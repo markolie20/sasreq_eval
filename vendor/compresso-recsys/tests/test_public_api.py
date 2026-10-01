@@ -1,0 +1,233 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
+from __future__ import annotations
+
+import compresso_recsys as cr
+import compresso_recsys.checkpoint as checkpoint
+import compresso_recsys.datasets as datasets
+import compresso_recsys.evaluation as evaluation
+import compresso_recsys.metrics as metrics
+import compresso_recsys.models as models
+import compresso_recsys.models.batching as batching
+import compresso_recsys.persistence as persistence
+import compresso_recsys.stats as stats
+
+
+def test_top_level_public_api_is_intentional():
+    expected = {
+        "DBbook",
+        "LastFM2K",
+        "save_item_embeddings",
+        "load_item_embeddings",
+        "list_item_embeddings",
+        "enrich_multimodal_checkpoint",
+        "Steam",
+        "NetflixPrize",
+        "TasteProfile",
+        "Gowalla",
+        "RetailRocket",
+        "Music4AllOnion",
+        "OTTO",
+        "Yambda",
+        "AmazonReviews2023",
+        "build_recsys_checkpoint",
+        "Goodbooks",
+        "ItemSequences",
+        "MovieLens1M",
+        "MovieLens20M",
+        "ModelCheckpointReader",
+        "ModelCheckpointWriter",
+        "RecSysDataset",
+        "SplitBundle",
+        "load_cluster_graph_stage",
+        "load_item_sequences",
+        "load_json",
+        "load_manifest",
+        "load_recsys_split",
+        "read_checkpoint",
+        "save_cluster_graph_stage",
+        "save_item_sequences",
+        "save_json",
+        "save_manifest",
+        "save_recsys_split",
+        "update_checkpoint",
+        "update_stage_manifest",
+    }
+
+    assert set(cr.__all__) == expected
+    for name in expected:
+        assert hasattr(cr, name)
+
+
+def test_model_and_retrieval_helpers_are_not_top_level_exports():
+    hidden = {
+        "CLUSTERING_DIR",
+        "COMPRESSED_ELSA_DIR",
+        "CompressedELSA",
+        "ELSA_DIR",
+        "SAE_DIR",
+        "SBERT_DIR",
+        "SBERT_SAE_DIR",
+        "TorchELSA",
+        "build_eval_holdout",
+        "build_item_cold_holdout",
+        "build_leave_last_out_holdout",
+        "build_temporal_holdout",
+        "evaluate_item_embeddings",
+        "evaluate_item_embeddings_with_holdout",
+        "fit_compressed_elsa",
+        "fit_elsa",
+        "fit_sae_on_embeddings",
+        "hf_to_torch_dataloader",
+    }
+
+    for name in hidden:
+        assert not hasattr(cr, name)
+
+
+def test_submodule_public_apis_are_intentional():
+    expected_by_module = {
+        checkpoint: {
+            "update_checkpoint",
+            "read_checkpoint",
+            "load_manifest",
+            "save_manifest",
+            "update_stage_manifest",
+            "save_json",
+            "load_json",
+            "save_recsys_split",
+            "load_recsys_split",
+            "save_cluster_graph_stage",
+            "load_cluster_graph_stage",
+        },
+        datasets: {
+            "DBbook",
+            "LastFM2K",
+            "Steam",
+            "NetflixPrize",
+            "TasteProfile",
+            "Gowalla",
+            "RetailRocket",
+            "Music4AllOnion",
+            "OTTO",
+            "Yambda",
+            "SplitBundle",
+            "RecSysDataset",
+            "MovieLens1M",
+            "MovieLens20M",
+            "Goodbooks",
+            "AmazonReviews2023",
+        },
+        evaluation: {
+            "EvaluationResult",
+            "RankingEvaluator",
+            "evaluate_ranked_predictions",
+            "evaluate_recommender",
+        },
+        stats: {
+            "ComparisonReport",
+            "PairwiseComparison",
+            "compare_models",
+            "compare_pair",
+        },
+        metrics: {
+            "CalibratedRecall",
+            "HitRate",
+            "MAP",
+            "MRR",
+            "NDCG",
+            "Precision",
+            "Recall",
+            "RankingBatch",
+            "RankingMetric",
+        },
+        batching: {
+            "InteractionBatch",
+            "InteractionBatchSampler",
+            "dense_training_target",
+        },
+        persistence: {
+            "MODEL_CHECKPOINT_FORMAT",
+            "MODEL_CHECKPOINT_VERSION",
+            "ModelCheckpointReader",
+            "ModelCheckpointWriter",
+        },
+        models: {
+            "BaseColdStartRecommender",
+            "BaseMultiModalRecommender",
+            "BaseCollaborativeRecommender",
+            "BaseIdentifiedRecommender",
+            "BasePersistableRecommender",
+            "BaseSequentialRecommender",
+            "Bert4Rec",
+            "Bert4RecConfig",
+            "Bert4RecTrainer",
+            "CandidateCatalog",
+            "ColdStartRecommender",
+            "CompressedELSA",
+            "ContentRecommender",
+            "ContentRecommenderConfig",
+            "EASE",
+            "EASEConfig",
+            "ELSA",
+            "ELSACompressionConfig",
+            "ELSAConfig",
+            "ELSATrainer",
+            "ItemTokenizer",
+            "ItemVocabulary",
+            "IdentifiedRecommender",
+            "MutableCandidateCatalog",
+            "MMConcatWrapper",
+            "MMConcatWrapperConfig",
+            "MultiModalCandidateCatalog",
+            "MultiModalCandidateSelection",
+            "MultiModalItemFeatures",
+            "MutableMultiModalCandidateCatalog",
+            "InteractionBatch",
+            "InteractionBatchSampler",
+            "ItemKNNConfig",
+            "ItemKNNRecommender",
+            "dense_training_target",
+            "MultDAE",
+            "MultDAEConfig",
+            "MultDAETrainer",
+            "MultVAE",
+            "MultVAEConfig",
+            "MultVAETrainer",
+            "PopularityBaseline",
+            "PopularityBaselineConfig",
+            "PersistableRecommender",
+            "RandomBaseline",
+            "RandomBaselineConfig",
+            "UserKNNConfig",
+            "UserKNNRecommender",
+            "Recommender",
+            "Recommendations",
+            "SASRec",
+            "SASRecConfig",
+            "SASRecTrainer",
+            "SequenceBatcher",
+            "SequentialRecommender",
+            "SimpleBidirectionalTransformer",
+            "SimpleBidirectionalTransformerConfig",
+            "SimpleBidirectionalTransformerTrainer",
+            "SimpleGPT",
+            "SimpleGPTConfig",
+            "SimpleGPTTrainer",
+            "SimpleRNN",
+            "SimpleRNNConfig",
+            "SimpleRNNTrainer",
+            "Tokenizer",
+            "TransformerConfig",
+            "TEASER",
+            "TEASERConfig",
+            "TEASERGD",
+            "TEASERGDConfig",
+            "TEASERGDTrainer",
+            "WarmCatalogAdapter",
+        },
+    }
+
+    for module, expected in expected_by_module.items():
+        assert set(module.__all__) == expected
+        for name in expected:
+            assert hasattr(module, name)

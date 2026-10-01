@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seqrec-eval"
+version = "0.1.0"
+description = "Evaluation suite for the sequential-recommendation study: stage-1 model selection and the data ablations."
+requires-python = ">=3.11"
+# compresso-recsys is the copy in vendor/compresso-recsys (2026-10-01, DECISIONS.md §29): release 0.3.7 plus
+# the local branch's training on every user (temporal_train_users), bounded training memory
+# (loss_chunk_elements) and BERT4Rec. It is installed from there, never from PyPI, so `uv sync` gives every
+# machine exactly the library the suite was reviewed against. Refresh it with scripts/vendor-cr.sh.
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "torch",
+    "matplotlib>=3.11.2",
+    "compresso-recsys==0.3.7+trainusers",
+    "pytest>=9.1.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+seqrec-eval = "seqrec_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# torch comes from PyTorch's CUDA 12.6 index, not PyPI (review H08, 2026-09-29).
+# PyPI's Linux wheel is the CUDA 13 build: no Volta kernels (sm_75 and up), and
+# CUDA 13 needs driver 580+. The DGX has V100s (sm_70) on driver 550 (CUDA 12.4).
+# The cu126 build is compiled for sm_50 to sm_90, including sm_70, and driver 550
+# runs it through CUDA's minor-version compatibility. It also runs on the
+# laptop's RTX 4050 (sm_89) through its sm_86 kernels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+compresso-recsys = { path = "vendor/compresso-recsys" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,273 @@
+"""Keep documented code honest about the signatures it calls.
+
+Sphinx never executes a ``code-block``, and ``nbsphinx_execute`` is ``"never"``,
+so a documented call can go stale in complete silence: building with ``-W``
+passes, the HTML renders, and the snippet raises ``TypeError`` for the first
+reader who copies it. That already happened once here — ``max_length`` moved from
+``SimpleRNNConfig`` to ``SequenceBatcher`` and the example kept passing it.
+
+These tests cannot run the snippets, which mostly need a checkpoint. They check
+the two things that rot without anyone touching the docs: that the code still
+parses, and that every keyword argument aimed at a public callable still exists
+in its signature.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import json
+import re
+import textwrap
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import compresso_recsys
+import compresso_recsys.evaluation
+import compresso_recsys.metrics
+import compresso_recsys.models
+
+DOCS = Path(__file__).resolve().parent.parent / "docs" / "source"
+
+_BLOCK = re.compile(
+    r"\.\. code-block:: python\n(?:\s*:[a-z]+:.*\n)*\n((?:(?:[ \t]+.*)?\n)+)"
+)
+
+
+def _public_callables() -> dict[str, object]:
+    """Every class or function a reader could reach by its documented name."""
+    found: dict[str, object] = {}
+    for module in (
+        compresso_recsys,
+        compresso_recsys.models,
+        compresso_recsys.evaluation,
+        compresso_recsys.metrics,
+    ):
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            obj = getattr(module, name)
+            if inspect.isclass(obj) or inspect.isfunction(obj):
+                found.setdefault(name, obj)
+    return found
+
+
+def _rst_snippets() -> list[tuple[str, int, str]]:
+    """``(source, line, code)`` for every python block in the documentation."""
+    out = []
+    for path in sorted(DOCS.rglob("*.rst")):
+        text = path.read_text()
+        for match in _BLOCK.finditer(text):
+            line = text[: match.start()].count("\n") + 1
+            out.append(
+                (str(path.relative_to(DOCS)), line, textwrap.dedent(match.group(1)))
+            )
+    return out
+
+
+def _notebook_snippets() -> list[tuple[str, int, str]]:
+    """Code cells from the shipped tutorials, which are not executed at build."""
+    out = []
+    for path in sorted(DOCS.rglob("*.ipynb")):
+        cells = json.loads(path.read_text())["cells"]
+        for index, cell in enumerate(cells):
+            if cell["cell_type"] != "code":
+                continue
+            code = "".join(cell["source"])
+            # Notebook magics and shell escapes are not Python.
+            if any(l.lstrip().startswith(("!", "%")) for l in code.splitlines()):
+                continue
+            out.append((str(path.relative_to(DOCS)), index, code))
+    return out
+
+
+SNIPPETS = _rst_snippets() + _notebook_snippets()
+
+
+def test_the_documentation_actually_contains_snippets():
+    """A regex that silently matches nothing would make the rest of this vacuous."""
+    assert len(SNIPPETS) > 30, f"only found {len(SNIPPETS)} snippets"
+    assert any(s[0].endswith(".ipynb") for s in SNIPPETS)
+    assert any(s[0].endswith(".rst") for s in SNIPPETS)
+
+
+def test_dataset_guide_covers_every_registered_dataset():
+    from compresso_recsys.builder import DATASETS
+
+    guide = (DOCS / "datasets.rst").read_text()
+    for dataset in DATASETS:
+        assert f".. _dataset-{dataset}:" in guide
+    navigation = (DOCS / "index.rst").read_text()
+    assert "   datasets\n" in navigation
+    assert "   multimodal-datasets\n" not in navigation
+
+
+def test_user_computed_feature_example_round_trips(tmp_path):
+    snippets = [code for source, _, code in SNIPPETS
+                if source == "examples.rst" and "def attach_computed_features" in code]
+    assert len(snippets) == 1
+    namespace = {}
+    exec(compile(snippets[0], "examples.rst#user-computed-features", "exec"), namespace)
+    path = tmp_path / "features.zip"
+    namespace["attach_computed_features"](
+        path, "image/my_encoder", {"product-b": [1., 2.], "product-a": [3., 4.]},
+        encoder="example-v1",
+    )
+    with compresso_recsys.read_checkpoint(path) as root:
+        features = compresso_recsys.load_item_embeddings(
+            root, "image/my_encoder", item_ids=["product-a", "missing", "product-b"]
+        )
+    np.testing.assert_array_equal(features["embeddings"], [[3, 4], [0, 0], [1, 2]])
+    assert features["available"].tolist() == [True, False, True]
+    assert features["metadata"]["encoder"] == "example-v1"
+
+
+def test_multimodal_subclass_example_runs():
+    snippets = [code for source, _, code in SNIPPETS
+                if source == "api/models.rst" and "class ExampleMultiModalContent" in code]
+    assert len(snippets) == 1
+    namespace = {}
+    exec(compile(snippets[0], "api/models.rst#multimodal", "exec"), namespace)
+    model = namespace["model"]
+    with pytest.raises(ValueError, match="unknown item ID"):
+        model.recommend([["cold"]], k=1)
+    model.remove_candidates(["a"])
+    assert model.recommend([["a"]], k=1).item_ids[0, 0] == "cold"
+
+
+def test_multimodal_wrapper_notebook_executes(tmp_path, monkeypatch):
+    """Exercise the tutorial without network access or a large data download."""
+    from scipy.sparse import csr_matrix
+
+    path = DOCS / "multimodal-concat-wrapper.ipynb"
+    cells = json.loads(path.read_text())["cells"]
+    monkeypatch.chdir(tmp_path)
+    namespace = {"__name__": "__main__"}
+    rng = np.random.default_rng(42)
+    for index, cell in enumerate(cells):
+        if cell["cell_type"] != "code":
+            continue
+        if "requires-data" in cell.get("metadata", {}).get("tags", []):
+            train = np.zeros((12, 12), dtype=np.float32)
+            for row in range(12):
+                train[row, [row, (row + 1) % 12, (row + 4) % 12]] = 1
+            targets = np.zeros((6, 24), dtype=np.float32)
+            targets[np.arange(6), np.arange(6)] = 1
+            masks = {name: np.ones(36, dtype=bool) for name in ("text", "image")}
+            masks["text"][[2, 13]] = False
+            namespace.update(
+                item_ids=np.array([f"book-{i}" for i in range(36)]),
+                warm=np.arange(12), cold=np.arange(12, 36),
+                x_train=csr_matrix(train), test_source=csr_matrix(train[:6]),
+                test_targets=csr_matrix(targets),
+                features={"text": rng.normal(size=(36, 4)).astype(np.float32),
+                          "image": rng.normal(size=(36, 5)).astype(np.float32)},
+                available=masks,
+            )
+            continue
+        exec(compile("".join(cell["source"]), f"{path.name}#cell-{index}", "exec"), namespace)
+    assert namespace["results"].shape == (6, 4)
+    assert namespace["restored"].is_fitted
+    assert len(namespace["restored"].candidate_item_ids) == 24
+
+
+@pytest.mark.parametrize(
+    ("source", "line", "code"), SNIPPETS, ids=[f"{s}:{l}" for s, l, _ in SNIPPETS]
+)
+def test_documented_snippets_parse(source, line, code):
+    try:
+        ast.parse(code)
+    except SyntaxError as error:  # pragma: no cover - only on a docs regression
+        pytest.fail(f"{source}:{line} does not parse: {error.msg}")
+
+
+@pytest.mark.parametrize(
+    ("source", "line", "code"), SNIPPETS, ids=[f"{s}:{l}" for s, l, _ in SNIPPETS]
+)
+def test_documented_keywords_exist_in_their_signatures(source, line, code):
+    """The failure mode Sphinx cannot see: a keyword that stopped existing."""
+    known = _public_callables()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return  # the parse test owns this failure
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            continue
+        target = known.get(name)
+        if target is None:
+            continue
+        try:
+            signature = inspect.signature(target)
+        except (TypeError, ValueError):  # pragma: no cover - builtins
+            continue
+        # **kwargs accepts anything, so there is nothing to check.
+        if any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in signature.parameters.values()
+        ):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None:  # **spread
+                continue
+            assert keyword.arg in signature.parameters, (
+                f"{source}:{line} calls {name}({keyword.arg}=...) but "
+                f"{name} takes {sorted(signature.parameters)}"
+            )
+
+
+def test_implementing_a_recommender_notebook_executes():
+    """Run the educational path without downloading the benchmark dataset."""
+    path = DOCS / "implementing-a-recommender.ipynb"
+    cells = json.loads(path.read_text())["cells"]
+    namespace = {"__name__": "__main__"}
+
+    for index, cell in enumerate(cells):
+        if cell["cell_type"] != "code":
+            continue
+        code = "".join(cell["source"])
+        if "requires-data" in cell.get("metadata", {}).get("tags", []):
+            from scipy.sparse import csr_matrix
+
+            if "x_train" not in namespace:
+                n_items = 30
+                train = np.zeros((12, n_items), dtype=np.float32)
+                source = np.zeros((4, n_items), dtype=np.float32)
+                targets = np.zeros((4, n_items), dtype=np.float32)
+                for row in range(train.shape[0]):
+                    train[
+                        row,
+                        [row % 10, (row + 3) % 20, (row + 9) % n_items],
+                    ] = 1
+                for row in range(source.shape[0]):
+                    source[row, [row, row + 4, row + 8]] = 1
+                    targets[row, row + 20] = 1
+                namespace.update(
+                    x_train=csr_matrix(train),
+                    test_source=csr_matrix(source),
+                    test_targets=csr_matrix(targets),
+                    item_ids=np.array([f"item-{i}" for i in range(n_items)]),
+                )
+            continue
+        exec(compile(code, f"{path.name}#cell-{index}", "exec"), namespace)
+
+    assert namespace["tutorial_model"].is_fitted
+    assert namespace["tutorial_result"].metrics["ndcg@20"] >= 0.0
+
+    tutorial_model = namespace["tutorial_model"]
+    old_popularity = tutorial_model.popularity_.copy()
+    old_item_ids = tutorial_model.source_item_ids.copy()
+    with pytest.raises(ValueError, match="item_ids has 1 entries"):
+        tutorial_model.fit(namespace["x_train"], item_ids=["too-short"])
+    np.testing.assert_array_equal(tutorial_model.popularity_, old_popularity)
+    np.testing.assert_array_equal(tutorial_model.source_item_ids, old_item_ids)

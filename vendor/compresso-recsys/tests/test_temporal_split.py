@@ -1,0 +1,286 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+from scipy.sparse import csr_matrix
+
+from compresso_recsys.builder import (
+    DEFAULT_TEMPORAL_PERIOD_HOURS,
+    _build_args,
+    _build_temporal_split,
+    _resolve_args,
+    _timestamps_in_seconds,
+)
+from compresso_recsys.checkpoint import load_recsys_split, save_recsys_split
+
+
+def _temporal_args(**overrides):
+    values = {
+        "dataset": "ml1m",
+        "split_mode": "temporal",
+        "temporal_period_hours": 1,
+        "min_user_support": 2,
+        "item_min_support": 2,
+        "min_source_items": 1,
+        "min_target_items": 1,
+    }
+    values.update(overrides)
+    return _build_args(**values)
+
+
+def _timeline() -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for user_id in ("u1", "u2"):
+        rows.extend(
+            [
+                {"user_id": user_id, "item_id": "A", "value": 1.0, "timestamp": 1_800},
+                {"user_id": user_id, "item_id": "B", "value": 1.0, "timestamp": 5_400},
+                {"user_id": user_id, "item_id": "C", "value": 1.0, "timestamp": 9_000},
+                {"user_id": user_id, "item_id": "D", "value": 1.0, "timestamp": 14_400},
+            ]
+        )
+    rows.extend(
+        [
+            {"user_id": "u3", "item_id": "A", "value": 1.0, "timestamp": 1_800},
+            {"user_id": "u3", "item_id": "B", "value": 1.0, "timestamp": 5_400},
+            {"user_id": "u3", "item_id": "E", "value": 1.0, "timestamp": 9_000},
+            {"user_id": "u3", "item_id": "D", "value": 1.0, "timestamp": 14_400},
+        ]
+    )
+    return pd.DataFrame(rows)
+
+
+def test_temporal_period_defaults_to_official_339_day_scale():
+    # Main resolves the registered window inside _build_args, so it is already
+    # concrete here rather than deferred to _resolve_args.
+    args = _build_args(dataset="amazon2023")
+
+    assert args.temporal_period_hours == DEFAULT_TEMPORAL_PERIOD_HOURS
+    assert args.temporal_period_hours == 339 * 24
+
+
+def test_gowalla_temporal_default_builds_on_its_shorter_timestamp_span():
+    from compresso_recsys.builder import _resolve_args
+
+    frame = pd.DataFrame([
+        {"user_id": f"u{u}", "item_id": f"i{i}", "value": 1., "timestamp": day * 86400}
+        for u in range(12) for day in (0, 550, 580, 610, 626) for i in range(12)
+    ])
+    args, _ = _resolve_args(_build_args(dataset="gowalla", split_mode="temporal"))
+    assert args.temporal_period_hours == 720
+    split = _build_temporal_split(args, frame)
+    assert split["x_train"].nnz > 0
+    for phase in ("train", "val", "test"):
+        assert split[f"{phase}_target_matrix"].nnz > 0
+
+
+def test_temporal_fraction_is_deprecated_in_favor_of_hours():
+    with pytest.warns(DeprecationWarning, match="temporal_period_hours"):
+        args = _build_args(dataset="amazon2023", temporal_test_frac=0.2)
+
+    assert args.temporal_test_frac == 0.2
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True])
+def test_temporal_period_must_be_positive_and_finite(value):
+    with pytest.raises(ValueError, match="temporal_period_hours"):
+        _build_args(dataset="amazon2023", temporal_period_hours=value)
+
+
+def test_timestamp_normalization_accepts_seconds_and_milliseconds():
+    seconds = pd.Series([1_700_000_000, 1_700_003_600])
+    milliseconds = seconds * 1_000
+
+    np.testing.assert_array_equal(
+        _timestamps_in_seconds(seconds),
+        _timestamps_in_seconds(milliseconds),
+    )
+
+
+def test_temporal_split_builds_expanding_mixed_catalogs_and_filters_support():
+    split = _build_temporal_split(_temporal_args(), _timeline())
+
+    assert split["train_item_ids"].tolist() == ["A", "B"]
+    assert split["val_item_ids"].tolist() == ["A", "B", "C"]
+    assert split["test_item_ids"].tolist() == ["A", "B", "C", "D"]
+    assert split["item_ids"].tolist() == ["A", "B", "C", "D"]
+
+    assert split["train_source_matrix"].shape == (3, 2)
+    assert split["train_target_matrix"].shape == (3, 2)
+    assert split["val_source_matrix"].shape == (2, 3)
+    assert split["val_target_matrix"].shape == (2, 3)
+    assert split["test_source_matrix"].shape == (3, 4)
+    assert split["test_target_matrix"].shape == (3, 4)
+
+    assert split["val_user_ids"].tolist() == ["u1", "u2"]
+    assert split["test_user_ids"].tolist() == ["u1", "u2", "u3"]
+    assert "E" not in split["val_item_ids"]
+    assert "E" not in split["test_item_ids"]
+    assert split["val_cold_item_indices"].tolist() == [2]
+    assert split["test_cold_item_indices"].tolist() == [3]
+
+    expected_x_train = split["train_source_matrix"].maximum(
+        split["train_target_matrix"]
+    )
+    assert (split["x_train"] != expected_x_train).nnz == 0
+    assert np.all(split["val_source_matrix"].getnnz(axis=1) >= 1)
+    assert np.all(split["val_target_matrix"].getnnz(axis=1) >= 1)
+    assert np.all(
+        split["val_source_matrix"]
+        .maximum(split["val_target_matrix"])
+        .getnnz(axis=1)
+        >= 2
+    )
+
+
+def test_temporal_prefilter_remains_an_upper_bound_for_repeated_events():
+    rows = [
+        {"user_id": "good", "item_id": "A", "value": 1.0, "timestamp": 900},
+        {"user_id": "good", "item_id": "B", "value": 1.0, "timestamp": 1_800},
+        {"user_id": "good", "item_id": "C", "value": 1.0, "timestamp": 5_400},
+        {"user_id": "good", "item_id": "D", "value": 1.0, "timestamp": 9_000},
+        {"user_id": "good", "item_id": "E", "value": 1.0, "timestamp": 14_400},
+    ]
+    for _ in range(2):
+        rows.extend(
+            [
+                {"user_id": "duplicate", "item_id": "A", "value": 1.0, "timestamp": 900},
+                {"user_id": "duplicate", "item_id": "C", "value": 1.0, "timestamp": 5_400},
+            ]
+        )
+
+    split = _build_temporal_split(
+        _temporal_args(min_user_support=3, item_min_support=1),
+        pd.DataFrame(rows),
+    )
+
+    assert split["train_user_ids"].tolist() == ["good"]
+    assert split["extra_metadata"]["train_stage"]["initial_users"] == 2
+    assert split["extra_metadata"]["train_stage"]["prefiltered_users"] == 2
+
+
+def _timeline_with_early_users() -> pd.DataFrame:
+    """The timeline plus two users whose every event precedes the train target window."""
+    early = [
+        {"user_id": user_id, "item_id": item_id, "value": 1.0, "timestamp": timestamp}
+        for user_id in ("e1", "e2")
+        for item_id, timestamp in (("A", 100), ("Z", 200))
+    ]
+    return pd.concat([_timeline(), pd.DataFrame(early)], ignore_index=True)
+
+
+def test_temporal_train_users_window_drops_users_inactive_in_the_train_window():
+    split = _build_temporal_split(_temporal_args(), _timeline_with_early_users())
+
+    assert split["train_user_ids"].tolist() == ["u1", "u2", "u3"]
+    assert "Z" not in split["train_item_ids"]
+
+
+def test_temporal_train_users_all_trains_on_everything_before_the_validation_window():
+    window = _build_temporal_split(_temporal_args(), _timeline_with_early_users())
+    split = _build_temporal_split(
+        _temporal_args(temporal_train_users="all"), _timeline_with_early_users()
+    )
+
+    # the early users, and the item only they had, join training
+    assert split["train_user_ids"].tolist() == ["e1", "e2", "u1", "u2", "u3"]
+    assert split["train_item_ids"].tolist() == ["A", "B", "Z"]
+    rows = {user: row for row, user in enumerate(split["train_user_ids"])}
+    items = {item: col for col, item in enumerate(split["train_item_ids"])}
+    for user in ("e1", "e2"):
+        assert split["x_train"][rows[user]].indices.tolist() == [items["A"], items["Z"]]
+        assert split["train_target_matrix"][rows[user]].nnz == 0  # no train-window event
+        assert split["x_train_sequences"].row(rows[user]).tolist() == [items["A"], items["Z"]]
+
+    # nothing from the validation window or later reaches training
+    assert split["x_train"].sum() == 3 * 2 + 2 * 2  # u1, u2, u3: A and B; e1, e2: A and Z
+
+    # validation and test score the same users; their catalogues still extend training's
+    for phase in ("val", "test"):
+        assert split[f"{phase}_user_ids"].tolist() == window[f"{phase}_user_ids"].tolist()
+        ids = split[f"{phase}_item_ids"].tolist()
+        assert ids[: len(split["train_item_ids"])] == split["train_item_ids"].tolist()
+    assert split["extra_metadata"]["temporal_train_users"] == "all"
+
+
+def test_temporal_train_users_must_be_known():
+    with pytest.raises(ValueError, match="temporal_train_users"):
+        _temporal_args(temporal_train_users="everyone")
+
+
+def test_temporal_split_rejects_period_longer_than_available_history():
+    with pytest.raises(ValueError, match="three target windows"):
+        _build_temporal_split(
+            _temporal_args(temporal_period_hours=2),
+            _timeline(),
+        )
+
+
+def test_checkpoint_round_trip_preserves_stage_item_spaces_and_training_union(
+    tmp_path,
+):
+    train_source = csr_matrix([[1.0, 0.0]], dtype=np.float32)
+    train_target = csr_matrix([[0.0, 1.0]], dtype=np.float32)
+    x_train = train_source.maximum(train_target)
+    val_source = csr_matrix([[1.0, 1.0, 0.0]], dtype=np.float32)
+    val_target = csr_matrix([[0.0, 0.0, 1.0]], dtype=np.float32)
+    test_source = csr_matrix([[1.0, 1.0, 1.0, 0.0]], dtype=np.float32)
+    test_target = csr_matrix([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+
+    save_recsys_split(
+        tmp_path,
+        item_ids=np.asarray(["A", "B", "C", "D"]),
+        train_item_ids=np.asarray(["A", "B"]),
+        val_item_ids=np.asarray(["A", "B", "C"]),
+        test_item_ids=np.asarray(["A", "B", "C", "D"]),
+        x_train=x_train,
+        train_source_matrix=train_source,
+        train_target_matrix=train_target,
+        val_source_matrix=val_source,
+        val_target_matrix=val_target,
+        test_source_matrix=test_source,
+        test_target_matrix=test_target,
+        val_source_indices=[np.asarray([0, 1])],
+        val_target_indices=[np.asarray([2])],
+        test_source_indices=[np.asarray([0, 1, 2])],
+        test_target_indices=[np.asarray([3])],
+    )
+
+    loaded = load_recsys_split(tmp_path)
+
+    assert loaded["train_item_ids"].tolist() == ["A", "B"]
+    assert loaded["val_item_ids"].tolist() == ["A", "B", "C"]
+    assert loaded["test_item_ids"].tolist() == ["A", "B", "C", "D"]
+    assert (loaded["train_source_matrix"] != train_source).nnz == 0
+    assert (loaded["train_target_matrix"] != train_target).nnz == 0
+    assert (loaded["x_train"] != x_train).nnz == 0
+    assert (loaded["val_source_matrix"] != val_source).nnz == 0
+    assert (loaded["test_target_matrix"] != test_target).nnz == 0
+
+
+def test_checkpoint_rejects_matrix_item_id_mismatch(tmp_path):
+    matrix = csr_matrix([[1.0]], dtype=np.float32)
+
+    # Catalogs nest, so the only thing wrong here is the matrix width -- which
+    # is what this test is about.
+    with pytest.raises(ValueError, match="validation matrix columns"):
+        save_recsys_split(
+            tmp_path,
+            item_ids=np.asarray(["A", "B"]),
+            train_item_ids=np.asarray(["A"]),
+            val_item_ids=np.asarray(["A", "B"]),
+            test_item_ids=np.asarray(["A", "B"]),
+            x_train=matrix,
+            train_source_matrix=matrix,
+            train_target_matrix=matrix,
+            val_source_matrix=matrix,
+            val_target_matrix=matrix,
+            test_source_matrix=matrix,
+            test_target_matrix=matrix,
+            val_source_indices=[np.asarray([0])],
+            val_target_indices=[np.asarray([0])],
+            test_source_indices=[np.asarray([0])],
+            test_target_indices=[np.asarray([0])],
+        )

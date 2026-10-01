@@ -1,0 +1,3645 @@
+diff --git a/README.md b/README.md
+index 76e6b94..dcf3c63 100644
+--- a/README.md
++++ b/README.md
+@@ -127,7 +127,8 @@ cold-start examples, and defaults.
+ - Sequential recommenders over chronological histories: `SimpleRNN`, a recurrent
+   next-item baseline; `SimpleGPT`, a causal transformer with a tied head;
+   `SASRec`, a modernized variant of the published self-attentive architecture
+-  trained against sampled negatives; and
++  trained against sampled negatives; `BERT4Rec`, the bidirectional encoder
++  trained with the Cloze objective; and
+   `SimpleBidirectionalTransformer`, a sequence-to-set encoder that can train on
+   the target matrices produced by temporal splits. They are built from
+   replaceable parts — an `ItemTokenizer` owning the vocabulary and a
+diff --git a/pyproject.toml b/pyproject.toml
+index afa29c9..0629e20 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "compresso-recsys"
+-version = "0.3.7"
++version = "0.3.7+trainusers"   # local branch: temporal_train_users; not a release
+ description = "Recommender-system experiments and checkpoint pipelines for Compresso"
+ readme = { file = "README.md", content-type = "text/markdown" }
+ requires-python = ">=3.10"
+diff --git a/src/compresso_recsys/builder.py b/src/compresso_recsys/builder.py
+index 556b913..45a828b 100644
+--- a/src/compresso_recsys/builder.py
++++ b/src/compresso_recsys/builder.py
+@@ -148,6 +148,10 @@ DATASETS = {
+ }
+ 
+ 
++#: Who a temporal split trains on; see :func:`build_recsys_checkpoint`.
++TEMPORAL_TRAIN_USERS = ("window", "all")
++
++
+ def _temporal_period_hours(dataset: str, value: float | None) -> float:
+     value = DATASETS[dataset].temporal_period_hours if value is None else value
+     if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+@@ -240,6 +244,15 @@ def parse_args():
+     )
+     p.add_argument("--min_source_items", type=int, default=1)
+     p.add_argument("--min_target_items", type=int, default=1)
++    p.add_argument(
++        "--temporal_train_users",
++        type=str,
++        default="window",
++        choices=TEMPORAL_TRAIN_USERS,
++        help="Who the temporal split trains on. 'window' (default): users with events both before and "
++             "inside the train target window. 'all': every user with enough events before the "
++             "validation window, whether or not they were active in the train window.",
++    )
+     p.add_argument(
+         "--amazon_category",
+         type=str,
+@@ -461,6 +474,7 @@ def _build_args(
+     temporal_period_hours: float | None = None,
+     min_source_items: int = 1,
+     min_target_items: int = 1,
++    temporal_train_users: str = "window",
+     amazon_category: str = "Toys_and_Games",
+     metadata_text_fields: str | list[str] | tuple[str, ...] | None = None,
+     min_entity_text_words: int | None = None,
+@@ -483,6 +497,10 @@ def _build_args(
+         )
+     if split_mode not in {"user_split", "item_split", "leave_last_out", "temporal", "official"}:
+         raise ValueError(f"Unsupported split_mode: {split_mode!r}")
++    if temporal_train_users not in TEMPORAL_TRAIN_USERS:
++        raise ValueError(
++            f"temporal_train_users must be one of {TEMPORAL_TRAIN_USERS}, got {temporal_train_users!r}"
++        )
+     if annotation_source not in {"genres", "ml20m_tags", "goodbooks_tags", "none"}:
+         raise ValueError(f"Unsupported annotation_source: {annotation_source!r}")
+     temporal_period_hours = _temporal_period_hours(dataset, temporal_period_hours)
+@@ -516,6 +534,7 @@ def _build_args(
+         temporal_period_hours=float(temporal_period_hours),
+         min_source_items=min_source_items,
+         min_target_items=min_target_items,
++        temporal_train_users=temporal_train_users,
+         amazon_category=amazon_category,
+         metadata_text_fields=_metadata_text_fields_arg(metadata_text_fields),
+         min_entity_text_words=min_entity_text_words,
+@@ -530,6 +549,12 @@ def _build_args(
+ def _resolve_args(args):
+     spec = DATASETS[args.dataset]
+     args.temporal_period_hours = _temporal_period_hours(args.dataset, args.temporal_period_hours)
++    # A namespace from before the option existed trains on the window's users, as it always did.
++    args.temporal_train_users = getattr(args, "temporal_train_users", "window")
++    if args.temporal_train_users not in TEMPORAL_TRAIN_USERS:
++        raise ValueError(
++            f"temporal_train_users must be one of {TEMPORAL_TRAIN_USERS}, got {args.temporal_train_users!r}"
++        )
+     # Normalised here rather than in _build_args because the console script
+     # builds its namespace straight from argparse and never calls that.
+     caller_options = _resolve_dataset_options(spec, getattr(args, "dataset_options", None))
+@@ -1448,6 +1473,24 @@ def _build_temporal_stage(
+     }
+ 
+ 
++def _train_stage_args(args):
++    """The train stage's eligibility: the window's, or, with ``temporal_train_users="all"``, everyone's.
++
++    Validation and test need a user to have a history and a target in their
++    window, or there is nothing to score. Training needs neither: a user whose
++    events all precede the train window is still evidence of how items relate.
++    So with ``"all"`` the train stage asks only for ``min_user_support`` events
++    before the validation window, and ``x_train`` becomes everything before
++    the cutoff.
++    """
++    if getattr(args, "temporal_train_users", "window") == "window":
++        return args
++    relaxed = argparse.Namespace(**vars(args))
++    relaxed.min_source_items = 0
++    relaxed.min_target_items = 0
++    return relaxed
++
++
+ def _build_temporal_split(args, proc_df, progress: _CheckpointProgress | None = None):
+     if "timestamp" not in proc_df.columns:
+         raise ValueError("temporal split requires a timestamp column")
+@@ -1494,7 +1537,7 @@ def _build_temporal_split(args, proc_df, progress: _CheckpointProgress | None =
+         values=values,
+         timestamps=timestamps,
+         inherited_item_codes=np.asarray([], dtype=np.int64),
+-        args=args,
++        args=_train_stage_args(args),
+         stage="train",
+     )
+     if progress is not None:
+@@ -1596,6 +1639,7 @@ def _build_temporal_split(args, proc_df, progress: _CheckpointProgress | None =
+                 "use a complete target window only to define benchmark eligibility."
+             ),
+             "temporal_period_hours": float(args.temporal_period_hours),
++            "temporal_train_users": getattr(args, "temporal_train_users", "window"),
+             "timestamp_unit": "unix_seconds",
+             "timestamp_min": timestamp_min,
+             "timestamp_max": timestamp_max,
+@@ -1835,6 +1879,7 @@ def build_recsys_checkpoint(
+     temporal_period_hours: float | None = None,
+     min_source_items: int = 1,
+     min_target_items: int = 1,
++    temporal_train_users: str = "window",
+     amazon_category: str = "Toys_and_Games",
+     metadata_text_fields: str | list[str] | tuple[str, ...] | None = None,
+     min_entity_text_words: int | None = None,
+@@ -1851,6 +1896,18 @@ def build_recsys_checkpoint(
+     with: 336 hours for Retailrocket, 48 for OTTO, 720 for Gowalla, Yambda and
+     Music4All-Onion, and 8136 for every other dataset. An explicit positive
+     period overrides that default.
++
++    ``temporal_train_users`` decides who a temporal split trains on. The
++    default, ``"window"``, keeps the train stage's own eligibility: at least
++    ``min_source_items`` events before the train target window and
++    ``min_target_items`` inside it, so a user inactive during that window
++    contributes nothing to training. ``"all"`` drops those two requirements
++    for the train stage only, so training holds every user with
++    ``min_user_support`` events before the validation window -- everything
++    before the cutoff, as a global temporal split is usually defined. The
++    train stage's source/target pair keeps its shape; a user without a target
++    event simply has an empty target row. Validation and test are unchanged:
++    they can only score users active in their own windows.
+     """
+     args = _build_args(
+         multimodal_features=multimodal_features,
+@@ -1875,6 +1932,7 @@ def build_recsys_checkpoint(
+         temporal_period_hours=temporal_period_hours,
+         min_source_items=min_source_items,
+         min_target_items=min_target_items,
++        temporal_train_users=temporal_train_users,
+         amazon_category=amazon_category,
+         metadata_text_fields=metadata_text_fields,
+         min_entity_text_words=min_entity_text_words,
+diff --git a/src/compresso_recsys/models/__init__.py b/src/compresso_recsys/models/__init__.py
+index 7573931..ece0733 100644
+--- a/src/compresso_recsys/models/__init__.py
++++ b/src/compresso_recsys/models/__init__.py
+@@ -48,6 +48,7 @@ from .elsa import (
+     ELSAConfig,
+     ELSATrainer,
+ )
++from .bert4rec import Bert4Rec, Bert4RecConfig, Bert4RecTrainer
+ from .sasrec import SASRec, SASRecConfig, SASRecTrainer
+ from .simple_gpt import (
+     SimpleGPT,
+@@ -76,6 +77,9 @@ __all__ = [
+     "BaseIdentifiedRecommender",
+     "BasePersistableRecommender",
+     "BaseSequentialRecommender",
++    "Bert4Rec",
++    "Bert4RecConfig",
++    "Bert4RecTrainer",
+     "CompressedELSA",
+     "CandidateCatalog",
+     "ColdStartRecommender",
+diff --git a/src/compresso_recsys/models/bert4rec/__init__.py b/src/compresso_recsys/models/bert4rec/__init__.py
+new file mode 100644
+index 0000000..030fd08
+--- /dev/null
++++ b/src/compresso_recsys/models/bert4rec/__init__.py
+@@ -0,0 +1,15 @@
++"""BERT4Rec: bidirectional self-attention trained with the Cloze objective.
++
++Sun et al., *BERT4Rec: Sequential Recommendation with Bidirectional Encoder
++Representations from Transformer*, CIKM 2019.
++
++:class:`Bert4Rec` is the architecture of §3, :class:`Bert4RecConfig` its
++published settings, and :class:`Bert4RecTrainer` the §3.6 objective plus the
++batching the paper leaves to its implementation.
++"""
++
++from .config import Bert4RecConfig
++from .model import Bert4Rec
++from .trainer import Bert4RecTrainer
++
++__all__ = ["Bert4Rec", "Bert4RecConfig", "Bert4RecTrainer"]
+diff --git a/src/compresso_recsys/models/bert4rec/config.py b/src/compresso_recsys/models/bert4rec/config.py
+new file mode 100644
+index 0000000..d541f33
+--- /dev/null
++++ b/src/compresso_recsys/models/bert4rec/config.py
+@@ -0,0 +1,290 @@
++"""Configuration for :class:`~compresso_recsys.models.Bert4Rec`.
++
++Every default here is the published setting. Where the paper is silent the
++value comes from the authors' TensorFlow implementation at
++https://github.com/FeiSun/BERT4Rec, which is noted per field, because a number
++with two possible provenances is the one most likely to drift.
++
++"The reference" there means the four ``run_*.sh`` scripts, which are what
++produced the paper's tables. The flag defaults in ``run.py`` and
++``gen_data_fin.py`` are a third thing again, inherited from the BERT
++pretraining code the repository was forked from, and several of them are
++values no published run ever used -- ``batch_size`` 32, ``learning_rate``
++5e-5, ``num_train_steps`` 100000, ``num_warmup_steps`` 10000. A citation
++here naming a flag default rather than a script is a citation to the wrong
++tier, so the fields below say which one they mean.
++
++The scripts disagree with each other per dataset, so a single default set
++cannot be all four at once. These follow ml-20m, the long-sequence run the
++default ``max_history_length`` of 200 already commits to, except for
++``dropout``, which is ml-1m's 0.2 against ml-20m's 0.1.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal
++
++import torch
++
++from compresso_recsys._reporting import _validate_log_every_n_steps
++
++__all__ = ["Bert4RecConfig"]
++
++OptimizerName = Literal["AdamW"]
++
++
++@dataclass(frozen=True)
++class Bert4RecConfig:
++    """Architecture, Cloze, and optimization settings for BERT4Rec.
++
++    **Architecture.** ``n_blocks`` and ``n_heads`` are the paper's ``L = 2`` and
++    ``h = 2`` (§4.3). ``d_model`` is 64, the smallest width at which §4.5 reports
++    the model saturating, and the width the released configs use. The
++    feed-forward inner width is ``4 * d_model`` and is not a field: Eq. 3 fixes
++    it, and the released config agrees (``intermediate_size`` 256 at
++    ``hidden_size`` 64).
++
++    ``max_history_length`` is ``N``, the truncation point *and* the size of the
++    positional table (§3.4). The paper uses 200 for the MovieLens datasets and
++    50 for the sparse ones; 200 is the default because the released configs set
++    ``max_position_embeddings`` to it. A history longer than ``N`` keeps its most
++    recent ``N`` interactions, matching ``item_seq[-max_num_tokens:]`` in the
++    reference generator -- a context window is a claim about recency.
++
++    ``dropout`` and ``att_dropout`` are the reference's ``hidden_dropout_prob``
++    and ``attention_probs_dropout_prob``. They are two fields rather than one
++    because the reference exposes two; the paper names only the tuning range
++    (§4.3). The released ``bert_config`` files disagree -- 0.2/0.2 for ml-1m,
++    0.1/0.1 for ml-20m -- and 0.2 is ml-1m's, the run the paper reports in
++    most detail. ``dropout`` covers all three of the reference's
++    hidden-dropout sites -- the postprocessed input embedding, the attention
++    output, and the feed-forward output -- while ``att_dropout`` applies to the
++    attention probabilities alone.
++
++    **Cloze.** ``mask_proportion`` is the paper's rho: the fraction of positions
++    masked per training sequence (§3.6). The paper tunes it per dataset -- 0.2
++    for MovieLens, 0.4 for Steam, 0.6 for Beauty (§4.3) -- and 0.2 is the
++    default for the long-sequence case the default ``max_history_length``
++    assumes. ``max_predictions`` caps the count per sequence at
++    ``max_predictions_per_seq``, which the scripts set per dataset: 40 for
++    ml-1m, 20 for ml-20m and steam, 30 for beauty. 20 is ml-20m's, and at
++    ``N`` 200 with rho 0.2 it is that run's exact pairing -- so the cap binds
++    at 20 rather than the 40 rho alone would ask for on a full-length window,
++    which is a published choice and not an accident of the two numbers
++    meeting.
++
++    ``mask_token_probability`` is the reference's ``mask_prob``, and its default
++    of 1.0 is the interesting one: it *disables* BERT's 80/10/10 corruption, so
++    a chosen position always becomes ``[MASK]``. The paper describes exactly
++    that -- "replace them with a special token ``[mask]``" -- with no mention of
++    random or kept tokens. Below 1.0 the remainder splits evenly between keeping
++    the original item and drawing a random one, as in ``create_masked_lm_
++    predictions``.
++
++    ``duplication_factor`` and ``sliding_window_step`` reproduce ``dupe_factor``
++    (10 in all four scripts) and ``prop_sliding_window`` (0.5 in ml-1m, ml-20m
++    and steam; 0.1 in beauty, whose ``N`` is 50). The first re-masks every
++    sequence that many times per fit, which is how the Cloze objective turns
++    one history into the many samples §3.6 claims for it. It is not a slower
++    spelling of ``epochs``: it also fixes the ratio of randomly masked samples
++    to ``last_item_samples`` ones at 10:1, which is what weights the Cloze
++    objective against the fine-tuning objective.
++
++    The second slides a window over any history longer than
++    ``max_history_length`` in steps of
++    ``sliding_window_step * max_history_length``, so the early part of a long
++    history is trained on rather than discarded. At the default ``N`` of 200
++    that is a window every 100 interactions. Beauty's 0.1 would place one
++    every 20 and cost five times as much per epoch; it is paired with an ``N``
++    of 50, where it means a window every 5.
++
++    ``last_item_samples`` adds the paper's fine-tuning samples: an extra
++    sequence with only the final item masked, "to better match the sequential
++    recommendation task" (§3.6). ``create_training_instances`` appends these
++    unconditionally via ``mask_last``, which runs over a user's whole document
++    -- so one per sliding window, not one per user -- and the default is
++    ``True``.
++
++    Every Cloze sample keeps at least one position unmasked, so the count is
++    also capped at ``len - 1`` and a ``mask_proportion`` of 1.0 means "all but
++    one". A history of a single interaction therefore yields no sample at all:
++    masking its only position would leave the input identical for every such
++    history, teaching nothing but a popularity prior ``duplication_factor``
++    times over. The reference's ``create_masked_lm_predictions`` has no such
++    floor and would mask the lone position; this one is the package's.
++
++    ``unk_dropout`` replaces that fraction of the *context* positions -- real
++    positions not chosen for prediction -- with the tokenizer's ``unk`` token,
++    teaching the model to read a history containing an item it cannot
++    identify. It defaults to zero for paper parity. Set it above zero when
++    otherwise ``unk`` would never be trained: the training vocabulary *is* the
++    training window, so an out-of-catalog item cannot occur until evaluation.
++    Until then the ``unk`` row is trained only as a wrong answer in the tied
++    softmax, so it reaches a temporal test history as a vector pushed away from
++    every masked state rather than as a learned "unknown item". The right rate
++    tracks the out-of-catalog share the split will actually produce -- near zero
++    under ``leave_last_out``, far higher on a late ``temporal`` stage. Chosen
++    positions are never replaced, so no label is lost and ``unk`` never stands
++    in for ``[mask]``. It is ignored when the tokenizer has no ``unk`` to
++    substitute.
++
++    **Optimization.** The paper's §4.3 settings, and the scripts agree with it
++    throughout: ``lr`` 1e-4 and ``batch_size`` 256 are both §4.3's *and* what
++    all four scripts pass, so there is nothing to adjudicate. (``run.py``
++    defaults those flags to 5e-5 and 32, which is the fork's inheritance and
++    not a published setting.) ``optimization.py`` supplies the rest: decoupled
++    weight decay 0.01, ``betas`` of (0.9, 0.999), ``epsilon`` 1e-6 against
++    PyTorch's 1e-8, gradients clipped at an l2 norm of 5, and a
++    ``polynomial_decay`` of power 1, which is the paper's linear decay. Weight
++    decay is excluded from LayerNorm and bias parameters, as
++    ``exclude_from_weight_decay`` does.
++
++    ``warmup_steps`` is the scripts' ``num_warmup_steps``, 100 in all four,
++    and it is a count rather than a fraction of the run because that is what
++    the reference means by it. Warmup buys a fixed number of steps for Adam's
++    zero-initialized second moment to become a usable estimate, and that cost
++    does not grow because the run is longer: 100 steps is 100 steps at 400000
++    total, as the scripts are, and at 400. As a fraction it would be 2.5e-4,
++    which is the right ratio only at the scripts' length and rounds to no
++    warmup at all below about 4000 steps -- so a short fit would take its very
++    first step, the one against that zero-initialized estimate, at the full
++    learning rate. The other sequential models here do take a
++    ``warmup_fraction``; none of them is reproducing a published step count.
++
++    ``epochs`` has no counterpart at all. The reference trains a fixed
++    ``num_train_steps`` -- 400000, or 800000 for steam -- over a corpus
++    generated once; here the step count is
++    ``epochs * samples / batch_size`` and so depends on the dataset. 10 is a
++    default for this package's shape, not a published figure.
++
++    ``initializer_range`` is the truncated-normal width the paper gives as
++    [-0.02, 0.02] and the configs give as ``initializer_range`` 0.02.
++    """
++
++    # -- architecture -------------------------------------------------------
++    d_model: int = 64
++    n_blocks: int = 2
++    n_heads: int = 2
++    dropout: float = 0.2
++    att_dropout: float = 0.2
++    max_history_length: int = 200
++    initializer_range: float = 0.02
++
++    # -- Cloze objective ----------------------------------------------------
++    mask_proportion: float = 0.2
++    max_predictions: int = 20
++    mask_token_probability: float = 1.0
++    duplication_factor: int = 10
++    sliding_window_step: float = 0.5
++    last_item_samples: bool = True
++    unk_dropout: float = 0.0
++
++    # -- optimization -------------------------------------------------------
++    batch_size: int = 256
++    epochs: int = 10
++    lr: float = 1e-4
++    weight_decay: float = 0.01
++    betas: tuple[float, float] = (0.9, 0.999)
++    epsilon: float = 1e-6
++    max_grad_norm: float = 5.0
++    warmup_steps: int = 100
++    optimizer: OptimizerName = "AdamW"
++
++    # -- runtime ------------------------------------------------------------
++    device: str | torch.device = "cpu"
++    show_progress: bool = True
++    seed: int = 0
++    log_prefix: str = "Bert4Rec"
++    log_every_n_steps: int = 1000
++
++    def __post_init__(self) -> None:
++        _validate_log_every_n_steps(self.log_every_n_steps)
++        if self.d_model < 1:
++            raise ValueError(f"d_model must be >= 1, got {self.d_model}")
++        if self.n_heads < 1:
++            raise ValueError(f"n_heads must be >= 1, got {self.n_heads}")
++        if self.d_model % self.n_heads:
++            raise ValueError(
++                f"d_model ({self.d_model}) must be divisible by n_heads "
++                f"({self.n_heads}): each head reads d_model / h of the "
++                "residual stream"
++            )
++        if self.n_blocks < 1:
++            raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
++        if not 0.0 <= self.dropout < 1.0:
++            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
++        if not 0.0 <= self.att_dropout < 1.0:
++            raise ValueError(
++                f"att_dropout must be in [0, 1), got {self.att_dropout}"
++            )
++        if self.max_history_length < 2:
++            raise ValueError(
++                "max_history_length must be >= 2: a Cloze example needs a "
++                "masked position and at least one position of context, got "
++                f"{self.max_history_length}"
++            )
++        if self.initializer_range <= 0.0:
++            raise ValueError(
++                f"initializer_range must be > 0, got {self.initializer_range}"
++            )
++        if not 0.0 < self.mask_proportion <= 1.0:
++            raise ValueError(
++                "mask_proportion is the fraction of positions masked per "
++                f"sequence and must be in (0, 1], got {self.mask_proportion}"
++            )
++        if self.max_predictions < 1:
++            raise ValueError(
++                f"max_predictions must be >= 1, got {self.max_predictions}"
++            )
++        if not 0.0 <= self.mask_token_probability <= 1.0:
++            raise ValueError(
++                "mask_token_probability must be in [0, 1], got "
++                f"{self.mask_token_probability}"
++            )
++        if self.duplication_factor < 1:
++            raise ValueError(
++                f"duplication_factor must be >= 1, got {self.duplication_factor}"
++            )
++        if not 0.0 < self.sliding_window_step <= 1.0:
++            raise ValueError(
++                "sliding_window_step is a fraction of max_history_length and "
++                f"must be in (0, 1], got {self.sliding_window_step}"
++            )
++        if not 0.0 <= self.unk_dropout < 1.0:
++            raise ValueError(
++                f"unk_dropout must be in [0, 1), got {self.unk_dropout}"
++            )
++        if self.batch_size < 1:
++            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
++        if self.epochs < 1:
++            raise ValueError(f"epochs must be >= 1, got {self.epochs}")
++        if self.lr <= 0.0:
++            raise ValueError(f"lr must be > 0, got {self.lr}")
++        if self.weight_decay < 0.0:
++            raise ValueError(
++                f"weight_decay must be >= 0, got {self.weight_decay}"
++            )
++        # asdict writes a JSON array and reading it back gives a list, so a
++        # reloaded config would otherwise carry a different type than a fresh
++        # one and compare unequal to it. Frozen, hence object.__setattr__.
++        object.__setattr__(self, "betas", tuple(self.betas))
++        if len(self.betas) != 2:
++            raise ValueError(f"betas must be two values, got {self.betas!r}")
++        if not all(0.0 <= beta < 1.0 for beta in self.betas):
++            raise ValueError(f"betas must each be in [0, 1), got {self.betas!r}")
++        if self.epsilon <= 0.0:
++            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
++        if self.max_grad_norm <= 0.0:
++            raise ValueError(
++                f"max_grad_norm must be > 0, got {self.max_grad_norm}"
++            )
++        if self.warmup_steps < 0:
++            raise ValueError(
++                f"warmup_steps must be >= 0, got {self.warmup_steps}"
++            )
++        if self.optimizer != "AdamW":
++            raise ValueError(
++                "BERT4Rec's published optimizer is Adam with decoupled weight "
++                f"decay, which PyTorch spells AdamW; got {self.optimizer!r}"
++            )
+diff --git a/src/compresso_recsys/models/bert4rec/model.py b/src/compresso_recsys/models/bert4rec/model.py
+new file mode 100644
+index 0000000..0a57d4d
+--- /dev/null
++++ b/src/compresso_recsys/models/bert4rec/model.py
+@@ -0,0 +1,279 @@
++"""The BERT4Rec architecture: §3 of Sun et al., CIKM 2019.
++
++A stack of bidirectional transformer blocks over an item history, read out at
++the positions holding ``[mask]``. The Cloze objective that trains it and the
++batching that feeds it live in :mod:`.trainer`; this module is the network and
++nothing else.
++
++The output is *logits* over the vocabulary, not probabilities. Eq. 7 is written
++as a softmax and Eq. 8 as the negative log-likelihood of it, but a softmax
++followed by a log is the numerically poor way to evaluate that composition:
++where a probability underflows to zero the log is infinite, and clamping it
++makes the loss locally constant and its gradient exactly zero. Returning logits
++lets :meth:`~.trainer.Bert4RecTrainer._train_step` use the fused
++``cross_entropy``, which is the same function of the same inputs evaluated
++stably. Ranking is unaffected either way, the softmax being monotonic.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++__all__ = ["Bert4Rec", "PositionWiseFeedForward"]
++
++# The reference's modeling.layer_norm calls tf.contrib.layers.layer_norm
++# without an epsilon, which defaults to 1e-12; PyTorch's nn.LayerNorm
++# defaults to 1e-5. SASRec's LAYER_NORM_EPS is 1e-8 for the same reason and
++# a different reference: the number belongs to the implementation it was
++# published with, so the two models disagreeing is correct.
++LAYER_NORM_EPS = 1e-12
++
++# Both GELU sites -- Eq. 3's feed-forward and the output head -- take PyTorch's
++# default ``approximate='none'``, the exact ``x * Phi(x)`` §3.3 writes, Phi
++# being the standard Gaussian cumulative distribution function. The
++# reference's modeling.gelu is BERT's tanh approximation,
++# ``0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715x^3)))``, which differs from it by at
++# most ~3e-4. The two disagree here, so the rule that settles LAYER_NORM_EPS
++# does not apply: the reference supplies what the paper leaves unstated, not a
++# second reading of what it states, and the paper states this one.
++
++
++class PositionWiseFeedForward(nn.Module):
++    """Eq. 3's two-layer feed-forward network, applied at every position.
++
++    The inner width is ``4 * d_model``, which Eq. 3 fixes and the released
++    config agrees with (``intermediate_size`` 256 at ``hidden_size`` 64), so it
++    is not a parameter.
++    """
++
++    def __init__(self, d_model: int) -> None:
++        super().__init__()
++
++        self.linear1 = nn.Linear(d_model, 4 * d_model)
++        self.gelu = nn.GELU()
++        self.linear2 = nn.Linear(4 * d_model, d_model)
++
++    def forward(self, states: torch.Tensor) -> torch.Tensor:
++        return self.linear2(self.gelu(self.linear1(states)))
++
++
++class Bert4Rec(nn.Module):
++    """Bidirectional transformer encoder scoring the catalog at ``[mask]``.
++
++    Every position attends to every other, in both directions -- the property
++    that separates this from a causal recommender like
++    :class:`~compresso_recsys.models.SASRec`, and the reason the training
++    objective has to mask: without a mask the target is in the input.
++
++    Constructed by :meth:`~.trainer.Bert4RecTrainer._build_model`, which takes
++    the architecture from :class:`~.config.Bert4RecConfig` and the token ids
++    from the tokenizer, so the defaults here are the config's rather than a
++    second opinion about them.
++    """
++
++    def __init__(
++        self,
++        n_items: int,
++        max_history_length: int,
++        d_model: int,
++        n_blocks: int = 2,
++        n_heads: int = 2,
++        dropout: float = 0.2,
++        att_dropout: float = 0.2,
++        pad: int = 0,
++        mask: int = 1,
++        n_reserved: int = 3,
++    ) -> None:
++        super().__init__()
++
++        self.n_items = n_items
++        self.d_model = d_model
++        self.max_history_length = max_history_length
++
++        # The catalog sits above the reserved ids, so the table has a row for
++        # every special as well as every item. The reference reaches the same
++        # place from the other end: FreqVocab numbers items from 1 and appends
++        # its three specials ([pad], [MASK], [NO_USE]) above them, leaving id 0
++        # unassigned and therefore free for the zero-fill that pads a TFRecord.
++        # Either way a padded position embeds to something that is not an item,
++        # which is the property that matters. The third special differs -- unk
++        # here against the reference's unused [NO_USE] -- so n_reserved is 3 in
++        # both, but for one shared reason and one coincidence.
++        self.n_reserved = n_reserved
++        self.vocab_size = n_reserved + self.n_items
++
++        self.item_embedding = nn.Embedding(
++            self.vocab_size, self.d_model, padding_idx=pad
++        )
++        self.positional_embedding = nn.Embedding(self.max_history_length, self.d_model)
++        # §3.4 writes h_i^0 as the plain sum of the item and position
++        # embeddings -- in prose, not a numbered equation, so there is no Eq. to
++        # cite here however much the rest of this file cites them -- but the
++        # reference's embedding_postprocessor ends with
++        # layer_norm_and_dropout(output, hidden_dropout_prob), so the sum is
++        # normalized and then dropped out before the first block reads it.
++        # Without the norm the first block attends over a state whose scale
++        # is whatever the 0.02 initialization and the position table happen
++        # to add up to; without the dropout, hidden_dropout_prob regularizes
++        # two sites here against the reference's three.
++        self.embedding_norm = nn.LayerNorm(d_model, eps=LAYER_NORM_EPS)
++        self.embedding_dropout = nn.Dropout(dropout)
++
++        self.pad = pad
++        self.mask = mask
++
++        self.attention_layers = nn.ModuleList()
++        self.attention_dropouts = nn.ModuleList()
++        self.attention_norms = nn.ModuleList()
++
++        self.feed_forward_layers = nn.ModuleList()
++        self.feed_forward_dropouts = nn.ModuleList()
++        self.feed_forward_norms = nn.ModuleList()
++
++        for _ in range(n_blocks):
++            attention_layer = nn.MultiheadAttention(
++                d_model, n_heads, att_dropout, batch_first=True
++            )
++            attention_dropout = nn.Dropout(dropout)
++            attention_normalization = nn.LayerNorm(d_model, eps=LAYER_NORM_EPS)
++
++            feed_forward_layer = PositionWiseFeedForward(d_model)
++            feed_forward_dropout = nn.Dropout(dropout)
++
++            feed_forward_normalization = nn.LayerNorm(d_model, eps=LAYER_NORM_EPS)
++
++            self.attention_layers.append(attention_layer)
++            self.attention_dropouts.append(attention_dropout)
++            self.attention_norms.append(attention_normalization)
++            self.feed_forward_layers.append(feed_forward_layer)
++            self.feed_forward_dropouts.append(feed_forward_dropout)
++            self.feed_forward_norms.append(feed_forward_normalization)
++
++        self.projection_layer = nn.Linear(d_model, d_model)
++        self.gelu = nn.GELU()
++        # Eq. 7 goes straight from the GELU to the tied embedding matrix, but
++        # the reference's get_masked_lm_output normalizes in between
++        # (dense -> gelu -> layer_norm -> matmul):
++        # https://github.com/FeiSun/BERT4Rec/blob/b5a1c2eddbe5c2cb4ae6c7a7845b3e6f251f90ba/run.py#L366-L385
++        # It is not cosmetic: the embeddings are initialized at a standard
++        # deviation of 0.02, so without a normalized state the dot products
++        # start within ~1e-3 of each other and the softmax is uniform to four
++        # decimal places, which leaves almost no gradient for the blocks below.
++        self.projection_norm = nn.LayerNorm(d_model, eps=LAYER_NORM_EPS)
++        self.output_bias = nn.Parameter(torch.zeros(self.vocab_size))
++
++    def forward(
++        self,
++        item_history: torch.Tensor,
++        padding_mask: torch.Tensor | None = None,
++        mask_positions: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Score the vocabulary at every predicted position in the batch.
++
++        Returns one row of logits per predicted position, in row-major order
++        over ``item_history`` -- the order
++        :meth:`~.trainer.Bert4RecTrainer._cloze_batch` builds its labels in, so
++        the two line up.
++
++        ``mask_positions`` marks which positions to read, and training has to
++        pass it. Under the reference's ``mask_prob`` a chosen position becomes
++        ``[mask]`` only some of the time; the rest keep the original item or
++        take a random one, and Eq. 8 covers those too. Recovering the positions
++        from ``item_history == mask`` would find fewer of them than there are
++        labels, which is why the correspondence cannot rest on the token alone.
++        Prediction passes nothing and falls back to it, the batch there being
++        built with exactly one ``[mask]`` per row and no corruption at all.
++
++        A batch with nothing to read would make that correspondence vacuous
++        rather than wrong, and silently returning an empty score matrix hides
++        the mistake downstream, so it is refused here.
++        """
++        item_history = item_history[..., -self.max_history_length :]
++
++        embedded_items = self.item_embedding(item_history)
++
++        positions = torch.arange(
++            0, item_history.shape[-1], dtype=torch.long, device=item_history.device
++        )
++        embedded_positions = self.positional_embedding(positions)
++
++        input_embedding = self.embedding_dropout(
++            self.embedding_norm(embedded_items + embedded_positions)
++        )
++
++        trm_input_output = input_embedding
++
++        # True marks a position attention must not read. Padding carries no
++        # interaction, so letting a real position attend to it would mix a
++        # filler embedding into the representation the Cloze target is read
++        # from -- and the amount mixed in would depend on how much padding the
++        # row happened to need, which is an artefact of batching rather than
++        # anything about the user.
++        #
++        # PyTorch masks by adding -inf before the softmax, where the reference's
++        # create_attention_mask_from_input_mask adds -10000.0 and so leaves
++        # padding a weight of e^-10000 rather than zero. No row here is entirely
++        # padding -- every window holds at least one interaction -- so the
++        # softmax is well defined either way and the difference is unobservable.
++        key_padding_mask = None
++        if padding_mask is not None:
++            key_padding_mask = ~padding_mask[..., -self.max_history_length :]
++
++        for (
++            attention_layer,
++            attention_dropout,
++            attention_normalization,
++            feed_forward_layer,
++            feed_forward_dropout,
++            feed_forward_normalization,
++        ) in zip(
++            self.attention_layers,
++            self.attention_dropouts,
++            self.attention_norms,
++            self.feed_forward_layers,
++            self.feed_forward_dropouts,
++            self.feed_forward_norms,
++        ):
++            applied_attention, _ = attention_layer(
++                trm_input_output,
++                trm_input_output,
++                trm_input_output,
++                key_padding_mask=key_padding_mask,
++                need_weights=False,
++            )
++
++            applied_attention_dropout = attention_dropout(applied_attention)
++
++            in_between_residual = trm_input_output + applied_attention_dropout
++
++            normalized_attention = attention_normalization(in_between_residual)
++
++            applied_feed_forward = feed_forward_layer(normalized_attention)
++
++            applied_feed_forward_dropout = feed_forward_dropout(applied_feed_forward)
++
++            final_residual = normalized_attention + applied_feed_forward_dropout
++
++            trm_input_output = feed_forward_normalization(final_residual)
++
++        if mask_positions is None:
++            selected = item_history == self.mask
++        else:
++            selected = mask_positions[..., -self.max_history_length :]
++        masked_hidden = trm_input_output[torch.where(selected)]
++        if masked_hidden.shape[0] == 0:
++            raise ValueError(
++                "Bert4Rec reads its output at the predicted positions and "
++                "this batch has none: "
++                + (
++                    f"no token equals the mask id {self.mask}"
++                    if mask_positions is None
++                    else "mask_positions selects nothing"
++                )
++            )
++
++        projection_linear = self.projection_layer(masked_hidden)
++        projection_activation = self.gelu(projection_linear)
++        projection_normalized = self.projection_norm(projection_activation)
++        return projection_normalized @ self.item_embedding.weight.T + self.output_bias
+diff --git a/src/compresso_recsys/models/bert4rec/trainer.py b/src/compresso_recsys/models/bert4rec/trainer.py
+new file mode 100644
+index 0000000..91ff7c2
+--- /dev/null
++++ b/src/compresso_recsys/models/bert4rec/trainer.py
+@@ -0,0 +1,918 @@
++"""Cloze training and next-item prediction for BERT4Rec.
++
++Sun et al., *BERT4Rec: Sequential Recommendation with Bidirectional Encoder
++Representations from Transformer*, CIKM 2019. The model in :mod:`.model` is the
++paper's architecture; this module is §3.6, "Model Learning", and the batching
++the paper leaves to its implementation.
++
++The shape of a fit::
++
++    ItemSequences
++      -> sliding windows over histories longer than N       (reference)
++      -> duplication_factor independent maskings per window (§3.6)
++      -> + one last-item-masked sample per window           (§3.6)
++      -> tokenize, right-pad to the batch width
++      -> Bert4Rec -> catalog logits at the masked positions
++      -> cross entropy against the true items               (Eq. 8)
++
++Prediction appends ``[mask]`` to the history and ranks the catalog from that
++position's output, which is the paper's remedy for the train/test mismatch the
++Cloze objective creates.
++
++Where the paper does not specify something, this follows the authors' released
++TensorFlow implementation (https://github.com/FeiSun/BERT4Rec) and says so at
++the point of the decision.
++"""
++
++from __future__ import annotations
++
++import time
++from collections.abc import Hashable, Sequence
++from dataclasses import replace
++from typing import Any
++
++import numpy as np
++import torch
++from compresso import SRPTensor
++from torch import nn
++from torch.nn import functional as F
++
++from compresso_recsys._reporting import (
++    _INHERIT,
++    _format_duration,
++    _Inherit,
++    _Reporter,
++    _resolve_reporter,
++)
++from compresso_recsys.models.base import BaseSequentialRecommender
++from compresso_recsys.models.identifiers import ItemVocabulary
++from compresso_recsys.models.sequence_batching import SequenceBatcher
++from compresso_recsys.models.tokenizer import ItemTokenizer
++from compresso_recsys.persistence import (
++    ModelCheckpointReader,
++    ModelCheckpointWriter,
++)
++from compresso_recsys.sequences import ItemSequences
++
++from .config import Bert4RecConfig
++from .model import Bert4Rec
++
++__all__ = ["Bert4RecTrainer"]
++
++#: ``pad`` fills the batch rectangle and must never be an item; ``mask`` is the
++#: Cloze token the model predicts at; ``unk`` represents an item outside the
++#: fitted catalog, which a later split stage can produce. The reference reserves
++#: id 0 for padding and gives ``[MASK]`` its own entry for the same reasons.
++SPECIAL_TOKENS = {"pad": 0, "mask": 1, "unk": 2}
++
++
++def _sliding_windows(history: np.ndarray, width: int, step: int) -> list[np.ndarray]:
++    """Split one history into overlapping windows of at most ``width``.
++
++    A history no longer than the window is one sample. A longer one is cut into
++    windows ending at the most recent interaction and walking backwards by
++    ``step``, with the oldest window pinned to the start so no interaction is
++    dropped. That is ``create_training_instances`` in the reference generator:
++    the windows are produced back-to-front and then reversed, so the returned
++    list is in chronological order.
++
++    Without this, everything before the last ``N`` interactions of a long
++    history would never appear in training at all.
++    """
++    length = int(history.size)
++    if length <= width:
++        return [history]
++    starts = list(range(length - width, 0, -step))
++    starts.append(0)
++    return [history[start : start + width] for start in reversed(starts)]
++
++
++class Bert4RecTrainer(BaseSequentialRecommender):
++    """Train :class:`Bert4Rec` with the Cloze objective and rank from ``[mask]``.
++
++    ``fit`` builds the vocabulary, the batcher and the model unless a batcher was
++    supplied for its vocabulary, then runs ``cfg.epochs`` passes over the Cloze
++    samples. ``predict_on_batch`` appends ``[mask]`` and ranks the catalog from
++    the final hidden state at that position.
++
++    The trainer owns tokenization because the checkpointed histories deliberately
++    do not: :class:`~compresso_recsys.ItemSequences` holds catalog indices with
++    no padding and no special tokens, so ``[mask]``, ``[pad]`` and the right
++    padding that makes a dense batch are all decided here.
++    """
++
++    checkpoint_type = "bert4rec_trainer"
++
++    def __init__(
++        self,
++        config: Bert4RecConfig | None = None,
++        batcher: SequenceBatcher | None = None,
++        logger: Any | None = None,
++    ) -> None:
++        self.cfg = config or Bert4RecConfig()
++        self.logger = logger
++        self.device = torch.device(self.cfg.device)
++        self.history: list[dict[str, float]] = []
++        self.model: Bert4Rec | None = None
++        self.optimizer: torch.optim.Optimizer | None = None
++        self.batcher = batcher
++        self._owns_batcher = batcher is None
++        self._n_items: int | None = None
++        # Set by fit and by _from_checkpoint_config, both of which know the
++        # window. Declared here so the attribute exists on an unfitted trainer
++        # rather than being absent until one of them runs.
++        self._predict_batcher: SequenceBatcher | None = None
++
++    # -- contract -----------------------------------------------------------
++
++    @property
++    def is_fitted(self) -> bool:
++        return self.model is not None
++
++    @property
++    def n_items(self) -> int | None:
++        return self._n_items
++
++    def _reporter(self, logger: Any, show_progress: Any) -> _Reporter:
++        return _resolve_reporter(
++            default_logger=self.logger,
++            logger=logger,
++            default_show_progress=self.cfg.show_progress,
++            show_progress=show_progress,
++            prefix=self.cfg.log_prefix,
++            log_every_n_steps=self.cfg.log_every_n_steps,
++        )
++
++    # -- training -----------------------------------------------------------
++
++    def fit(
++        self,
++        sequences: ItemSequences,
++        *,
++        item_ids: Sequence[Hashable] | np.ndarray | None = None,
++        logger: Any | None = _INHERIT,
++        show_progress: bool | None | _Inherit = _INHERIT,
++    ) -> Bert4RecTrainer:
++        """Train on chronological histories with the Cloze objective.
++
++        Validates the input, builds a default batcher when none was supplied,
++        reconciles its window with the config, records the item IDs, seeds Torch
++        and NumPy from ``cfg.seed``, builds the model and optimizer, then runs
++        ``cfg.epochs`` passes over freshly masked samples.
++
++        Masking is redrawn every epoch rather than fixed once. The reference
++        materializes ``dupe_factor`` maskings of every sequence to a file before
++        training and then reads that file each epoch; drawing them per epoch
++        gives the same distribution over a run without holding the expansion in
++        memory, and is strictly more varied for the same number of steps.
++
++        Rebuilds the model on every call: early stopping and incremental
++        training are not part of this contract.
++        """
++        reporter = self._reporter(logger, show_progress)
++        if not isinstance(sequences, ItemSequences):
++            raise TypeError(
++                "Bert4RecTrainer trains on ItemSequences, got "
++                f"{type(sequences).__name__}"
++            )
++        if sequences.n_rows == 0:
++            raise ValueError("cannot train on zero sequences")
++        if sequences.n_items < 1:
++            raise ValueError("cannot train on an empty catalog")
++
++        if self._owns_batcher:
++            self.batcher = SequenceBatcher(
++                ItemTokenizer(sequences.n_items, special_tokens=SPECIAL_TOKENS),
++                max_length=self.cfg.max_history_length,
++            )
++        if self.batcher is None:  # pragma: no cover - defensive against mutation
++            raise RuntimeError("trainer batcher is unavailable")
++        if self.batcher.tokenizer.n_items != sequences.n_items:
++            raise ValueError(
++                "batcher tokenizer has "
++                f"{self.batcher.tokenizer.n_items} items, but training "
++                f"sequences have {sequences.n_items}"
++            )
++        self._check_tokenizer(self.batcher.tokenizer)
++        tokenizer_ids = getattr(self.batcher.tokenizer, "item_ids", None)
++        if item_ids is not None and tokenizer_ids is not None:
++            supplied = ItemVocabulary.from_ids(item_ids).item_ids
++            if not np.array_equal(supplied, tokenizer_ids):
++                raise ValueError(
++                    "item_ids must match the batcher tokenizer item IDs"
++                )
++        self._set_item_ids(
++            tokenizer_ids if item_ids is None else item_ids,
++            n_items=sequences.n_items,
++        )
++        # A batcher handed over for its vocabulary usually states no window; it
++        # inherits the config's, which is the number that sized the positional
++        # table. Stating both and disagreeing is an error rather than a silent
++        # win for either.
++        if self.batcher.max_length is None:
++            self.batcher = replace(
++                self.batcher, max_length=self.cfg.max_history_length
++            )
++        elif int(self.batcher.max_length) != self.cfg.max_history_length:
++            raise ValueError(
++                f"batcher max_length ({self.batcher.max_length}) and config "
++                f"max_history_length ({self.cfg.max_history_length}) disagree; "
++                "the window sizes the positional table, so it cannot be two "
++                "numbers"
++            )
++        # Right padding is the reference's, which zero-fills to the right of
++        # each sequence. It also keeps position 0 meaning "oldest retained
++        # interaction" for every row, which is what a learned positional table
++        # reads under the Cloze objective -- unlike SASRec, nothing here gathers
++        # a final state whose column depends on the row's length.
++        if self.batcher.padding != "right":
++            self.batcher = replace(self.batcher, padding="right")
++
++        # Prediction appends [mask] to the history, so the encoder must have a
++        # position free for it. Training encodes at the full window; prediction
++        # truncates one shorter and then appends.
++        self._predict_batcher = replace(
++            self.batcher, max_length=self.cfg.max_history_length - 1
++        )
++
++        torch.manual_seed(int(self.cfg.seed))
++        # One generator for window choice, masking and row order alike, so a run
++        # is reproducible from cfg.seed alone.
++        rng = np.random.default_rng(int(self.cfg.seed))
++        self._n_items = sequences.n_items
++        self.model = self._build_model()
++        self._build_checkpoint_optimizer()
++        assert self.optimizer is not None
++        optimizer = self.optimizer
++        self.history = []
++
++        samples = self._training_windows(sequences)
++        if not samples:
++            raise ValueError(
++                "no history has at least two interactions -- one to mask and "
++                "one to predict it from -- so there is no Cloze example to "
++                "learn from"
++            )
++
++        n_samples = len(samples)
++        batch_size = self.cfg.batch_size
++        starts = range(0, n_samples, batch_size)
++        scheduler = self._build_scheduler(optimizer, len(starts) * self.cfg.epochs)
++
++        fit_started = time.monotonic()
++        reporter.log(
++            "fit started: "
++            f"{sequences.n_rows} sequences -> {n_samples} Cloze samples | "
++            f"{self._n_items} items | rho={self.cfg.mask_proportion} | "
++            f"{len(starts)} batches of {batch_size} | {self.cfg.epochs} epochs | "
++            f"device {self.device}"
++        )
++        epoch_iter = reporter.wrap(
++            range(1, self.cfg.epochs + 1),
++            total=self.cfg.epochs,
++            desc="Bert4Rec fit",
++        )
++        batch_bar = reporter.bar(total=len(starts), desc="Bert4Rec epoch 1")
++        try:
++            for epoch in epoch_iter:
++                epoch_started = time.monotonic()
++                self.model.train()
++                order = rng.permutation(n_samples)
++                if batch_bar is not None:
++                    batch_bar.reset(total=len(starts))
++                    batch_bar.set_description(f"Bert4Rec epoch {epoch}")
++                loss_sum, predicted = 0.0, 0
++                last_training_lr = float(optimizer.param_groups[0]["lr"])
++                for step_index, start in enumerate(starts, start=1):
++                    selected = order[start : start + batch_size]
++                    batch_lr = float(optimizer.param_groups[0]["lr"])
++                    step = self._train_step(
++                        [samples[int(index)] for index in selected], rng
++                    )
++                    if scheduler is not None:
++                        scheduler.step()
++                    if step is not None:
++                        last_training_lr = batch_lr
++                        batch_loss, batch_predicted = step
++                        loss_sum += batch_loss * batch_predicted
++                        predicted += batch_predicted
++                    if batch_bar is not None:
++                        batch_bar.update(1)
++                    log_steps = reporter.log_every_n_steps
++                    if log_steps and step_index % log_steps == 0:
++                        reporter.step(
++                            f"epoch {epoch}/{self.cfg.epochs} step "
++                            f"{step_index}/{len(starts)}",
++                            step_index,
++                            len(starts),
++                            epoch_started,
++                            {
++                                "loss": (
++                                    loss_sum / predicted
++                                    if predicted
++                                    else float("nan")
++                                )
++                            },
++                        )
++                mean_loss = loss_sum / predicted if predicted else float("nan")
++                record = {
++                    "epoch": float(epoch),
++                    "loss": mean_loss,
++                    "masked_items": float(predicted),
++                    "lr": last_training_lr,
++                }
++                self.history.append(record)
++                reporter.epoch(
++                    f"epoch {epoch}/{self.cfg.epochs}", record, epoch_started
++                )
++                if hasattr(epoch_iter, "set_postfix"):
++                    epoch_iter.set_postfix({"loss": f"{mean_loss:.4f}"})
++        finally:
++            if batch_bar is not None:
++                batch_bar.close()
++            if hasattr(epoch_iter, "close"):
++                epoch_iter.close()
++
++        reporter.log(
++            f"fit finished: {_format_duration(time.monotonic() - fit_started)} "
++            f"total | {len(self.history)} epochs recorded"
++        )
++        return self
++
++    # -- Cloze sample construction ------------------------------------------
++
++    def _training_windows(
++        self, sequences: ItemSequences
++    ) -> list[tuple[np.ndarray, bool]]:
++        """Every window to train on, paired with whether to mask only its last.
++
++        Three things happen here, all from §3.6 and the reference generator.
++        A history longer than the window becomes several overlapping windows, so
++        its early interactions are trained on. Each window is repeated
++        ``duplication_factor`` times, which is how one history yields the many
++        samples the Cloze objective is credited with -- the masking itself is
++        drawn per step, so the repeats differ. And each history contributes one
++        last-item-masked sample, the paper's fine-tuning for the actual
++        prediction task -- one per window, as ``mask_last`` does.
++
++        Histories shorter than two interactions are dropped. An empty one has
++        nothing to mask, and a single one has nothing to mask it *from*: every
++        such sample would be a lone ``[mask]`` at position 0, the same input
++        whatever its label, so all it could teach is a popularity prior. The
++        last-item branch below drops the same case for the same reason.
++        """
++        width = self.cfg.max_history_length
++        step = max(1, int(self.cfg.sliding_window_step * width))
++        samples: list[tuple[np.ndarray, bool]] = []
++        for row in range(sequences.n_rows):
++            history = np.asarray(sequences.row(row), dtype=np.int64)
++            # Sliding windows over a history of two or more are all at least
++            # that long -- the oldest is pinned to the start, not cut short --
++            # so filtering the history filters every window it yields.
++            if history.size < 2:
++                continue
++            windows = _sliding_windows(history, width, step)
++            for _ in range(self.cfg.duplication_factor):
++                samples.extend((window, False) for window in windows)
++            if self.cfg.last_item_samples:
++                # §3.6's fine-tuning sample: a sequence with only the final
++                # position masked, "to better match the sequential
++                # recommendation task".
++                #
++                # One per window, not one per user: create_training_instances
++                # calls mask_last on the training branch too, and mask_last
++                # iterates the user's whole document, which is the list of
++                # windows. A history that fits the window is a single window, so
++                # this differs from one-per-user only for the long histories the
++                # sliding window exists to serve.
++                #
++                # The masked position is the last of the window, so the context
++                # it leaves is ``width - 1`` interactions -- exactly what
++                # predict_on_batch encodes before appending [mask]. A wider
++                # context would train "recover the interaction you were shown",
++                # one step behind the question prediction asks. SASRec pays for
++                # the same shift by encoding one interaction wider than its
++                # window.
++                #
++                # Masking the last item of a window with only one position
++                # leaves no context at all, so the model would be asked to
++                # predict an item from nothing. The reference asserts the
++                # position is non-zero rather than handling it; the length
++                # filter above is the same requirement without the crash.
++                samples.extend((window, True) for window in windows)
++        return samples
++
++    def _cloze_batch(
++        self,
++        windows: list[tuple[np.ndarray, bool]],
++        rng: np.random.Generator,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Mask, tokenize and right-pad one batch of windows.
++
++        Returns ``(tokens, padding_mask, masked, labels)``. ``masked`` marks the
++        positions the loss is taken at and ``labels`` holds the token id of the
++        true item at each of them, in row-major order over ``masked`` -- the
++        order :meth:`Bert4Rec.forward` gathers them in when it is handed the
++        same index.
++
++        The index has to be passed rather than recovered from the tokens: below
++        a ``mask_token_probability`` of 1.0 a chosen position may keep its item
++        or take a random one, and the loss covers those as much as the masked
++        ones, so ``tokens == mask`` finds fewer positions than there are labels.
++
++        Positions are chosen per §3.6: ``round(len * rho)`` of them, at least
++        one, capped at ``max_predictions`` and at ``len - 1`` so that some
++        context always survives, sampled without replacement. The
++        reference is Python 2, where ``round`` goes half away from zero rather
++        than to even, but no published rho puts ``len * rho`` on a half-integer,
++        so the two agree everywhere it has been run. A
++        chosen position becomes ``[mask]`` with probability
++        ``mask_token_probability``; the reference's default of 1.0 means it
++        always does, and the remainder splits evenly between keeping the item
++        and drawing a random one.
++
++        ``unk_dropout`` then replaces a fraction of the positions *not* chosen
++        -- the context -- with ``unk``. Chosen positions are exempt so no label
++        is lost, and padding is exempt so ``unk`` and ``pad`` stay distinct. At
++        a rate of zero no random number is drawn, so the batch is exactly the
++        one a config without the field would have produced from the same seed.
++        """
++        assert self.batcher is not None
++        tokenizer = self.batcher.tokenizer
++        mask_id = tokenizer.token_id("mask")
++        unk_id = getattr(tokenizer, "unk_id", None)
++        unk_dropout = self.cfg.unk_dropout if unk_id is not None else 0.0
++        n_reserved = tokenizer.n_reserved
++        n_items = tokenizer.n_items
++
++        width = max(window.size for window, _ in windows)
++        rows = len(windows)
++        tokens = np.full((rows, width), tokenizer.pad_id, dtype=np.int64)
++        padding = np.zeros((rows, width), dtype=bool)
++        masked = np.zeros((rows, width), dtype=bool)
++        labels: list[np.ndarray] = []
++
++        for row, (window, force_last) in enumerate(windows):
++            length = int(window.size)
++            encoded = tokenizer.encode_indices(window)
++            tokens[row, :length] = encoded
++            padding[row, :length] = True
++
++            if force_last:
++                chosen = np.array([length - 1], dtype=np.int64)
++            else:
++                # The len - 1 cap keeps one position of context: a fully masked
++                # window is the same input whatever its items, so its labels
++                # could only be learned as a popularity prior. It binds only at
++                # a rho high enough to round up to the whole window -- 1.0, or
++                # >= 0.75 on a window of two.
++                count = min(
++                    self.cfg.max_predictions,
++                    max(1, round(length * self.cfg.mask_proportion)),
++                    length - 1,
++                )
++                chosen = rng.choice(length, size=count, replace=False)
++                chosen.sort()
++
++            masked[row, chosen] = True
++            labels.append(encoded[chosen])
++
++            if unk_dropout > 0.0:
++                context = ~masked[row, :length]
++                replaced = context & (rng.random(length) < unk_dropout)
++                tokens[row, :length][replaced] = unk_id
++
++            if force_last or self.cfg.mask_token_probability >= 1.0:
++                tokens[row, chosen] = mask_id
++                continue
++            draws = rng.random(chosen.size)
++            replacement = np.where(
++                draws < self.cfg.mask_token_probability,
++                mask_id,
++                # Below the threshold the reference splits the remainder in
++                # half: keep the original item, or substitute a random one.
++                np.where(
++                    rng.random(chosen.size) < 0.5,
++                    encoded[chosen],
++                    rng.integers(n_reserved, n_reserved + n_items, chosen.size),
++                ),
++            )
++            tokens[row, chosen] = replacement
++
++        return (
++            torch.from_numpy(tokens).to(self.device),
++            torch.from_numpy(padding).to(self.device),
++            torch.from_numpy(masked).to(self.device),
++            torch.from_numpy(np.concatenate(labels)).to(self.device),
++        )
++
++    def _train_step(
++        self,
++        windows: list[tuple[np.ndarray, bool]],
++        rng: np.random.Generator,
++    ) -> tuple[float, int] | None:
++        """Optimize one batch against Eq. 8.
++
++        Eq. 8 is the negative log-likelihood of the softmax in Eq. 7, which is
++        what ``cross_entropy`` computes from logits -- by the log-sum-exp
++        identity rather than by forming the probability and taking its log. The
++        two are the same function of the same inputs; only the second one
++        underflows. Where a probability reaches zero in float32 its log is
++        infinite, and clamping it makes the loss locally constant, so the
++        gradient at exactly the positions the model is most wrong about is zero.
++        """
++        assert self.model is not None
++        assert self.optimizer is not None
++        if not windows:
++            return None
++
++        tokens, padding, masked, labels = self._cloze_batch(windows, rng)
++        if labels.numel() == 0:
++            return None
++
++        logits = self.model(tokens, padding, masked)
++        loss = F.cross_entropy(logits, labels)
++
++        self.optimizer.zero_grad(set_to_none=True)
++        loss.backward()
++        # "The gradient is clipped when its l2 norm exceeds a threshold of 5."
++        torch.nn.utils.clip_grad_norm_(
++            self.model.parameters(), self.cfg.max_grad_norm
++        )
++        self.optimizer.step()
++        return float(loss.detach()), int(labels.numel())
++
++    # -- prediction ---------------------------------------------------------
++
++    def predict_on_batch(
++        self,
++        source: ItemSequences,
++        *,
++        k: int,
++        exclude_seen: bool = True,
++        candidate_ids: Sequence[Hashable] | np.ndarray | None = None,
++    ) -> SRPTensor:
++        """Rank the catalog from a ``[mask]`` appended to each history.
++
++        §3.6, "Test": the Cloze objective predicts a masked position, while the
++        task is to predict the future, so the token is appended to the end of
++        the history and the recommendation is read from its hidden state.
++
++        The ranking itself is this package's and not the paper's. §4.2 ranks
++        the held-out item against 100 popularity-sampled negatives; this ranks
++        the whole catalog and, by default, strikes out what the user has
++        already seen. Full-catalog ranking is the harder and more honest
++        measurement, but it is a different one, so HR@k and NDCG@k from here
++        are not comparable to the paper's tables.
++
++        Every row gets exactly one masked position, and rows are padded to a
++        common width, so the model's masked-position gather returns one row of
++        scores per source row in order.
++        """
++        if self.model is None or self._n_items is None:
++            raise RuntimeError("Bert4RecTrainer must be fitted before predicting")
++        if not isinstance(source, ItemSequences):
++            raise TypeError(
++                "Bert4RecTrainer predicts from ItemSequences, got "
++                f"{type(source).__name__}"
++            )
++        if self._predict_batcher is None:  # pragma: no cover - defensive
++            raise RuntimeError("trainer batcher is unavailable")
++
++        n_items = self._n_items
++        candidate_rows = self._candidate_rows(candidate_ids)
++        candidate_count = int(candidate_rows.size)
++        if not 1 <= k <= candidate_count:
++            raise ValueError(f"k must be in [1, {candidate_count}], got {k}")
++        if exclude_seen:
++            self._check_unseen_capacity(
++                source,
++                n_items=n_items,
++                k=k,
++                candidate_rows=candidate_rows,
++            )
++
++        rows = source.n_rows
++        if rows == 0:
++            return SRPTensor(
++                cols=torch.empty((0, k), dtype=torch.long, device=self.device),
++                vals=torch.empty((0, k), dtype=torch.float32, device=self.device),
++                shape=(0, n_items),
++            )
++
++        self.model.eval()
++        with torch.no_grad():
++            tokens, padding = self._encode_with_mask(source)
++            logits = self.model(tokens, padding)
++            # The model scores the whole vocabulary; the catalog is the part
++            # above the reserved ids, and nothing downstream of a model sees a
++            # token id. These are logits rather than probabilities, which ranks
++            # identically -- the softmax is monotonic -- and matches what every
++            # other model in the package returns as a score.
++            scores = logits[:, self._item_offset :]
++            if exclude_seen:
++                self._mask_seen(scores, source)
++            candidates = torch.from_numpy(candidate_rows).long().to(self.device)
++            vals, local_cols = torch.topk(scores[:, candidates], k, dim=1)
++            cols = candidates[local_cols]
++
++        return SRPTensor(cols=cols, vals=vals, shape=(rows, n_items))
++
++    def _encode_with_mask(
++        self, source: ItemSequences
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Encode histories with ``[mask]`` appended to each.
++
++        The batcher truncates to one short of the window, so appending keeps
++        every row inside the positional table. The appended token is a real
++        position rather than padding -- it is the one the model reads -- so it
++        is marked in the padding mask.
++        """
++        assert self.model is not None
++        batcher = self._predict_batcher
++        tokens, padding = batcher.encode(source, device=self.device)
++        lengths = padding.sum(dim=1)
++        rows = tokens.shape[0]
++        column = torch.arange(rows, device=tokens.device)
++
++        pad_id = batcher.tokenizer.pad_id
++        widened = torch.full(
++            (rows, int(tokens.shape[1]) + 1),
++            pad_id,
++            dtype=tokens.dtype,
++            device=tokens.device,
++        )
++        widened[:, : tokens.shape[1]] = tokens
++        widened[column, lengths] = self.model.mask
++
++        widened_padding = torch.zeros(
++            widened.shape, dtype=torch.bool, device=tokens.device
++        )
++        widened_padding[:, : padding.shape[1]] = padding
++        widened_padding[column, lengths] = True
++        return widened, widened_padding
++
++    @property
++    def _item_offset(self) -> int:
++        assert self.batcher is not None
++        return int(self.batcher.tokenizer.n_reserved)
++
++    def _mask_seen(self, scores: torch.Tensor, source: ItemSequences) -> None:
++        """Forbid every item in the *full* history, truncated part included.
++
++        Scores are indexed by catalog position, and a history may span a wider
++        catalog than this model was fitted on -- a later split stage does
++        exactly that. Items beyond the fitted catalog are dropped from the mask
++        rather than clipped: they were never scoreable, so there is nothing to
++        forbid.
++        """
++        if source.values.size == 0:
++            return
++        n_items = int(scores.shape[1])
++        rows = np.repeat(np.arange(source.n_rows), source.row_lengths)
++        cols = np.array(source.values, dtype=np.int64)
++        scoreable = cols < n_items
++        if not scoreable.all():
++            rows, cols = rows[scoreable], cols[scoreable]
++        if cols.size == 0:
++            return
++        scores[
++            torch.as_tensor(rows, dtype=torch.long, device=scores.device),
++            torch.as_tensor(cols, dtype=torch.long, device=scores.device),
++        ] = -torch.inf
++
++    # -- construction -------------------------------------------------------
++
++    @staticmethod
++    def _check_tokenizer(tokenizer: Any) -> None:
++        """Require the vocabulary to carry a ``mask`` token.
++
++        The Cloze objective is not expressible without one: masking with an item
++        id would teach the model that that item means "predict here".
++        """
++        token_id = getattr(tokenizer, "token_id", None)
++        if token_id is None:
++            raise TypeError(
++                "Bert4Rec needs a tokenizer with named special tokens, got "
++                f"{type(tokenizer).__name__}"
++            )
++        try:
++            token_id("mask")
++        except KeyError:
++            raise ValueError(
++                "Bert4Rec's Cloze objective needs a 'mask' special token; "
++                "build the tokenizer with "
++                "ItemTokenizer(n_items, special_tokens="
++                f"{SPECIAL_TOKENS})"
++            ) from None
++
++    def _build_model(self) -> Bert4Rec:
++        if self.batcher is None:
++            raise RuntimeError("trainer batcher is unavailable")
++        tokenizer = self.batcher.tokenizer
++        model = Bert4Rec(
++            n_items=tokenizer.n_items,
++            max_history_length=self.cfg.max_history_length,
++            d_model=self.cfg.d_model,
++            n_blocks=self.cfg.n_blocks,
++            n_heads=self.cfg.n_heads,
++            dropout=self.cfg.dropout,
++            att_dropout=self.cfg.att_dropout,
++            pad=tokenizer.pad_id,
++            mask=tokenizer.token_id("mask"),
++            n_reserved=tokenizer.n_reserved,
++        ).to(self.device)
++        self._init_weights(model)
++        return model
++
++    def _init_weights(self, model: Bert4Rec) -> None:
++        """Truncated normal with standard deviation ``initializer_range``.
++
++        §4.3 reads "initialized using truncated normal distribution in the range
++        [-0.02, 0.02]", but the reference's ``create_initializer`` passes 0.02 as
++        ``stddev`` to ``tf.truncated_normal_initializer``, which truncates at two
++        standard deviations:
++        https://github.com/FeiSun/BERT4Rec/blob/b5a1c2eddbe5c2cb4ae6c7a7845b3e6f251f90ba/modeling.py#L371-L373
++
++        So 0.02 is the deviation and 0.04 the bound, not the other way round;
++        reading it as the bound shrinks every weight by half and leaves the tied
++        output head dotting a normalized state against embeddings too small to
++        separate any two items.
++
++        The padding row is zeroed afterwards so a padded position embeds to
++        nothing.
++        """
++        std = float(self.cfg.initializer_range)
++        bound = 2.0 * std
++        for module in model.modules():
++            if isinstance(module, (nn.Linear, nn.Embedding)):
++                nn.init.trunc_normal_(
++                    module.weight, std=std, a=-bound, b=bound
++                )
++            if isinstance(module, nn.Linear) and module.bias is not None:
++                nn.init.zeros_(module.bias)
++            if isinstance(module, nn.MultiheadAttention):
++                for weight in (module.in_proj_weight, module.out_proj.weight):
++                    if weight is not None:
++                        nn.init.trunc_normal_(weight, std=std, a=-bound, b=bound)
++                for bias in (module.in_proj_bias, module.out_proj.bias):
++                    if bias is not None:
++                        nn.init.zeros_(bias)
++        with torch.no_grad():
++            model.item_embedding.weight[model.pad].zero_()
++
++    def _build_scheduler(
++        self, optimizer: torch.optim.Optimizer, total_steps: int
++    ) -> torch.optim.lr_scheduler.LRScheduler | None:
++        """Linear warmup then linear decay toward zero.
++
++        §4.3 specifies "linear decay of the learning rate", which the shared
++        ``_schedule`` helper does not offer -- it has constant and cosine -- so
++        it is written here rather than by widening a helper two other models
++        depend on.
++
++        The shape is ``create_optimizer``'s: a ``polynomial_decay`` of power 1
++        from ``init_lr`` to zero across *all* ``num_train_steps``, which a
++        linear warmup overrides for the first stretch rather than displacing.
++        So the decay is measured from step 0 and not from the end of warmup,
++        and the rate re-enters a little below ``init_lr`` once the warmup lets
++        go, instead of restarting at it.
++
++        Neither end of the schedule spends a step at exactly zero: the last
++        step lands at ``1 / total_steps`` of the peak, and the warmup starts at
++        ``1 / (warmup + 1)`` where ``create_optimizer`` starts at 0. A step
++        whose learning rate is zero computes a gradient, clips it, and applies
++        nothing.
++        """
++        if total_steps <= 1:
++            return None
++        # Not clamped to total_steps: create_optimizer ramps toward a flat
++        # num_warmup_steps and simply ends early if the run is shorter, which
++        # leaves a short fit training below the peak rate throughout rather
++        # than compressing the ramp to fit.
++        warmup = int(self.cfg.warmup_steps)
++
++        def factor(step: int) -> float:
++            if step < warmup:
++                # Step 0 would otherwise train at exactly zero and waste a step.
++                return (step + 1) / (warmup + 1)
++            return max(0.0, 1.0 - step / total_steps)
++
++        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=factor)
++
++    def _build_checkpoint_optimizer(self) -> None:
++        """Construct the optimizer before optimizer state is loaded into it.
++
++        Weight decay skips biases and LayerNorm parameters, matching
++        ``exclude_from_weight_decay`` in the reference. Decaying a normalization
++        scale pulls it toward zero, which shrinks the activations it exists to
++        standardize.
++
++        The decoupling itself is equivalent: the reference applies
++        ``param -= lr * (update + weight_decay * param)`` where AdamW scales the
++        parameter by ``1 - lr * weight_decay`` and then takes the Adam step,
++        which is the same update rearranged.
++
++        One thing is not equivalent. ``AdamWeightDecayOptimizer`` computes
++        ``update = next_m / (sqrt(next_v) + epsilon)`` with no bias correction,
++        which the comment there calls a deliberate departure from Adam;
++        ``torch.optim.AdamW`` always corrects. The ratio of the two step sizes
++        is ``sqrt(1 - beta2**t) / (1 - beta1**t)``, so this takes roughly a
++        third of the reference's step at t = 1 and agrees with it to within a
++        percent by t ~ 1000. Warmup covers most of that stretch. Matching it
++        exactly would mean carrying an optimizer, which is a poor trade for a
++        difference that has vanished before the schedule reaches its peak.
++        """
++        if self.model is None:
++            raise RuntimeError("Bert4Rec model must be built before its optimizer")
++        decayed, spared = [], []
++        for name, parameter in self.model.named_parameters():
++            if not parameter.requires_grad:
++                continue
++            if parameter.ndim == 1 or name.endswith(".bias"):
++                spared.append(parameter)
++            else:
++                decayed.append(parameter)
++        self.optimizer = torch.optim.AdamW(
++            [
++                {"params": decayed, "weight_decay": self.cfg.weight_decay},
++                {"params": spared, "weight_decay": 0.0},
++            ],
++            lr=self.cfg.lr,
++            betas=tuple(self.cfg.betas),
++            eps=self.cfg.epsilon,
++        )
++
++    # -- persistence --------------------------------------------------------
++
++    @classmethod
++    def _from_checkpoint_config(
++        cls,
++        config: dict,
++        reader: ModelCheckpointReader,
++        *,
++        device: torch.device,
++    ) -> Bert4RecTrainer:
++        """Rebuild the trainer's shape before learned state is installed."""
++        config = dict(config)
++        # The stored device is where the model was trained, which says nothing
++        # about where it is being loaded. The caller's choice wins.
++        config["device"] = str(device)
++        # betas arrives from JSON as a list; Bert4RecConfig.__post_init__
++        # normalizes it back to a tuple, so nothing is needed here.
++        trainer_state = reader.read_json("state/trainer.json")
++        tokenizer_state = reader.read_json("state/tokenizer.json")
++        if reader.exists("state/tokenizer_item_ids.json"):
++            tokenizer_state["item_ids"] = reader.read_item_ids(
++                "state/tokenizer_item_ids.json"
++            )
++        tokenizer = ItemTokenizer.from_dict(tokenizer_state)
++        batcher = SequenceBatcher(
++            tokenizer,
++            max_length=int(trainer_state["max_length"]),
++            padding="right",
++        )
++        trainer = cls(Bert4RecConfig(**config), batcher)
++        trainer._n_items = tokenizer.n_items
++        trainer._predict_batcher = replace(
++            batcher, max_length=int(trainer_state["max_length"]) - 1
++        )
++        # Built by _build_model rather than inline, so a reloaded model is
++        # constructed by exactly the path that trained it.
++        trainer.model = trainer._build_model()
++        return trainer
++
++    def _checkpoint_module(self) -> nn.Module | None:
++        return self.model
++
++    def _save_checkpoint_state(self, writer: ModelCheckpointWriter) -> None:
++        """Write the non-module state: ``max_length``, history, and tokenizer."""
++        if self.batcher is None or not isinstance(
++            self.batcher.tokenizer, ItemTokenizer
++        ):
++            raise TypeError(
++                "Bert4RecTrainer checkpoints support ItemTokenizer only"
++            )
++        assert self.batcher.max_length is not None
++        writer.write_json(
++            "state/trainer.json",
++            {
++                "max_length": int(self.batcher.max_length),
++                "history": self.history,
++            },
++        )
++        writer.write_json(
++            "state/tokenizer.json",
++            self.batcher.tokenizer.to_dict(include_item_ids=False),
++        )
++        item_ids = self.batcher.tokenizer.item_ids
++        if item_ids is not None:
++            writer.write_item_ids("state/tokenizer_item_ids.json", item_ids)
++
++    def _load_checkpoint_state(self, reader: ModelCheckpointReader) -> None:
++        """Restore :attr:`history` from the archive."""
++        state = reader.read_json("state/trainer.json")
++        history = state.get("history")
++        if not isinstance(history, list):
++            raise TypeError("Bert4Rec training history must be a list")
++        self.history = list(history)
+diff --git a/src/compresso_recsys/models/elsa.py b/src/compresso_recsys/models/elsa.py
+index 7eacb48..a812bdf 100644
+--- a/src/compresso_recsys/models/elsa.py
++++ b/src/compresso_recsys/models/elsa.py
+@@ -197,6 +197,15 @@ class ELSAConfig:
+     from the entire batch. Consequently, a batch with more positive columns
+     than ``max_output`` exceeds the requested limit rather than dropping
+     positive targets. ``None`` evaluates the full item output during training.
++
++    ``loss_chunk_elements`` bounds the dense output held at once in training:
++    a batch is scored in groups of at most ``loss_chunk_elements // outputs``
++    users (``outputs`` is the output width: the catalog, or the batch's
++    candidates) and their gradients added up before the one optimizer step.
++    The loss is a mean over users, so this is the same loss and the same
++    gradient, up to the order of floating-point additions. At the full width
++    of a 517k-item catalog, 1,024 users hold 2.1 GB per dense array, several
++    times over.
+     """
+ 
+     latent_dim: int = 1024
+@@ -215,9 +224,12 @@ class ELSAConfig:
+     compression: ELSACompressionConfig | None = None
+     log_prefix: str = "ELSA"
+     log_every_n_steps: int = 1000
++    loss_chunk_elements: int = 2**27
+ 
+     def __post_init__(self) -> None:
+         _validate_log_every_n_steps(self.log_every_n_steps)
++        if self.loss_chunk_elements < 1:
++            raise ValueError("loss_chunk_elements must be >= 1")
+         if self.latent_dim < 1:
+             raise ValueError("latent_dim must be >= 1")
+         if self.batch_size < 1:
+@@ -726,30 +738,37 @@ class ELSATrainer(BaseCollaborativeRecommender):
+             raise RuntimeError("trainer must be built before train_step")
+         x = x.to_dense()
+         assert self.input_dim is not None
+-        y = _dense_training_target(
+-            x,
+-            sources=sources,
+-            candidates=candidates,
+-            input_dim=self.input_dim,
+-        )
+         self.elsa.train()
+         self.optimizer.zero_grad(set_to_none=True)
+-        predictions = self.elsa(
+-            x,
+-            sources=sources,
+-            candidates=candidates,
+-            x_out=y,
+-        )
+-        loss = _normalized_mse(predictions, y)
+-        cosine_loss = (
+-            1.0
+-            - F.cosine_similarity(
+-                predictions,
+-                y,
+-                dim=-1,
+-            ).mean()
+-        )
+-        loss.backward()
++        # Users are scored in groups (see ELSAConfig.loss_chunk_elements); each
++        # group's mean is weighted by its share of the batch, so the summed
++        # gradient is the whole batch's.
++        rows = x.shape[0]
++        outputs = int(candidates.numel()) if candidates is not None else int(self.input_dim)
++        chunk = max(1, self.cfg.loss_chunk_elements // max(1, outputs))
++        loss = x.new_zeros(())
++        cosine_loss = x.new_zeros(())
++        for start in range(0, rows, chunk):
++            x_part = x[start : start + chunk]
++            y = _dense_training_target(
++                x_part,
++                sources=sources,
++                candidates=candidates,
++                input_dim=self.input_dim,
++            )
++            predictions = self.elsa(
++                x_part,
++                sources=sources,
++                candidates=candidates,
++                x_out=y,
++            )
++            share = x_part.shape[0] / rows
++            part = _normalized_mse(predictions, y) * share
++            part.backward()
++            loss = loss + part.detach()
++            cosine_loss = cosine_loss + (
++                1.0 - F.cosine_similarity(predictions.detach(), y, dim=-1)
++            ).sum() / rows
+         self.optimizer.step()
+         self._last_controller_info = (
+             self.sparsity_controller.step()
+diff --git a/src/compresso_recsys/models/sasrec.py b/src/compresso_recsys/models/sasrec.py
+index 3326c85..aeb37b4 100644
+--- a/src/compresso_recsys/models/sasrec.py
++++ b/src/compresso_recsys/models/sasrec.py
+@@ -98,6 +98,16 @@ class SASRecConfig:
+ 
+     The learning rate is deliberately constant: there is no schedule field,
+     because the published results are a flat 0.001 for the whole run.
++
++    ``loss_chunk_elements`` bounds what training holds at once. Scoring
++    ``n_negatives`` items per position gathers a positions x negatives x
++    ``d_model`` embedding block, 13 GB at batch 256, window 400, 256 negatives
++    and d 128. Only valid positions are scored -- padding is dropped before the
++    gather, not after -- and they are scored in chunks of at most
++    ``loss_chunk_elements // (n_negatives * d_model)`` positions, their
++    gradients added up. Both terms of the loss are means, so this is the same
++    loss and the same gradient, up to the order of floating-point additions;
++    the negatives are drawn exactly as before.
+     """
+ 
+     d_model: int = 50
+@@ -118,9 +128,12 @@ class SASRecConfig:
+     seed: int = 0
+     log_prefix: str = "SASRec"
+     log_every_n_steps: int = 1000
++    loss_chunk_elements: int = 2**27
+ 
+     def __post_init__(self) -> None:
+         _validate_log_every_n_steps(self.log_every_n_steps)
++        if self.loss_chunk_elements < 1:
++            raise ValueError(f"loss_chunk_elements must be >= 1, got {self.loss_chunk_elements}")
+         for name in (
+             "d_model",
+             "n_blocks",
+@@ -814,21 +827,44 @@ class SASRecTrainer(BaseSequentialRecommender):
+ 
+         negatives = self._sample_negatives(batch, positives, self._rng)
+         states = self.model(inputs)
+-        # Scored on the full grid and masked after, rather than gathered first
+-        # the way the siblings must: what a state is scored against here is
+-        # n_negatives wide, so there is no rows x length x catalog tensor.
+-        positive_scores = self.model.score_items(states, positives)[valid]
+-        negative_scores = self.model.score_items(states, negatives)[valid]
+-        # Summed rather than averaged: each term is already a mean over its
+-        # own positions, and the reference weights the two equally.
+-        loss = objective(positive_scores, torch.ones_like(positive_scores))
+-        loss = loss + objective(
+-            negative_scores, torch.zeros_like(negative_scores)
+-        )
++        # Gathered to the valid positions before scoring, so padding never
++        # enters the positions x negatives x d_model block, and scored in
++        # chunks (see SASRecConfig.loss_chunk_elements).
++        selected = states[valid]
++        chosen_positives = positives[valid]
++        chosen_negatives = negatives[valid]
++        n_negatives = chosen_negatives.shape[-1]
++        chunk = max(1, self.cfg.loss_chunk_elements // (n_negatives * selected.shape[-1]))
+         optimizer.zero_grad(set_to_none=True)
+-        loss.backward()
++        if chunk >= n_positions:
++            positive_scores = self.model.score_items(selected, chosen_positives)
++            negative_scores = self.model.score_items(selected, chosen_negatives)
++            # Summed rather than averaged: each term is already a mean over its
++            # own positions, and the reference weights the two equally.
++            loss = objective(positive_scores, torch.ones_like(positive_scores))
++            loss = loss + objective(negative_scores, torch.zeros_like(negative_scores))
++            loss.backward()
++            total = float(loss.detach())
++        else:
++            # Each chunk's loss backpropagates into the item embeddings and into
++            # a detached copy of the states; the encoder then gets the summed
++            # gradient once. The two means become sums over their own counts.
++            detached = selected.detach().requires_grad_()
++            total = 0.0
++            for start in range(0, n_positions, chunk):
++                part = slice(start, start + chunk)
++                positive_scores = self.model.score_items(detached[part], chosen_positives[part])
++                negative_scores = self.model.score_items(detached[part], chosen_negatives[part])
++                part_loss = F.binary_cross_entropy_with_logits(
++                    positive_scores, torch.ones_like(positive_scores), reduction="sum"
++                ) / n_positions + F.binary_cross_entropy_with_logits(
++                    negative_scores, torch.zeros_like(negative_scores), reduction="sum"
++                ) / (n_positions * n_negatives)
++                part_loss.backward()
++                total += float(part_loss.detach())
++            selected.backward(detached.grad)
+         optimizer.step()
+-        return float(loss.detach()), n_positions
++        return total, n_positions
+ 
+     def _sample_negatives(
+         self,
+diff --git a/src/compresso_recsys/models/simple_rnn.py b/src/compresso_recsys/models/simple_rnn.py
+index 5780706..bc15fee 100644
+--- a/src/compresso_recsys/models/simple_rnn.py
++++ b/src/compresso_recsys/models/simple_rnn.py
+@@ -43,6 +43,7 @@ from typing import Any, Hashable, Literal, Sequence
+ import numpy as np
+ import torch
+ from torch import nn
++from torch.nn import functional as F
+ 
+ from compresso import SRPTensor
+ 
+@@ -90,6 +91,16 @@ class SimpleRNNConfig:
+     which is a property of the split rather than of the model: near zero under
+     ``leave_last_out``, and far higher on a late ``temporal`` stage. It is
+     ignored when the tokenizer has no ``unk`` to substitute.
++
++    ``loss_chunk_elements`` bounds the logits held at once in training. The
++    full-catalog loss scores every valid position against every item, so a
++    batch holds ``positions x n_items`` logits, which on a large catalog with
++    long histories exceeds any GPU (512 rows x 185 positions x 134k items is
++    51 GB, before the softmax and its gradient). The positions are scored in
++    chunks of at most ``loss_chunk_elements // n_items`` and their gradients
++    added up. The loss is a mean over positions, so this is the same loss and
++    the same gradient, up to the order of floating-point additions. The
++    dropout on the states is still drawn once over all positions.
+     """
+ 
+     rnn_type: RNNType = "gru"
+@@ -111,10 +122,13 @@ class SimpleRNNConfig:
+     seed: int = 0
+     log_prefix: str = "SimpleRNN"
+     log_every_n_steps: int = 1000
++    loss_chunk_elements: int = 2**27
+ 
+     def __post_init__(self) -> None:
+         _validate_log_every_n_steps(self.log_every_n_steps)
+         check_schedule(self.lr_schedule, self.warmup_fraction, self.min_lr_ratio)
++        if self.loss_chunk_elements < 1:
++            raise ValueError(f"loss_chunk_elements must be >= 1, got {self.loss_chunk_elements}")
+         if self.rnn_type not in ("gru", "lstm"):
+             raise ValueError(
+                 f"rnn_type must be 'gru' or 'lstm', got {self.rnn_type!r}"
+@@ -564,11 +578,34 @@ class SimpleRNNTrainer(BaseSequentialRecommender):
+         # materialises rows x length x n_items and then throws most of it away:
+         # 3.46 GB at batch 128 on a 34k-item catalog against 0.16 GB this way.
+         states = self.model(inputs)
+-        loss = objective(self.model.score(states[valid]), targets[valid])
++        chosen = targets[valid]
++        chunk = max(1, self.cfg.loss_chunk_elements // self._n_items)
+         optimizer.zero_grad(set_to_none=True)
+-        loss.backward()
++        if chunk >= n_positions:
++            loss = objective(self.model.score(states[valid]), chosen)
++            loss.backward()
++            total = float(loss.detach())
++        else:
++            # score() is dropout, then the head. The dropout is drawn once over
++            # all positions, as the single score() call above would; only the
++            # head and the loss are chunked (see
++            # SimpleRNNConfig.loss_chunk_elements). Each chunk backpropagates
++            # into the head and into a detached copy of the states; the
++            # recurrence then gets the summed gradient once.
++            selected = self.model.dropout(states[valid])
++            detached = selected.detach().requires_grad_()
++            total = 0.0
++            for start in range(0, n_positions, chunk):
++                part = F.cross_entropy(
++                    self.model.head(detached[start : start + chunk]),
++                    chosen[start : start + chunk],
++                    reduction="sum",
++                ) / n_positions
++                part.backward()
++                total += float(part.detach())
++            selected.backward(detached.grad)
+         optimizer.step()
+-        return float(loss.detach()), n_positions
++        return total, n_positions
+ 
+     def _with_unk_dropout(
+         self, inputs: torch.Tensor, mask: torch.Tensor
+diff --git a/tests/test_bert4rec.py b/tests/test_bert4rec.py
+new file mode 100644
+index 0000000..211b4c3
+--- /dev/null
++++ b/tests/test_bert4rec.py
+@@ -0,0 +1,1246 @@
++"""BERT4Rec: the Cloze objective, bidirectional attention, and ranking at [mask].
++
++Organized like ``tests/test_sasrec.py``, because the two models differ in
++exactly the places worth testing: SASRec is causal and trained on sampled
++negatives, BERT4Rec is bidirectional and trained by masking. Where a test here
++mirrors one there, the assertion is usually inverted -- a SASRec step must not
++see a later step, while a BERT4Rec masked position must.
++
++The Cloze sections have no SASRec counterpart at all. They cover the machinery
++that turns one history into many training samples (sliding windows, the
++duplication factor, the last-item samples) and the masking distribution itself,
++which is the part of §3.6 the paper specifies as a rate rather than a procedure.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import json
++
++import numpy as np
++import pytest
++import torch
++import torch.nn.functional as F
++
++from compresso_recsys.models.bert4rec import (
++    Bert4Rec,
++    Bert4RecConfig,
++    Bert4RecTrainer,
++)
++from compresso_recsys.models.bert4rec.trainer import (
++    SPECIAL_TOKENS,
++    _sliding_windows,
++)
++from compresso_recsys.models.sequence_batching import SequenceBatcher
++from compresso_recsys.models.tokenizer import ItemTokenizer
++from compresso_recsys.sequences import ItemSequences
++
++N_ITEMS = 8
++PAD_ID = 0
++MASK_ID = 1
++N_RESERVED = 3
++MAX_POSITIONS = 8
++
++
++def _seqs(rows, n_items=N_ITEMS):
++    return ItemSequences.from_rows(rows, n_items=n_items)
++
++
++def _cycle_rows(n_rows=48, length=4, n_items=N_ITEMS):
++    """Histories drawn from a single cycle, so ``next(i) == (i + 1) % n_items``.
++
++    Learnable from the last item alone, which is the point: it isolates whether
++    the wiring works from whether the architecture is any good.
++    """
++    return [
++        [(start + step) % n_items for step in range(length)]
++        for start in range(n_rows)
++    ]
++
++
++def _tokenizer(n_items=N_ITEMS, **kwargs):
++    return ItemTokenizer(n_items, special_tokens=SPECIAL_TOKENS, **kwargs)
++
++
++def _batcher(max_length=None, n_items=N_ITEMS, **kwargs):
++    return SequenceBatcher(_tokenizer(n_items), max_length=max_length, **kwargs)
++
++
++def _config(**overrides):
++    defaults = dict(
++        d_model=16,
++        n_blocks=2,
++        n_heads=2,
++        dropout=0.0,
++        att_dropout=0.0,
++        max_history_length=6,
++        epochs=1,
++        batch_size=16,
++        duplication_factor=1,
++        show_progress=False,
++        seed=0,
++    )
++    return Bert4RecConfig(**{**defaults, **overrides})
++
++
++def _trainer(config=None, batcher=None, **overrides):
++    """A trainer whose batcher is already built, so the Cloze helpers can run.
++
++    ``fit`` builds one from the training catalog; the sample-construction tests
++    call ``_training_windows`` and ``_cloze_batch`` directly and need the
++    vocabulary without a fit.
++    """
++    config = config or _config(**overrides)
++    if batcher is None:
++        batcher = _batcher(max_length=config.max_history_length)
++    return Bert4RecTrainer(config, batcher)
++
++
++def _fitted_on_cycle(epochs=60, **overrides):
++    config = _config(epochs=epochs, lr=0.01, batch_size=48, **overrides)
++    return Bert4RecTrainer(config).fit(_seqs(_cycle_rows()))
++
++
++def _model(**overrides):
++    defaults = dict(
++        n_items=N_ITEMS,
++        max_history_length=MAX_POSITIONS,
++        d_model=16,
++        n_blocks=2,
++        n_heads=2,
++        dropout=0.0,
++        att_dropout=0.0,
++        pad=PAD_ID,
++        mask=MASK_ID,
++        n_reserved=N_RESERVED,
++    )
++    return Bert4Rec(**{**defaults, **overrides})
++
++
++# --------------------------------------------------------------------------
++# configuration
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "kwargs,message",
++    [
++        (dict(d_model=0), "d_model must be >= 1"),
++        (dict(n_heads=0), "n_heads must be >= 1"),
++        (dict(d_model=10, n_heads=4), "divisible by n_heads"),
++        (dict(n_blocks=0), "n_blocks must be >= 1"),
++        (dict(dropout=1.0), r"dropout must be in \[0, 1\)"),
++        (dict(att_dropout=-0.1), r"att_dropout must be in \[0, 1\)"),
++        (dict(max_history_length=1), "max_history_length must be >= 2"),
++        (dict(initializer_range=0.0), "initializer_range must be > 0"),
++        (dict(mask_proportion=0.0), r"mask_proportion .* must be in \(0, 1\]"),
++        (dict(mask_proportion=1.1), r"mask_proportion .* must be in \(0, 1\]"),
++        (dict(max_predictions=0), "max_predictions must be >= 1"),
++        (dict(mask_token_probability=1.1), r"mask_token_probability must be in \[0, 1\]"),
++        (dict(duplication_factor=0), "duplication_factor must be >= 1"),
++        (dict(sliding_window_step=0.0), r"sliding_window_step .* must be in \(0, 1\]"),
++        (dict(unk_dropout=1.0), r"unk_dropout must be in \[0, 1\)"),
++        (dict(unk_dropout=-0.1), r"unk_dropout must be in \[0, 1\)"),
++        (dict(batch_size=0), "batch_size must be >= 1"),
++        (dict(epochs=0), "epochs must be >= 1"),
++        (dict(lr=0.0), "lr must be > 0"),
++        (dict(weight_decay=-0.1), "weight_decay must be >= 0"),
++        (dict(epsilon=0.0), "epsilon must be > 0"),
++        (dict(max_grad_norm=0.0), "max_grad_norm must be > 0"),
++        (dict(warmup_steps=-1), "warmup_steps must be >= 0"),
++        (dict(optimizer="Adam"), "PyTorch spells AdamW"),
++        (dict(betas=(0.9,)), "betas must be two values"),
++        (dict(betas=(0.9, 1.0)), r"betas must each be in \[0, 1\)"),
++    ],
++)
++def test_invalid_configuration_is_refused(kwargs, message):
++    with pytest.raises(ValueError, match=message):
++        _config(**kwargs)
++
++
++def test_the_defaults_are_the_published_settings():
++    """Every default is the paper's, or a run_*.sh figure where it is silent.
++
++    The config docstring cites a provenance per field; this pins the numbers so
++    the citation cannot quietly stop describing the code.
++
++    "The reference" means the four run_*.sh scripts, which produced the paper's
++    tables -- not the flag defaults in run.py and gen_data_fin.py, which the
++    repository inherited from BERT's pretraining code and which no published run
++    used. The two differ on batch_size (256 against 32), learning_rate (1e-4
++    against 5e-5), warmup (100 steps against 10000) and the sliding window (0.5
++    against 0.1), so citing the wrong tier is worth a test rather than a
++    comment. Where the scripts disagree with each other these follow ml-20m,
++    the long-sequence run the default max_history_length commits to -- except
++    dropout, which is ml-1m's 0.2 against ml-20m's 0.1, so the defaults are no
++    single published run. Dropout also comes from a third file again, the
++    released bert_config_*.json, rather than from a script.
++    """
++    cfg = Bert4RecConfig()
++
++    # Architecture: L = 2, h = 2 (§4.3); d_model 64 and the positional table at
++    # 200 are the released config's hidden_size and max_position_embeddings.
++    assert (cfg.d_model, cfg.n_blocks, cfg.n_heads) == (64, 2, 2)
++    assert cfg.max_history_length == 200
++    # ml-1m's hidden_dropout_prob and attention_probs_dropout_prob, the one
++    # place these defaults leave ml-20m (which sets both to 0.1).
++    assert (cfg.dropout, cfg.att_dropout) == (0.2, 0.2)
++    assert cfg.initializer_range == 0.02
++
++    # Cloze: rho 0.2 and max_predictions_per_seq 20 are ml-1m's and ml-20m's
++    # rho and ml-20m's cap; mask_prob 1.0 disables BERT's 80/10/10;
++    # dupe_factor 10 is every script's; prop_sliding_window 0.5 is ml-1m's,
++    # ml-20m's and steam's, against beauty's 0.1 at an N of 50.
++    assert cfg.mask_proportion == 0.2
++    assert cfg.max_predictions == 20
++    assert cfg.mask_token_probability == 1.0
++    assert cfg.duplication_factor == 10
++    assert cfg.sliding_window_step == 0.5
++    assert cfg.last_item_samples is True
++    # No unk corruption: the paper has none, and SASRec defaults it off for the
++    # same parity reason.
++    assert cfg.unk_dropout == 0.0
++
++    # Optimization: §4.3's batch of 256 and lr 1e-4, which every script passes
++    # too; decoupled weight decay 0.01; gradients clipped at l2 norm 5; the
++    # reference's eps of 1e-6; and 100 warmup steps, the scripts' num_warmup_
++    # steps rather than run.py's 10000 flag default. It is a count and not a
++    # fraction because warmup is a fixed cost, not a share of the run.
++    assert cfg.batch_size == 256
++    # epochs has no counterpart: the reference trains a fixed num_train_steps
++    # over a corpus generated once, so this is a package default, not published.
++    assert cfg.epochs == 10
++    assert cfg.lr == 1e-4
++    assert cfg.weight_decay == 0.01
++    assert cfg.betas == (0.9, 0.999)
++    assert cfg.epsilon == 1e-6
++    assert cfg.max_grad_norm == 5.0
++    assert cfg.warmup_steps == 100
++    assert cfg.optimizer == "AdamW"
++
++
++def test_the_feed_forward_width_is_not_configurable():
++    """Eq. 3 fixes the inner width at 4 * d_model, so it is not a field."""
++    assert not hasattr(Bert4RecConfig(), "d_ff")
++    model = _model(d_model=16)
++    assert model.feed_forward_layers[0].linear1.out_features == 64
++
++
++def test_betas_survive_a_json_round_trip_as_a_tuple():
++    """A reloaded config must compare equal to the one that was saved.
++
++    ``asdict`` writes a JSON array, which reads back as a list. Without the
++    normalization in ``__post_init__`` the two configs differ by the type of one
++    field and nothing else, which is the kind of inequality that only shows up
++    in a checkpoint test.
++    """
++    config = _config()
++    restored = Bert4RecConfig(
++        **json.loads(json.dumps(dataclasses.asdict(config), default=str))
++    )
++    assert isinstance(restored.betas, tuple)
++    assert restored == config
++
++
++def test_betas_given_as_a_list_are_normalized():
++    assert Bert4RecConfig(betas=[0.9, 0.999]).betas == (0.9, 0.999)
++
++
++# --------------------------------------------------------------------------
++# architecture
++# --------------------------------------------------------------------------
++
++
++def test_the_vocabulary_is_the_catalog_above_the_reserved_ids():
++    model = _model()
++    assert model.vocab_size == N_RESERVED + N_ITEMS
++    assert model.item_embedding.num_embeddings == N_RESERVED + N_ITEMS
++    assert model.output_bias.shape == (N_RESERVED + N_ITEMS,)
++
++
++def test_the_positional_table_has_one_row_per_position():
++    model = _model(max_history_length=5)
++    assert model.positional_embedding.num_embeddings == 5
++
++
++def test_the_model_constructs_with_its_own_defaults():
++    """Regression: n_heads defaulted to 5, which does not divide d_model 64.
++
++    The trainer always passes n_heads explicitly, so the broken default was
++    invisible until someone built the module directly.
++    """
++    model = Bert4Rec(n_items=N_ITEMS, max_history_length=6, d_model=64)
++    assert model.d_model == 64
++
++
++def test_padding_embeds_as_zero():
++    model = _model()
++    assert torch.equal(
++        model.item_embedding.weight[PAD_ID], torch.zeros(model.d_model)
++    )
++
++
++def test_the_output_is_logits_not_a_distribution():
++    """Eq. 8 is evaluated by cross_entropy, which needs logits.
++
++    A softmax here would leave the trainer taking the log of a probability that
++    can underflow; see ``test_the_loss_is_cross_entropy_on_the_masked_logits``.
++    """
++    model = _model()
++    model.eval()
++    scores = model(torch.tensor([[3, 4, MASK_ID, 6]]))
++    assert not torch.allclose(scores.exp().sum(dim=-1), torch.ones(1))
++
++
++def test_a_batch_with_no_mask_is_refused():
++    """The output is read at [mask]; a batch with none would score nothing.
++
++    Returning an empty matrix instead would push the mistake downstream, where
++    it surfaces as a shape error far from its cause.
++    """
++    model = _model()
++    with pytest.raises(ValueError, match=r"no token equals the mask id"):
++        model(torch.tensor([[3, 4, 5, 6]]))
++
++
++def test_an_index_selecting_nothing_is_refused():
++    """The same guard on the training path, where the index and not the token
++    says where to read."""
++    model = _model()
++    with pytest.raises(ValueError, match=r"mask_positions selects nothing"):
++        model(
++            torch.tensor([[3, 4, MASK_ID, 6]]),
++            None,
++            torch.zeros((1, 4), dtype=torch.bool),
++        )
++
++
++def test_one_row_of_scores_per_masked_position():
++    model = _model()
++    model.eval()
++    history = torch.tensor([[MASK_ID, 4, MASK_ID, 6], [3, 4, 5, MASK_ID]])
++    assert model(history).shape == (3, N_RESERVED + N_ITEMS)
++
++
++def test_masked_positions_are_scored_in_row_major_order():
++    """The trainer builds its labels in this order and passes no index along.
++
++    Two rows whose masked positions hold different items must come back in the
++    order the rows appear, with the earlier position of a row first.
++    """
++    model = _model()
++    model.eval()
++    with torch.no_grad():
++        both = model(torch.tensor([[MASK_ID, 4, MASK_ID, 6], [3, MASK_ID, 5, 6]]))
++        first = model(torch.tensor([[MASK_ID, 4, MASK_ID, 6]]))
++        second = model(torch.tensor([[3, MASK_ID, 5, 6]]))
++    assert torch.allclose(both[:2], first, atol=1e-5)
++    assert torch.allclose(both[2:], second, atol=1e-5)
++
++
++def test_a_masked_position_reads_the_items_after_it():
++    """Attention is bidirectional -- the property that makes the Cloze objective
++    necessary and separates this model from a causal one.
++
++    ``tests/test_sasrec.py`` asserts the opposite for SASRec: there a step
++    cannot see a later step. Here changing a *later* item must change the score
++    at an earlier masked position, or the model is not reading the future at all
++    and the masking was pointless.
++    """
++    model = _model()
++    model.eval()
++    with torch.no_grad():
++        before = model(torch.tensor([[3, MASK_ID, 5, 6]]))
++        after = model(torch.tensor([[3, MASK_ID, 5, 7]]))
++    assert not torch.allclose(before, after, atol=1e-6)
++
++
++def test_a_masked_position_also_reads_the_items_before_it():
++    model = _model()
++    model.eval()
++    with torch.no_grad():
++        before = model(torch.tensor([[3, 4, 5, MASK_ID]]))
++        after = model(torch.tensor([[7, 4, 5, MASK_ID]]))
++    assert not torch.allclose(before, after, atol=1e-6)
++
++
++def test_padding_is_not_visible_to_a_masked_position():
++    """A row's score must not depend on how much padding the batch gave it.
++
++    Without the key padding mask, a real position attends to filler embeddings
++    and the amount mixed in varies with the width of the batch rectangle, which
++    is an artefact of who else was in the batch.
++    """
++    model = _model()
++    model.eval()
++    history = torch.tensor([[3, 4, MASK_ID]])
++    padded = torch.tensor([[3, 4, MASK_ID, PAD_ID, PAD_ID]])
++    mask = torch.tensor([[True, True, True]])
++    padded_mask = torch.tensor([[True, True, True, False, False]])
++    with torch.no_grad():
++        tight = model(history, mask)
++        loose = model(padded, padded_mask)
++    assert torch.allclose(tight, loose, atol=1e-5)
++
++
++def test_a_history_longer_than_the_table_keeps_its_most_recent_positions():
++    model = _model(max_history_length=4)
++    model.eval()
++    long_history = torch.tensor([[3, 4, 5, 6, 7, MASK_ID]])
++    with torch.no_grad():
++        truncated = model(long_history)
++        equivalent = model(torch.tensor([[5, 6, 7, MASK_ID]]))
++    assert torch.allclose(truncated, equivalent, atol=1e-5)
++
++
++# --------------------------------------------------------------------------
++# Cloze sample construction
++# --------------------------------------------------------------------------
++
++
++def test_a_history_no_longer_than_the_window_is_one_sample():
++    history = np.arange(4)
++    assert [w.tolist() for w in _sliding_windows(history, 6, 2)] == [[0, 1, 2, 3]]
++
++
++def test_sliding_windows_cover_the_whole_history():
++    """Everything before the last N interactions would otherwise never train.
++
++    The windows walk backwards from the most recent interaction and the oldest
++    is pinned to the start, so the union is the entire history.
++    """
++    history = np.arange(10)
++    windows = _sliding_windows(history, 4, 2)
++    assert set(np.concatenate(windows).tolist()) == set(range(10))
++    assert all(len(w) == 4 for w in windows)
++
++
++def test_sliding_windows_are_chronological():
++    """The reference builds them back-to-front and reverses; so does this."""
++    windows = _sliding_windows(np.arange(10), 4, 2)
++    starts = [int(w[0]) for w in windows]
++    assert starts == sorted(starts)
++    assert int(windows[-1][-1]) == 9
++
++
++def test_the_duplication_factor_repeats_every_window():
++    """§3.6 turns one history into many samples; this is how many."""
++    rows = [[0, 1, 2, 3], [1, 2, 3, 4]]
++    one = _trainer(_config(duplication_factor=1, last_item_samples=False))
++    ten = _trainer(_config(duplication_factor=10, last_item_samples=False))
++    single = one._training_windows(_seqs(rows))
++    repeated = ten._training_windows(_seqs(rows))
++    assert len(repeated) == 10 * len(single)
++
++
++def test_each_history_contributes_one_last_item_sample():
++    """The paper's fine-tuning for the task the Cloze objective does not match."""
++    rows = [[0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]]
++    without = _trainer(_config(last_item_samples=False))._training_windows(_seqs(rows))
++    with_tail = _trainer(_config(last_item_samples=True))._training_windows(_seqs(rows))
++    assert len(with_tail) == len(without) + len(rows)
++    assert sum(1 for _, force_last in with_tail if force_last) == len(rows)
++
++
++def test_a_long_history_contributes_one_last_item_sample_per_window():
++    """mask_last iterates the user's whole document, which is the window list.
++
++    One per user would leave everything before the final window with no
++    fine-tuning sample at all -- the same gap the sliding window exists to
++    close for the Cloze samples.
++    """
++    config = _config(
++        max_history_length=6, last_item_samples=True, sliding_window_step=1 / 6
++    )
++    history = [step % N_ITEMS for step in range(10)]
++    windows = _sliding_windows(np.asarray(history), 6, 1)
++    samples = _trainer(config)._training_windows(_seqs([history]))
++    assert len(windows) > 1
++    assert sum(1 for _, force_last in samples if force_last) == len(windows)
++
++
++def test_the_last_item_samples_are_the_windows_themselves():
++    """Each is masked at its own final position, so each leaves width - 1 of
++    context -- what predict_on_batch encodes before appending [mask]."""
++    config = _config(
++        max_history_length=6, last_item_samples=True, sliding_window_step=1 / 6
++    )
++    history = [step % N_ITEMS for step in range(10)]
++    samples = _trainer(config)._training_windows(_seqs([history]))
++    tails = [window.tolist() for window, force_last in samples if force_last]
++    expected = _sliding_windows(np.asarray(history), 6, 1)
++    assert tails == [window.tolist() for window in expected]
++
++
++def test_a_single_item_history_yields_no_sample_at_all():
++    """Masking the only position leaves no context to predict it from.
++
++    For the last-item sample the reference asserts the position is non-zero
++    rather than handling it. For the random Cloze samples it has no such floor,
++    but a lone [mask] at position 0 is the same input for every such history, so
++    duplication_factor copies of it would teach only a popularity prior.
++    """
++    trainer = _trainer(_config(duplication_factor=3))
++    samples = trainer._training_windows(_seqs([[0], [1, 2, 3]]))
++    assert all(window.tolist() == [1, 2, 3] for window, _ in samples)
++    assert len(samples) == 3 + 1
++
++
++def test_fitting_only_single_item_histories_is_refused():
++    with pytest.raises(ValueError, match="at least two interactions"):
++        Bert4RecTrainer(_config()).fit(_seqs([[0], [3], [5]]))
++
++
++def test_an_empty_history_contributes_nothing():
++    samples = _trainer(_config())._training_windows(_seqs([[], [1, 2, 3]]))
++    assert all(window.size > 0 for window, _ in samples)
++
++
++def _masked_batch(trainer, rows, seed=0, force_last=False):
++    windows = [(np.asarray(row, dtype=np.int64), force_last) for row in rows]
++    return trainer._cloze_batch(windows, np.random.default_rng(seed))
++
++
++def test_the_masked_count_is_the_proportion_of_the_length():
++    """§3.6 masks round(len * rho) positions per sequence."""
++    trainer = _trainer(_config(mask_proportion=0.5, max_predictions=100))
++    tokens, _, _, labels = _masked_batch(trainer, [list(range(8))])
++    assert int((tokens == MASK_ID).sum()) == 4
++    assert labels.numel() == 4
++
++
++def test_at_least_one_position_is_always_masked():
++    """A sample with nothing masked carries no gradient at all."""
++    trainer = _trainer(_config(mask_proportion=0.01, max_predictions=100))
++    tokens, _, _, labels = _masked_batch(trainer, [[0, 1]])
++    assert int((tokens == MASK_ID).sum()) == 1
++    assert labels.numel() == 1
++
++
++def test_every_sample_keeps_one_position_of_context():
++    """rho high enough to round up to the whole window still leaves one item.
++
++    A fully masked window is the same input whatever its items, so rho 1.0
++    means "all but one", and a window of two keeps one at rho 0.75.
++    """
++    for rho, length in [(1.0, 8), (1.0, 2), (0.75, 2)]:
++        trainer = _trainer(_config(mask_proportion=rho, max_predictions=100))
++        for seed in range(5):
++            tokens, _, masked, labels = _masked_batch(
++                trainer, [list(range(length))], seed=seed
++            )
++            assert int(masked.sum()) == labels.numel() == length - 1
++            assert int((tokens >= N_RESERVED).sum()) == 1
++
++
++def test_the_masked_count_is_capped_by_max_predictions():
++    """The reference's max_predictions_per_seq binds before rho on a long row."""
++    trainer = _trainer(
++        _config(mask_proportion=1.0, max_predictions=3, max_history_length=20)
++    )
++    tokens, _, _, _ = _masked_batch(trainer, [list(range(8))])
++    assert int((tokens == MASK_ID).sum()) == 3
++
++
++def test_a_chosen_position_always_becomes_mask_at_the_default_probability():
++    """mask_prob 1.0 disables BERT's 80/10/10, as §3.6 describes."""
++    trainer = _trainer(_config(mask_proportion=0.5, mask_token_probability=1.0))
++    tokens, _, _, labels = _masked_batch(trainer, [list(range(8))])
++    assert int((tokens == MASK_ID).sum()) == labels.numel()
++
++
++def test_below_one_some_chosen_positions_keep_or_replace_the_item():
++    trainer = _trainer(
++        _config(mask_proportion=1.0, max_predictions=100, mask_token_probability=0.0)
++    )
++    tokens, _, _, labels = _masked_batch(trainer, [list(range(8))] * 8, seed=3)
++    assert int((tokens == MASK_ID).sum()) == 0
++    # rho 1.0 is "all but one": seven chosen per row of eight.
++    assert labels.numel() == 56
++
++
++def test_a_random_replacement_is_never_a_reserved_id():
++    """A reserved id in an item position would teach the model that pad or mask
++    can appear as data."""
++    trainer = _trainer(
++        _config(mask_proportion=1.0, max_predictions=100, mask_token_probability=0.0)
++    )
++    for seed in range(5):
++        tokens, padding, _, _ = _masked_batch(trainer, [list(range(8))] * 8, seed=seed)
++        assert int((tokens[padding] < N_RESERVED).sum()) == 0
++
++
++def test_the_masked_index_covers_positions_that_kept_their_item():
++    """Regression: the loss is taken at every *chosen* position, and below a
++    mask_token_probability of 1.0 most of those no longer hold [MASK]. The
++    index is what tells the model where to read; recovering it from the token
++    would find nothing here while the labels still number 56.
++    """
++    trainer = _trainer(
++        _config(mask_proportion=1.0, max_predictions=100, mask_token_probability=0.0)
++    )
++    tokens, _, masked, labels = _masked_batch(trainer, [list(range(8))] * 8, seed=3)
++    assert int((tokens == MASK_ID).sum()) == 0
++    assert int(masked.sum()) == labels.numel() == 56
++
++
++UNK_ID = SPECIAL_TOKENS["unk"]
++
++
++def test_unk_is_never_inserted_at_the_default_rate():
++    """Paper parity: the reference has no unk corruption."""
++    trainer = _trainer(_config(mask_token_probability=0.5))
++    for seed in range(5):
++        tokens, _, _, _ = _masked_batch(trainer, [list(range(6))] * 8, seed=seed)
++        assert int((tokens == UNK_ID).sum()) == 0
++
++
++def test_unk_dropout_replaces_context_and_nothing_else():
++    """Chosen positions keep their [mask] and label; padding stays padding.
++
++    Otherwise a label would be lost to unk, or the model would learn that unk
++    and pad mean the same thing.
++    """
++    trainer = _trainer(_config(unk_dropout=0.5, mask_proportion=0.5))
++    rows = [list(range(6)), [1, 2, 3]] * 16
++    tokens, padding, masked, labels = _masked_batch(trainer, rows, seed=0)
++    unk = tokens == UNK_ID
++    assert int(unk.sum()) > 0
++    assert not bool((unk & masked).any())
++    assert not bool((unk & ~padding).any())
++    assert bool((tokens[masked] == MASK_ID).all())
++    assert bool((labels >= N_RESERVED).all())
++    context = padding & ~masked
++    rate = float(unk.sum()) / float(context.sum())
++    assert 0.3 < rate < 0.7
++
++
++def test_unk_dropout_does_not_move_the_chosen_positions():
++    """The positions are drawn before the corruption, so the first row's choice
++    is the same at any rate -- the corruption is layered on, not re-drawn."""
++    rows = [list(range(6))]
++    plain = _masked_batch(_trainer(_config(mask_proportion=0.5)), rows, seed=4)
++    noisy = _masked_batch(
++        _trainer(_config(mask_proportion=0.5, unk_dropout=0.9)), rows, seed=4
++    )
++    assert torch.equal(plain[2], noisy[2])
++    assert torch.equal(plain[3], noisy[3])
++    differs = plain[0] != noisy[0]
++    assert bool((noisy[0][differs] == UNK_ID).all())
++
++
++def test_unk_dropout_is_ignored_without_an_unk_token():
++    tokenizer = ItemTokenizer(N_ITEMS, special_tokens={"pad": 0, "mask": 1})
++    config = _config(unk_dropout=0.9)
++    trainer = _trainer(
++        config, SequenceBatcher(tokenizer, max_length=config.max_history_length)
++    )
++    tokens, padding, masked, _ = _masked_batch(trainer, [list(range(6))] * 4)
++    assert bool((tokens[padding & ~masked] >= tokenizer.n_reserved).all())
++
++
++def test_training_runs_with_unk_dropout():
++    trainer = Bert4RecTrainer(_config(unk_dropout=0.3, epochs=2)).fit(
++        _seqs(_cycle_rows())
++    )
++    assert all(np.isfinite(record["loss"]) for record in trainer.history)
++
++
++def test_training_runs_below_a_mask_token_probability_of_one():
++    """Regression: forward used to gather at ``item_history == mask``, so any
++    corruption at all left fewer logit rows than labels and cross_entropy
++    refused the batch.
++    """
++    trainer = Bert4RecTrainer(
++        _config(mask_token_probability=0.5, mask_proportion=0.5)
++    ).fit(_seqs(_cycle_rows()))
++    assert trainer.history[-1]["masked_items"] > 0
++
++
++def test_the_read_positions_come_from_the_index_not_the_token():
++    """Given an index, the model reads exactly those positions -- including
++    ones holding an ordinary item, which is what corruption produces."""
++    model = _model()
++    tokens = torch.tensor([[3, 4, 5, 6]])
++    index = torch.tensor([[False, True, False, True]])
++    assert model(tokens, None, index).shape[0] == 2
++
++
++def test_the_labels_are_the_true_items_of_the_masked_positions():
++    """This is the contract the model's row-major gather relies on."""
++    trainer = _trainer(_config(mask_proportion=0.5, max_predictions=100))
++    rows = [[0, 1, 2, 3], [4, 5, 6, 7]]
++    tokens, _, _, labels = _masked_batch(trainer, rows)
++    tokenizer = trainer.batcher.tokenizer
++    expected = []
++    for row_index, row in enumerate(rows):
++        encoded = tokenizer.encode_indices(np.asarray(row, dtype=np.int64))
++        expected.extend(
++            int(encoded[position])
++            for position in torch.where(tokens[row_index] == MASK_ID)[0].tolist()
++        )
++    assert labels.tolist() == expected
++
++
++def test_the_last_item_sample_masks_only_its_final_position():
++    trainer = _trainer(_config())
++    tokens, _, _, labels = _masked_batch(trainer, [[0, 1, 2, 3]], force_last=True)
++    assert tokens[0, -1] == MASK_ID
++    assert int((tokens == MASK_ID).sum()) == 1
++    assert labels.numel() == 1
++
++
++def test_short_rows_are_right_padded_to_the_batch_width():
++    """Position 0 must mean 'oldest retained interaction' for every row."""
++    trainer = _trainer(_config())
++    tokens, padding, _, _ = _masked_batch(trainer, [[0, 1, 2, 3], [4, 5]])
++    assert tokens.shape == (2, 4)
++    assert padding[1].tolist() == [True, True, False, False]
++    assert tokens[1, 2:].tolist() == [PAD_ID, PAD_ID]
++
++
++# --------------------------------------------------------------------------
++# fit and the batcher contract
++# --------------------------------------------------------------------------
++
++
++def test_fit_builds_a_batcher_from_the_config_when_none_is_passed():
++    trainer = Bert4RecTrainer(_config()).fit(_seqs(_cycle_rows()))
++    assert trainer.batcher is not None
++    assert trainer.batcher.max_length == trainer.cfg.max_history_length
++    assert trainer.batcher.tokenizer.n_items == N_ITEMS
++
++
++def test_the_built_vocabulary_carries_a_mask_token():
++    trainer = Bert4RecTrainer(_config()).fit(_seqs(_cycle_rows()))
++    assert trainer.batcher.tokenizer.token_id("mask") == MASK_ID
++
++
++def test_a_tokenizer_without_a_mask_token_is_refused():
++    """The Cloze objective is not expressible without one: masking with an item
++    id would teach the model that that item means 'predict here'."""
++    plain = SequenceBatcher(ItemTokenizer(N_ITEMS), max_length=6)
++    with pytest.raises(ValueError, match="needs a 'mask' special token"):
++        Bert4RecTrainer(_config(), plain).fit(_seqs(_cycle_rows()))
++
++
++def test_a_batcher_naming_no_window_inherits_the_configs():
++    """The usual case: a batcher is handed over for its vocabulary, not its
++    window, and the window is what sized the positional table."""
++    trainer = Bert4RecTrainer(_config(max_history_length=6), _batcher()).fit(
++        _seqs(_cycle_rows())
++    )
++    assert trainer.batcher.max_length == 6
++
++
++def test_a_batcher_naming_a_different_window_is_refused():
++    trainer = Bert4RecTrainer(_config(max_history_length=6), _batcher(max_length=5))
++    with pytest.raises(ValueError, match="cannot be two numbers"):
++        trainer.fit(_seqs(_cycle_rows()))
++
++
++def test_a_batcher_naming_the_same_window_is_accepted():
++    trainer = Bert4RecTrainer(_config(max_history_length=6), _batcher(max_length=6))
++    assert trainer.fit(_seqs(_cycle_rows())).batcher.max_length == 6
++
++
++def test_fit_puts_the_batcher_on_the_right():
++    """Right padding keeps position 0 meaning 'oldest retained interaction' for
++    every row, which is what a learned positional table reads under Cloze."""
++    trainer = Bert4RecTrainer(
++        _config(max_history_length=6), _batcher(max_length=6, padding="left")
++    ).fit(_seqs(_cycle_rows()))
++    assert trainer.batcher.padding == "right"
++
++
++def test_the_prediction_batcher_leaves_room_for_the_appended_mask():
++    trainer = Bert4RecTrainer(_config(max_history_length=6)).fit(_seqs(_cycle_rows()))
++    assert trainer._predict_batcher.max_length == 5
++
++
++def test_an_unfitted_trainer_has_no_prediction_batcher():
++    """The attribute exists before fit so that nothing has to guess at it."""
++    assert Bert4RecTrainer(_config())._predict_batcher is None
++
++
++def test_fit_returns_the_trainer_and_reports_the_catalog():
++    trainer = Bert4RecTrainer(_config())
++    assert trainer.fit(_seqs(_cycle_rows())) is trainer
++    assert trainer.is_fitted
++    assert trainer.n_items == N_ITEMS
++
++
++def test_before_fitting_nothing_is_claimed():
++    trainer = Bert4RecTrainer(_config())
++    assert not trainer.is_fitted
++    assert trainer.n_items is None
++
++
++def test_fit_refuses_a_matrix_source():
++    with pytest.raises(TypeError, match="trains on ItemSequences"):
++        Bert4RecTrainer(_config()).fit(np.zeros((4, N_ITEMS)))
++
++
++def test_fit_refuses_an_empty_training_set():
++    with pytest.raises(ValueError, match="cannot train on zero sequences"):
++        Bert4RecTrainer(_config()).fit(_seqs([]))
++
++
++def test_fit_refuses_data_with_no_cloze_example():
++    with pytest.raises(ValueError, match="no Cloze example"):
++        Bert4RecTrainer(_config()).fit(_seqs([[], []]))
++
++
++def test_fit_rejects_a_supplied_batcher_for_a_different_catalog():
++    trainer = Bert4RecTrainer(_config(), _batcher(n_items=N_ITEMS + 3))
++    with pytest.raises(ValueError, match="but training"):
++        trainer.fit(_seqs(_cycle_rows()))
++
++
++def test_training_records_a_loss_per_epoch():
++    trainer = _fitted_on_cycle(epochs=3)
++    assert [record["epoch"] for record in trainer.history] == [1.0, 2.0, 3.0]
++    assert all(record["masked_items"] > 0 for record in trainer.history)
++
++
++def test_training_reduces_the_loss_on_a_learnable_cycle():
++    trainer = _fitted_on_cycle(epochs=40)
++    assert trainer.history[-1]["loss"] < trainer.history[0]["loss"]
++
++
++def test_refitting_starts_the_history_over():
++    trainer = _fitted_on_cycle(epochs=3)
++    trainer.fit(_seqs(_cycle_rows()))
++    assert len(trainer.history) == 3
++
++
++def test_the_same_seed_gives_the_same_model():
++    first = _fitted_on_cycle(epochs=2, seed=7)
++    second = _fitted_on_cycle(epochs=2, seed=7)
++    for left, right in zip(
++        first.model.state_dict().values(), second.model.state_dict().values()
++    ):
++        assert torch.equal(left, right)
++
++
++def test_a_different_seed_gives_a_different_model():
++    first = _fitted_on_cycle(epochs=2, seed=1)
++    second = _fitted_on_cycle(epochs=2, seed=2)
++    assert not torch.equal(
++        first.model.item_embedding.weight, second.model.item_embedding.weight
++    )
++
++
++# --------------------------------------------------------------------------
++# the objective
++# --------------------------------------------------------------------------
++
++
++def test_the_loss_is_cross_entropy_on_the_masked_logits():
++    """Eq. 8 is the negative log-likelihood of Eq. 7's softmax, which is what
++    cross_entropy computes from logits."""
++    trainer = Bert4RecTrainer(_config()).fit(_seqs(_cycle_rows()))
++    rng = np.random.default_rng(0)
++    windows = [(np.array([0, 1, 2, 3], dtype=np.int64), True)]
++    tokens, padding, masked, labels = trainer._cloze_batch(windows, rng)
++    trainer.model.eval()
++    with torch.no_grad():
++        expected = float(
++            F.cross_entropy(trainer.model(tokens, padding, masked), labels)
++        )
++    # _train_step redraws the batch from a generator in the same state, so it
++    # masks the same positions, and it backpropagates, so it runs outside
++    # no_grad. Dropout is off in this config, leaving train/eval equivalent.
++    loss, count = trainer._train_step(windows, np.random.default_rng(0))
++    assert count == int(labels.numel())
++    assert loss == pytest.approx(expected, abs=1e-5)
++
++
++def test_a_confidently_wrong_example_still_carries_gradient():
++    """Regression: the loss used to be -log(softmax(x).clamp_min(tiny)).
++
++    Clamping makes the loss locally constant where a probability underflows, so
++    its derivative is exactly zero -- the model stopped learning from precisely
++    the masked positions it was most wrong about, silently and with no NaN.
++    """
++    model = _model()
++    tokens = torch.tensor([[3, 4, MASK_ID, 6]])
++    with torch.no_grad():
++        # Drive one item's score far above the target's.
++        model.output_bias[5] = 400.0
++    labels = torch.tensor([4])
++    loss = F.cross_entropy(model(tokens), labels)
++    loss.backward()
++    total = sum(
++        float(p.grad.abs().sum())
++        for p in model.parameters()
++        if p.grad is not None
++    )
++    assert total > 0.0
++
++
++def test_only_masked_positions_contribute_to_the_loss():
++    """An unmasked position is context, not a target: the model can read the
++    item there, so scoring it would be free."""
++    trainer = Bert4RecTrainer(_config(mask_proportion=0.25, max_predictions=1)).fit(
++        _seqs(_cycle_rows())
++    )
++    windows = [(np.array([0, 1, 2, 3], dtype=np.int64), False)]
++    _, _, _, labels = trainer._cloze_batch(windows, np.random.default_rng(0))
++    assert labels.numel() == 1
++
++
++def test_every_epoch_redraws_the_masking():
++    """The reference materializes dupe_factor maskings to a file and reads it
++    each epoch; drawing per epoch is the same distribution, more varied."""
++    trainer = _trainer(_config(mask_proportion=0.5, max_predictions=100))
++    rows = [list(range(8))]
++    first, _, _, _ = _masked_batch(trainer, rows, seed=1)
++    second, _, _, _ = _masked_batch(trainer, rows, seed=2)
++    assert not torch.equal(first, second)
++
++
++def test_weight_decay_spares_biases_and_layer_norms():
++    """Decaying a normalization scale pulls it toward zero, shrinking the
++    activations it exists to standardize."""
++    trainer = _fitted_on_cycle(epochs=1)
++    decayed, spared = trainer.optimizer.param_groups
++    assert decayed["weight_decay"] == trainer.cfg.weight_decay
++    assert spared["weight_decay"] == 0.0
++    assert all(parameter.ndim > 1 for parameter in decayed["params"])
++    assert all(parameter.ndim == 1 for parameter in spared["params"])
++
++
++def test_no_training_step_runs_at_a_zero_learning_rate():
++    """Both ends of the schedule stay off zero: a step whose rate is zero
++    computes a gradient, clips it, and applies nothing."""
++    trainer = _trainer(_config())
++    trainer.model = _model()
++    trainer._build_checkpoint_optimizer()
++    scheduler = trainer._build_scheduler(trainer.optimizer, 20)
++    rates = []
++    for _ in range(20):
++        rates.append(trainer.optimizer.param_groups[0]["lr"])
++        trainer.optimizer.step()
++        scheduler.step()
++    assert all(rate > 0.0 for rate in rates)
++
++
++def test_the_schedule_warms_up_and_then_decays():
++    trainer = _trainer(_config(warmup_steps=5))
++    trainer.model = _model()
++    trainer._build_checkpoint_optimizer()
++    scheduler = trainer._build_scheduler(trainer.optimizer, 20)
++    rates = []
++    for _ in range(20):
++        rates.append(trainer.optimizer.param_groups[0]["lr"])
++        trainer.optimizer.step()
++        scheduler.step()
++    peak = rates.index(max(rates))
++    assert 0 < peak < len(rates) - 1
++    assert rates[:peak] == sorted(rates[:peak])
++    assert rates[peak:] == sorted(rates[peak:], reverse=True)
++
++
++def test_the_padding_row_is_zeroed_at_initialisation():
++    """So a padded position starts out embedding to nothing.
++
++    It does not stay zero: the embedding matrix is tied to the output head, so
++    the pad row is also a scoring row and cross entropy pushes its logit down at
++    every step. ``padding_idx`` suppresses only the input-side gradient. That is
++    harmless on both paths -- the key padding mask keeps attention off padded
++    positions, and prediction slices the reserved ids away before ranking -- but
++    it is why this asserts about initialisation rather than about every step.
++    """
++    trainer = _trainer(_config())
++    model = trainer._build_model()
++    assert torch.equal(
++        model.item_embedding.weight[model.pad], torch.zeros(model.d_model)
++    )
++
++
++def test_a_reserved_id_is_never_recommended():
++    """pad, mask and unk are scoreable in the softmax but are not catalog items.
++
++    They are sliced off before ranking, so no amount of probability mass landing
++    on them can put one in front of a user.
++    """
++    trainer = _fitted_on_cycle(epochs=2)
++    predictions = trainer.predict_on_batch(
++        _seqs(_cycle_rows(n_rows=4)), k=3, exclude_seen=False
++    )
++    assert int(predictions.cols.min()) >= 0
++    assert int(predictions.cols.max()) < N_ITEMS
++
++
++# --------------------------------------------------------------------------
++# prediction
++# --------------------------------------------------------------------------
++
++
++def test_predict_refuses_before_fitting():
++    with pytest.raises(RuntimeError, match="must be fitted before predicting"):
++        Bert4RecTrainer(_config()).predict_on_batch(_seqs([[0, 1]]), k=2)
++
++
++def test_predict_refuses_a_matrix_source():
++    trainer = _fitted_on_cycle(epochs=1)
++    with pytest.raises(TypeError, match="predicts from ItemSequences"):
++        trainer.predict_on_batch(np.zeros((2, N_ITEMS)), k=2)
++
++
++@pytest.mark.parametrize("k", [0, N_ITEMS + 1])
++def test_predict_refuses_an_impossible_k(k):
++    trainer = _fitted_on_cycle(epochs=1)
++    with pytest.raises(ValueError, match="k must be in"):
++        trainer.predict_on_batch(_seqs([[0, 1]]), k=k, exclude_seen=False)
++
++
++def test_predictions_are_shaped_and_ordered():
++    trainer = _fitted_on_cycle(epochs=2)
++    predictions = trainer.predict_on_batch(
++        _seqs([[0, 1, 2], [3, 4, 5]]), k=3, exclude_seen=False
++    )
++    assert predictions.cols.shape == (2, 3)
++    assert predictions.shape == (2, N_ITEMS)
++    for row in predictions.vals:
++        assert torch.equal(row, torch.sort(row, descending=True).values)
++
++
++def test_no_rows_at_all():
++    trainer = _fitted_on_cycle(epochs=1)
++    predictions = trainer.predict_on_batch(_seqs([]), k=2, exclude_seen=False)
++    assert predictions.cols.shape == (0, 2)
++
++
++def test_an_empty_history_is_predictable():
++    """Nothing to read but the appended [mask]; the model still has to answer."""
++    trainer = _fitted_on_cycle(epochs=1)
++    predictions = trainer.predict_on_batch(
++        _seqs([[], [0, 1]]), k=2, exclude_seen=False
++    )
++    assert predictions.cols.shape == (2, 2)
++
++
++def test_it_predicts_the_successor_of_the_last_item():
++    """On a pure cycle the answer is determined by the final interaction.
++
++    The source rows are training histories with their last interaction held
++    out, which is the split this model is trained for: ``fit`` sees the whole
++    history and masks its final position, and prediction sees the same context
++    with ``[mask]`` appended. A source of ``[0, 1, 2]`` therefore asks the same
++    question the last-item sample for ``[0, 1, 2, 3]`` was trained on.
++    """
++    trainer = _fitted_on_cycle(epochs=200)
++    predictions = trainer.predict_on_batch(
++        _seqs([[0, 1, 2], [2, 3, 4]]), k=1, exclude_seen=False
++    )
++    assert predictions.cols[:, 0].tolist() == [3, 5]
++
++
++def test_prediction_is_batching_invariant():
++    trainer = _fitted_on_cycle(epochs=2)
++    rows = [[0, 1, 2], [3, 4, 5], [2, 3, 4]]
++    together = trainer.predict_on_batch(_seqs(rows), k=2, exclude_seen=False)
++    apart = [
++        trainer.predict_on_batch(_seqs([row]), k=2, exclude_seen=False)
++        for row in rows
++    ]
++    for index, single in enumerate(apart):
++        assert torch.equal(together.cols[index], single.cols[0])
++        assert torch.allclose(together.vals[index], single.vals[0], atol=1e-5)
++
++
++def test_the_appended_mask_sits_after_the_last_real_interaction():
++    """Not at the end of the padded rectangle: the position of the token is what
++    the model reads the recommendation from."""
++    trainer = _fitted_on_cycle(epochs=1)
++    tokens, padding = trainer._encode_with_mask(_seqs([[0, 1, 2], [3]]))
++    assert int(torch.where(tokens[0] == MASK_ID)[0]) == 3
++    assert int(torch.where(tokens[1] == MASK_ID)[0]) == 1
++    assert padding[0].tolist()[:4] == [True, True, True, True]
++    assert padding[1].tolist()[:2] == [True, True]
++
++
++def test_a_history_longer_than_the_window_is_truncated_not_refused():
++    trainer = _fitted_on_cycle(epochs=1)
++    long_row = [(index % N_ITEMS) for index in range(30)]
++    predictions = trainer.predict_on_batch(
++        _seqs([long_row]), k=2, exclude_seen=False
++    )
++    assert predictions.cols.shape == (1, 2)
++
++
++def test_candidate_ids_restrict_the_ranking():
++    trainer = Bert4RecTrainer(_config(epochs=2)).fit(
++        _seqs(_cycle_rows()), item_ids=[f"item-{index}" for index in range(N_ITEMS)]
++    )
++    predictions = trainer.predict_on_batch(
++        _seqs([[0, 1, 2]]),
++        k=2,
++        exclude_seen=False,
++        candidate_ids=["item-4", "item-5", "item-6"],
++    )
++    assert set(predictions.cols[0].tolist()) <= {4, 5, 6}
++
++
++# --------------------------------------------------------------------------
++# exclude_seen
++# --------------------------------------------------------------------------
++
++
++def test_exclude_seen_masks_the_whole_history_including_repeats():
++    trainer = _fitted_on_cycle(epochs=2)
++    rows = [[0, 1, 1, 2]]
++    predictions = trainer.predict_on_batch(_seqs(rows), k=5, exclude_seen=True)
++    assert not ({0, 1, 2} & set(predictions.cols[0].tolist()))
++
++
++def test_exclude_seen_masks_what_truncation_dropped():
++    """A model that attends to the last N interactions must still refuse to
++    recommend the N+1th."""
++    trainer = _fitted_on_cycle(epochs=2, max_history_length=4)
++    row = [0, 1, 2, 3, 4, 5]
++    predictions = trainer.predict_on_batch(_seqs([row]), k=2, exclude_seen=True)
++    assert not (set(row) & set(predictions.cols[0].tolist()))
++
++
++def test_exclude_seen_refuses_when_fewer_than_k_unseen_items_remain():
++    trainer = _fitted_on_cycle(epochs=1)
++    row = list(range(N_ITEMS - 1))
++    with pytest.raises(ValueError):
++        trainer.predict_on_batch(_seqs([row]), k=3, exclude_seen=True)
++
++
++def test_exclude_seen_false_may_return_the_history():
++    trainer = _fitted_on_cycle(epochs=2)
++    rows = [[0, 1, 2]]
++    predictions = trainer.predict_on_batch(_seqs(rows), k=N_ITEMS, exclude_seen=False)
++    assert {0, 1, 2} <= set(predictions.cols[0].tolist())
++
++
++def test_masking_does_not_mutate_the_source():
++    trainer = _fitted_on_cycle(epochs=1)
++    source = _seqs([[0, 1, 2]])
++    before = np.array(source.values, copy=True)
++    trainer.predict_on_batch(source, k=2, exclude_seen=True)
++    assert np.array_equal(np.array(source.values), before)
++
++
++# --------------------------------------------------------------------------
++# persistence
++# --------------------------------------------------------------------------
++
++
++def test_a_reloaded_model_predicts_identically(tmp_path):
++    trainer = _fitted_on_cycle(epochs=2)
++    source = _seqs([[0, 1, 2], [3, 4, 5]])
++    before = trainer.predict_on_batch(source, k=3, exclude_seen=False)
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    restored = Bert4RecTrainer.load(path)
++    after = restored.predict_on_batch(source, k=3, exclude_seen=False)
++    assert torch.equal(before.cols, after.cols)
++    assert torch.allclose(before.vals, after.vals)
++
++
++def test_a_reloaded_model_keeps_the_window_and_the_padding_side(tmp_path):
++    trainer = _fitted_on_cycle(epochs=1, max_history_length=5)
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    restored = Bert4RecTrainer.load(path)
++    assert restored.batcher.max_length == 5
++    assert restored.batcher.padding == "right"
++    assert restored._predict_batcher.max_length == 4
++    assert restored.cfg.max_history_length == 5
++
++
++def test_a_reloaded_config_equals_the_saved_one(tmp_path):
++    trainer = _fitted_on_cycle(epochs=1)
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    assert Bert4RecTrainer.load(path).cfg == trainer.cfg
++
++
++def test_a_reloaded_model_keeps_the_history(tmp_path):
++    trainer = _fitted_on_cycle(epochs=2)
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    assert Bert4RecTrainer.load(path).history == trainer.history
++
++
++def test_a_reloaded_model_can_be_fitted_again(tmp_path):
++    trainer = _fitted_on_cycle(epochs=1)
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    restored = Bert4RecTrainer.load(path)
++    restored.fit(_seqs(_cycle_rows()))
++    assert len(restored.history) == 1
++    assert restored.is_fitted
++
++
++def test_the_vocabulary_survives_the_round_trip(tmp_path):
++    item_ids = [f"item-{index}" for index in range(N_ITEMS)]
++    batcher = SequenceBatcher(_tokenizer(item_ids=item_ids), max_length=6)
++    trainer = Bert4RecTrainer(_config(max_history_length=6), batcher).fit(
++        _seqs(_cycle_rows()), item_ids=item_ids
++    )
++    path = tmp_path / "bert4rec.ckpt"
++    trainer.save(path)
++    restored = Bert4RecTrainer.load(path)
++    assert list(restored.batcher.tokenizer.item_ids) == item_ids
++
++
++# --------------------------------------------------------------------------
++# the package's entry points
++# --------------------------------------------------------------------------
++
++
++def test_it_evaluates_through_the_standard_entry_point():
++    """A sequential model and a matrix model meet the same evaluation API."""
++    from scipy.sparse import csr_matrix
++
++    from compresso_recsys.evaluation import evaluate_recommender
++    from compresso_recsys.metrics import NDCG
++
++    trainer = _fitted_on_cycle(epochs=200)
++    sources = _seqs([[0, 1, 2], [3, 4, 5], [6, 7, 0]])
++    wanted = [3, 6, 1]
++    targets = csr_matrix(
++        (
++            np.ones(len(wanted), dtype=np.float32),
++            (np.arange(len(wanted)), np.array(wanted)),
++        ),
++        shape=(len(wanted), N_ITEMS),
++    )
++    result = evaluate_recommender(
++        trainer, source=sources, targets=targets, metrics=[NDCG(1)]
++    )
++    assert result.n_scored_rows == 3
++    assert result["ndcg@1"] == pytest.approx(1.0)
++
++
++def test_recommend_round_trips_real_item_ids():
++    """Giving the tokenizer the real IDs is what lets recommend() take and
++    return them instead of catalog offsets."""
++    item_ids = [f"item-{index}" for index in range(N_ITEMS)]
++    batcher = SequenceBatcher(_tokenizer(item_ids=item_ids), max_length=6)
++    trainer = Bert4RecTrainer(
++        _config(epochs=200, lr=0.01, batch_size=48, max_history_length=6), batcher
++    ).fit(_seqs(_cycle_rows()), item_ids=item_ids)
++
++    recommendations = trainer.recommend(
++        [["item-0", "item-1", "item-2"]], k=3, exclude_seen=True
++    )
++
++    assert list(recommendations.item_ids[0])[0] == "item-3"
++    assert not {"item-0", "item-1", "item-2"} & set(recommendations.item_ids[0])
++
++
++def test_item_ids_disagreeing_with_the_tokenizer_are_refused():
++    """Two vocabularies for one catalog is an error rather than a silent win."""
++    item_ids = [f"item-{index}" for index in range(N_ITEMS)]
++    batcher = SequenceBatcher(_tokenizer(item_ids=item_ids), max_length=6)
++    trainer = Bert4RecTrainer(_config(max_history_length=6), batcher)
++    with pytest.raises(ValueError, match="must match the batcher tokenizer"):
++        trainer.fit(_seqs(_cycle_rows()), item_ids=[f"x{i}" for i in range(N_ITEMS)])
+diff --git a/tests/test_elsa.py b/tests/test_elsa.py
+index f51d0ac..eb046c9 100644
+--- a/tests/test_elsa.py
++++ b/tests/test_elsa.py
+@@ -954,3 +954,39 @@ def test_streaming_evaluation_matches_materialized_predictions(
+     )
+ 
+     assert streamed == materialized
++
++
++# --------------------------------------------------------------------------
++# loss_chunk_elements: memory only
++# --------------------------------------------------------------------------
++
++
++def _one_step(trainer, x, sources, candidates, chunk):
++    """The loss and every gradient of one training step, with nothing updated."""
++    trainer.cfg = replace(trainer.cfg, loss_chunk_elements=chunk)
++    trainer.optimizer = torch.optim.SGD(trainer.elsa.parameters(), lr=0.0)
++    result = trainer.train_step(x, sources, candidates)
++    return result, [parameter.grad.clone() for parameter in trainer.elsa.parameters()]
++
++
++@pytest.mark.parametrize("with_candidates", [False, True])
++def test_a_chunked_loss_is_the_same_loss_and_gradient(interactions, with_candidates):
++    trainer = _trainer(max_output=None).fit(interactions)
++    dense = torch.tensor(interactions.toarray())
++    if with_candidates:
++        sources, candidates = torch.arange(6), torch.tensor([0, 1, 2, 3, 4, 5, 7])
++        x = dense[:, :6]
++    else:
++        sources, candidates, x = torch.arange(8), None, dense
++    whole, whole_grads = _one_step(trainer, x, sources, candidates, 2**27)
++    for chunk in (1, 16):  # one user per group; two users per group
++        result, grads = _one_step(trainer, x, sources, candidates, chunk)
++        for key in ("loss", "cosine_loss"):
++            assert float(result[key]) == pytest.approx(float(whole[key]), rel=1e-6)
++        for a, b in zip(whole_grads, grads):
++            assert torch.allclose(a, b, rtol=1e-5, atol=1e-7)
++
++
++def test_loss_chunk_elements_must_be_positive():
++    with pytest.raises(ValueError, match="loss_chunk_elements must be >= 1"):
++        ELSAConfig(loss_chunk_elements=0)
+diff --git a/tests/test_model_persistence.py b/tests/test_model_persistence.py
+index 18ff4ef..3f7f38a 100644
+--- a/tests/test_model_persistence.py
++++ b/tests/test_model_persistence.py
+@@ -28,6 +28,8 @@ from compresso_recsys.models import (
+     SequenceBatcher,
+     SimpleGPTConfig,
+     SimpleGPTTrainer,
++    Bert4RecConfig,
++    Bert4RecTrainer,
+     SASRecConfig,
+     SASRecTrainer,
+     SimpleRNNConfig,
+@@ -229,12 +231,21 @@ def test_job_logger_is_not_persisted(tmp_path, interactions):
+     assert restored.cfg.log_every_n_steps == 7
+ 
+ 
+-@pytest.mark.parametrize("kind", ["rnn", "gpt", "sasrec"])
++@pytest.mark.parametrize("kind", ["rnn", "gpt", "sasrec", "bert4rec"])
+ def test_sequential_round_trip_preserves_vocabulary_and_context(tmp_path, kind):
+     sequences = _sequence_data()
+-    tokenizer = ItemTokenizer(
+-        sequences.n_items,
+-        item_ids=np.array([f"item-{i}" for i in range(sequences.n_items)]),
++    item_ids = np.array([f"item-{i}" for i in range(sequences.n_items)])
++    # BERT4Rec masks to train, so its vocabulary needs a [mask] entry that the
++    # other three have no use for.
++    special_tokens = (
++        {"pad": 0, "mask": 1, "unk": 2} if kind == "bert4rec" else None
++    )
++    tokenizer = (
++        ItemTokenizer(
++            sequences.n_items, item_ids=item_ids, special_tokens=special_tokens
++        )
++        if special_tokens is not None
++        else ItemTokenizer(sequences.n_items, item_ids=item_ids)
+     )
+     batcher = SequenceBatcher(tokenizer, max_length=3)
+     if kind == "rnn":
+@@ -266,6 +277,23 @@ def test_sequential_round_trip_preserves_vocabulary_and_context(tmp_path, kind):
+             batcher,
+         ).fit(sequences)
+         model_class = SASRecTrainer
++    elif kind == "bert4rec":
++        model = Bert4RecTrainer(
++            Bert4RecConfig(
++                d_model=8,
++                n_blocks=1,
++                n_heads=2,
++                # As for SASRec: the batcher states a window, so the config has
++                # to name the same one.
++                max_history_length=3,
++                epochs=1,
++                batch_size=2,
++                duplication_factor=1,
++                show_progress=False,
++            ),
++            batcher,
++        ).fit(sequences)
++        model_class = Bert4RecTrainer
+     else:
+         model = SimpleGPTTrainer(
+             SimpleGPTConfig(
+@@ -507,8 +535,17 @@ def test_loading_defaults_to_cpu_even_if_saved_config_says_cuda(tmp_path):
+         SimpleRNNTrainer(),
+         SimpleGPTTrainer(),
+         SASRecTrainer(),
++        Bert4RecTrainer(),
++    ],
++    ids=[
++        "content",
++        "elsa",
++        "teaser-gd",
++        "simple-rnn",
++        "simple-gpt",
++        "sasrec",
++        "bert4rec",
+     ],
+-    ids=["content", "elsa", "teaser-gd", "simple-rnn", "simple-gpt", "sasrec"],
+ )
+ def test_torch_backed_recommenders_share_the_to_contract(model):
+     assert model.to("cpu") is model
+diff --git a/tests/test_progress_bars.py b/tests/test_progress_bars.py
+index 57fc112..7b4db5b 100644
+--- a/tests/test_progress_bars.py
++++ b/tests/test_progress_bars.py
+@@ -15,6 +15,8 @@ from compresso_recsys.models import (
+     ELSACompressionConfig,
+     ELSAConfig,
+     ELSATrainer,
++    Bert4RecConfig,
++    Bert4RecTrainer,
+     ItemTokenizer,
+     MultDAEConfig,
+     MultDAETrainer,
+@@ -335,6 +337,38 @@ def _fit_sasrec(
+     return trainer.fit(_histories(n_items=5))
+ 
+ 
++def _fit_bert4rec(
++    *, show_progress: bool = True, logger=None, log_every_n_steps=1000
++):
++    trainer = Bert4RecTrainer(
++        Bert4RecConfig(
++            d_model=8,
++            n_blocks=1,
++            n_heads=2,
++            dropout=0.0,
++            att_dropout=0.0,
++            # The batcher below states the window, so the config has to name the
++            # same one: it sizes the positional table.
++            max_history_length=8,
++            epochs=EPOCHS,
++            batch_size=2,
++            lr=1e-2,
++            # The default of 10 would turn each history into ten samples and ten
++            # times the batches, which changes nothing about the bars.
++            duplication_factor=1,
++            show_progress=show_progress,
++            seed=5,
++            log_every_n_steps=log_every_n_steps,
++        ),
++        SequenceBatcher(
++            ItemTokenizer(3, special_tokens={"pad": 0, "mask": 1, "unk": 2}),
++            max_length=8,
++        ),
++        logger=logger,
++    )
++    return trainer.fit(_histories())
++
++
+ TRAINERS = pytest.mark.parametrize(
+     ("fit", "label", "trainer_class", "step"),
+     [
+@@ -346,6 +380,7 @@ TRAINERS = pytest.mark.parametrize(
+         (_fit_simple_rnn, "SimpleRNN", SimpleRNNTrainer, "_train_step"),
+         (_fit_simple_gpt, "SimpleGPT", SimpleGPTTrainer, "_train_step"),
+         (_fit_sasrec, "SASRec", SASRecTrainer, "_train_step"),
++        (_fit_bert4rec, "Bert4Rec", Bert4RecTrainer, "_train_step"),
+     ],
+ )
+ 
+@@ -758,6 +793,7 @@ def test_logger_replaces_evaluation_bar(bars, capsys):
+ @pytest.mark.parametrize(
+     "config",
+     [
++        Bert4RecConfig,
+         ELSAConfig,
+         MultDAEConfig,
+         MultVAEConfig,
+diff --git a/tests/test_public_api.py b/tests/test_public_api.py
+index c6a7b9b..6b176f2 100644
+--- a/tests/test_public_api.py
++++ b/tests/test_public_api.py
+@@ -157,6 +157,9 @@ def test_submodule_public_apis_are_intentional():
+             "BaseIdentifiedRecommender",
+             "BasePersistableRecommender",
+             "BaseSequentialRecommender",
++            "Bert4Rec",
++            "Bert4RecConfig",
++            "Bert4RecTrainer",
+             "CandidateCatalog",
+             "ColdStartRecommender",
+             "CompressedELSA",
+diff --git a/tests/test_recommendations.py b/tests/test_recommendations.py
+index 4c0cb77..53903a1 100644
+--- a/tests/test_recommendations.py
++++ b/tests/test_recommendations.py
+@@ -18,6 +18,8 @@ from compresso_recsys.models import (
+     ELSAConfig,
+     ELSATrainer,
+     Recommendations,
++    Bert4RecConfig,
++    Bert4RecTrainer,
+     SASRecConfig,
+     SASRecTrainer,
+     SimpleGPTConfig,
+@@ -422,7 +424,9 @@ def test_warm_catalog_adapter_recommend_never_returns_cold_items():
+     assert "cold" not in result.item_ids[0]
+ 
+ 
+-@pytest.mark.parametrize("kind", ["ease", "elsa", "rnn", "gpt", "sasrec"])
++@pytest.mark.parametrize(
++    "kind", ["ease", "elsa", "rnn", "gpt", "sasrec", "bert4rec"]
++)
+ def test_builtin_fixed_models_apply_identified_candidate_filters(kind):
+     item_ids = np.array([f"item-{item}" for item in range(6)], dtype=object)
+     interactions = csr_matrix(
+@@ -475,6 +479,20 @@ def test_builtin_fixed_models_apply_identified_candidate_filters(kind):
+                 show_progress=False,
+             )
+         ).fit(sequences, item_ids=item_ids)
++    elif kind == "bert4rec":
++        model = Bert4RecTrainer(
++            Bert4RecConfig(
++                d_model=8,
++                n_blocks=1,
++                n_heads=2,
++                dropout=0.0,
++                max_history_length=3,
++                epochs=1,
++                batch_size=2,
++                duplication_factor=1,
++                show_progress=False,
++            )
++        ).fit(sequences, item_ids=item_ids)
+     else:
+         model = SimpleGPTTrainer(
+             SimpleGPTConfig(
+diff --git a/tests/test_sasrec.py b/tests/test_sasrec.py
+index a57d4ad..a757563 100644
+--- a/tests/test_sasrec.py
++++ b/tests/test_sasrec.py
+@@ -1360,3 +1360,38 @@ def test_the_configured_dropout_reaches_every_sublayer():
+     for forward in model.forward_layers:
+         assert forward.dropout1.p == 0.3
+         assert forward.dropout2.p == 0.3
++
++
++# --------------------------------------------------------------------------
++# loss_chunk_elements: memory only
++# --------------------------------------------------------------------------
++
++
++def _one_step(trainer, batch, chunk):
++    """The loss and every gradient of one training step, with nothing updated."""
++    trainer.cfg = dataclasses.replace(trainer.cfg, loss_chunk_elements=chunk)
++    trainer.model.train()
++    torch.manual_seed(1)  # the same dropout draw
++    trainer._rng = np.random.default_rng(5)  # the same negatives
++    loss, _ = trainer._train_step(batch, torch.optim.SGD(trainer.model.parameters(), lr=0.0), nn.BCEWithLogitsLoss())
++    return loss, [parameter.grad.clone() for parameter in trainer.model.parameters() if parameter.grad is not None]
++
++
++@pytest.mark.parametrize("n_negatives", [1, 4])
++def test_a_chunked_loss_is_the_same_loss_and_gradient(n_negatives):
++    d_model = 16
++    batch = _seqs(_cycle_rows(n_rows=12, length=6))
++    trainer = SASRecTrainer(_config(n_negatives=n_negatives, d_model=d_model)).fit(batch)
++    whole_loss, whole = _one_step(trainer, batch, 2**27)
++    # n_negatives * d_model elements per chunk is one position per chunk
++    for chunk in (n_negatives * d_model, 5 * n_negatives * d_model):
++        loss, grads = _one_step(trainer, batch, chunk)
++        assert loss == pytest.approx(whole_loss, rel=1e-6)
++        assert len(grads) == len(whole)
++        for a, b in zip(whole, grads):
++            assert torch.allclose(a, b, rtol=1e-5, atol=1e-7)
++
++
++def test_loss_chunk_elements_must_be_positive():
++    with pytest.raises(ValueError, match="loss_chunk_elements must be >= 1"):
++        _config(loss_chunk_elements=0)
+diff --git a/tests/test_simple_rnn.py b/tests/test_simple_rnn.py
+index 45d75a8..7441b4e 100644
+--- a/tests/test_simple_rnn.py
++++ b/tests/test_simple_rnn.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import dataclasses
++
+ import numpy as np
+ import pytest
+ import torch
+@@ -693,3 +695,35 @@ def test_both_sequential_trainers_share_one_schedule_implementation():
+     from compresso_recsys.models import simple_gpt, simple_rnn
+ 
+     assert simple_rnn.build_scheduler is simple_gpt.build_scheduler
++
++
++# --------------------------------------------------------------------------
++# loss_chunk_elements: memory only
++# --------------------------------------------------------------------------
++
++
++def _one_step(trainer, batch, chunk):
++    """The loss and every gradient of one training step, with nothing updated."""
++    trainer.cfg = dataclasses.replace(trainer.cfg, loss_chunk_elements=chunk)
++    trainer.model.train()
++    torch.manual_seed(1)  # the same dropout draw for every chunk size
++    loss, _ = trainer._train_step(batch, torch.optim.SGD(trainer.model.parameters(), lr=0.0), nn.CrossEntropyLoss())
++    return loss, [parameter.grad.clone() for parameter in trainer.model.parameters()]
++
++
++@pytest.mark.parametrize("dropout", [0.0, 0.3])
++def test_a_chunked_loss_is_the_same_loss_and_gradient(dropout):
++    batch = _seqs(_cycle_rows(n_rows=12, length=6))
++    trainer = SimpleRNNTrainer(_fast_config(dropout=dropout, unk_dropout=0.0)).fit(batch)
++    whole_loss, whole = _one_step(trainer, batch, 2**27)
++    # N_ITEMS elements per chunk is one position per chunk: the most chunks there can be
++    for chunk in (N_ITEMS, 7 * N_ITEMS):
++        loss, grads = _one_step(trainer, batch, chunk)
++        assert loss == pytest.approx(whole_loss, rel=1e-6)
++        for a, b in zip(whole, grads):
++            assert torch.allclose(a, b, rtol=1e-5, atol=1e-7)
++
++
++def test_loss_chunk_elements_must_be_positive():
++    with pytest.raises(ValueError, match="loss_chunk_elements must be >= 1"):
++        _fast_config(loss_chunk_elements=0)
+diff --git a/tests/test_temporal_split.py b/tests/test_temporal_split.py
+index 69b7f35..b93acba 100644
+--- a/tests/test_temporal_split.py
++++ b/tests/test_temporal_split.py
+@@ -160,6 +160,55 @@ def test_temporal_prefilter_remains_an_upper_bound_for_repeated_events():
+     assert split["extra_metadata"]["train_stage"]["prefiltered_users"] == 2
+ 
+ 
++def _timeline_with_early_users() -> pd.DataFrame:
++    """The timeline plus two users whose every event precedes the train target window."""
++    early = [
++        {"user_id": user_id, "item_id": item_id, "value": 1.0, "timestamp": timestamp}
++        for user_id in ("e1", "e2")
++        for item_id, timestamp in (("A", 100), ("Z", 200))
++    ]
++    return pd.concat([_timeline(), pd.DataFrame(early)], ignore_index=True)
++
++
++def test_temporal_train_users_window_drops_users_inactive_in_the_train_window():
++    split = _build_temporal_split(_temporal_args(), _timeline_with_early_users())
++
++    assert split["train_user_ids"].tolist() == ["u1", "u2", "u3"]
++    assert "Z" not in split["train_item_ids"]
++
++
++def test_temporal_train_users_all_trains_on_everything_before_the_validation_window():
++    window = _build_temporal_split(_temporal_args(), _timeline_with_early_users())
++    split = _build_temporal_split(
++        _temporal_args(temporal_train_users="all"), _timeline_with_early_users()
++    )
++
++    # the early users, and the item only they had, join training
++    assert split["train_user_ids"].tolist() == ["e1", "e2", "u1", "u2", "u3"]
++    assert split["train_item_ids"].tolist() == ["A", "B", "Z"]
++    rows = {user: row for row, user in enumerate(split["train_user_ids"])}
++    items = {item: col for col, item in enumerate(split["train_item_ids"])}
++    for user in ("e1", "e2"):
++        assert split["x_train"][rows[user]].indices.tolist() == [items["A"], items["Z"]]
++        assert split["train_target_matrix"][rows[user]].nnz == 0  # no train-window event
++        assert split["x_train_sequences"].row(rows[user]).tolist() == [items["A"], items["Z"]]
++
++    # nothing from the validation window or later reaches training
++    assert split["x_train"].sum() == 3 * 2 + 2 * 2  # u1, u2, u3: A and B; e1, e2: A and Z
++
++    # validation and test score the same users; their catalogues still extend training's
++    for phase in ("val", "test"):
++        assert split[f"{phase}_user_ids"].tolist() == window[f"{phase}_user_ids"].tolist()
++        ids = split[f"{phase}_item_ids"].tolist()
++        assert ids[: len(split["train_item_ids"])] == split["train_item_ids"].tolist()
++    assert split["extra_metadata"]["temporal_train_users"] == "all"
++
++
++def test_temporal_train_users_must_be_known():
++    with pytest.raises(ValueError, match="temporal_train_users"):
++        _temporal_args(temporal_train_users="everyone")
++
++
+ def test_temporal_split_rejects_period_longer_than_available_history():
+     with pytest.raises(ValueError, match="three target windows"):
+         _build_temporal_split(

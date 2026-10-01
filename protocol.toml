@@ -1,0 +1,362 @@
+# Stage-1 evaluation protocol (research design §5.3).
+#
+# Freeze this file before the first run. Every run records a fingerprint of the
+# sections that determine its result: [protocol], its dataset and its model.
+# Runs live in a directory named after that fingerprint, so editing a section
+# after runs exist does not overwrite them. It starts a fresh set of runs for
+# exactly the dataset/model pairs the edit touches, and the report only reads
+# runs that match the file as it stands.
+#
+# Lines marked "Decided" are choices the research design does not fix. Each
+# records what was chosen and why (reviewed 2026-09-24); after the first run,
+# changing one is a new protocol.
+
+[protocol]
+version = 1
+cutoffs = [5, 10, 20]
+metrics = ["ndcg", "recall", "calibrated_recall", "hit_rate", "precision", "map", "mrr"]
+primary_metric = "ndcg@10"      # the ranking metric of §5.3; the rest are diagnostics
+seeds = [0, 1, 2]               # final runs per selected configuration (§6.1)
+trials_per_model = 20           # equal random-search budget per model (§5.2)
+search_seed = 20260923
+# Decided: validation rows scored per search trial. One sample per dataset,
+# drawn once when the split is prepared, so every trial of every model is scored
+# on the same users and trials stay paired. Test is always scored in full.
+# Kept on condition that every dataset has enough validation users: `prepare`
+# prints the counts; a dataset with fewer simply scores all of them.
+max_val_users = 20000
+# Decided: what a user is scored against. "next" is the first thing they do
+# after their history ends (every item at that first timestamp): next-item
+# prediction, the research question and what serving faces. "window" -- all
+# they do in the phase's window, a year on ML-20M -- is reported beside it as a
+# diagnostic. Selection, the floor and every statistic use this one.
+# Decided (2026-09-29, H16): "next" is the user's *real* first moment in the
+# window, over all their events, including those on items the builder then
+# deleted as too rare; a deleted item is not replaced by a later event. And
+# next-item metrics are computed only over users whose next item a model can
+# recommend (it is in the training catalogue -- the refit one at test): the
+# others score 0 for every model. Test users scored, with refit: ML-20M 2,942 of
+# 3,321; Amazon Toys_and_Games 77,976 of 109,774; Music4All 30,180 of 30,369;
+# Yambda 50% 3,840 of 4,373; OTTO 14,605 of 18,458. The window diagnostic
+# scores everyone.
+targets = "next"
+# Decided (2026-09-29): refit before test. The search fits on the training
+# window and scores validation; each selected configuration (and each baseline
+# and control) is then fitted once more, per seed, on everything before the test
+# window, and only that model is tested. Without it, validation and test are
+# different tasks: a whole window lies between training and a test history, so
+# items first seen in validation cannot be recommended, BERT4Rec's mask lands on
+# untrained positions, and the search never sees either. The refit set is
+# rebuilt by the library's train-stage rule and proved against its x_train on
+# every `prepare` (seqrec_eval/refit.py). Selected settings are applied
+# unchanged to the larger training set.
+refit = true
+eval_batch_size = 1024          # speed only; not part of any fingerprint
+
+[latency]
+# Measurement settings, not protocol: they are recorded with each measurement
+# but do not enter any fingerprint.
+history_bins = [1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+requests_per_bin = 200
+warmup_requests = 20
+
+# ---------------------------------------------------------------------------
+# Datasets. Every preprocessing value is passed to the builder explicitly.
+# `options` override the builder's registered dataset options; any registered
+# option left unset still applies, and the resolved values are written to
+# split_info.json so the report states what was actually used.
+#
+# min_value_to_keep: a number keeps interactions with value >= it; "none" keeps
+# everything. (The builder reads a missing value as "use the registry default",
+# which for ML-20M is 4 stars -- so "none" is passed on as -inf, not as None.)
+#
+# train_users: "all" trains on every user with enough events before the
+# validation window, as §5.3 defines the training set; the library's default,
+# "window", keeps only users also active in the train target window (on ML-20M,
+# 3,940 of 130,281). Needs the compresso-recsys build with temporal_train_users.
+#
+# exclude_seen: whether items already in a user's history may be recommended.
+# Decided per dataset: true where a repeat is not a useful recommendation, false
+# where re-consumption is the behaviour a model has to beat. With true, a
+# repeated item can never be a hit. new_item_diagnostic additionally scores the
+# final runs against only the targets not already in the history.
+# ---------------------------------------------------------------------------
+
+[datasets.ml20m]
+builder = "ml20m"
+temporal_period_hours = 8136    # the library default, 339 days
+train_users = "all"
+min_user_support = 5
+item_min_support = 1
+min_value_to_keep = 3.0         # 3 stars and up; 1-2 are not positive, and half stars below 3 (2.5) go too
+set_all_values_to = 1.0
+exclude_seen = true             # a film is rated once
+new_item_diagnostic = false
+
+[datasets.amazon]
+builder = "amazon2023"
+# Decided 2026-09-29 (H56): Toys_and_Games replaces All_Beauty. All_Beauty has
+# about one review per user (93% have a single one), which left 259 test users,
+# and 73 once next-item metrics count only users a model could score; Toys keeps
+# about 78,000 (emulated; the first prepare gives the real count). 16.1M rated
+# events and a 447,069-item training catalogue: EASE (max_items 40,000) is skipped
+# here, as on Yambda and OTTO. The ratings and metadata are already downloaded.
+amazon_category = "Toys_and_Games"
+temporal_period_hours = 8136
+train_users = "all"
+min_user_support = 5
+item_min_support = 1
+min_value_to_keep = "none"
+set_all_values_to = 1.0
+exclude_seen = true             # Decided: repeats could be removed from the recommendations and stay valid
+new_item_diagnostic = false
+
+[datasets.music4all]
+builder = "music4all-onion"
+temporal_period_hours = 720     # 30 days, the registry value for the 2014 window
+train_users = "all"
+min_user_support = 5
+item_min_support = 5
+min_value_to_keep = "none"
+set_all_values_to = 1.0
+exclude_seen = false            # Decided: repeats are the dominant behaviour, and recommending them is right
+new_item_diagnostic = true
+options = { start = "2014-01-01", end = "2015-01-01" }
+
+[datasets.yambda]
+builder = "yambda"
+temporal_period_hours = 720
+train_users = "all"
+min_user_support = 5
+item_min_support = 5
+min_value_to_keep = "none"
+set_all_values_to = 1.0
+exclude_seen = false            # Decided: repeat listening, as Music4All
+new_item_diagnostic = true
+# Decided 2026-09-29: 50% of the 50m release's users (was 20%, which left 1,802 users and too few for the
+# catalogue sweeps). Hash-based, so it contains the old 20% exactly. No cache exists for it yet: the first
+# `prepare` builds one from the raw parquet (about 23M listens; run it on the DGX).
+options = { user_sample = 0.5 }
+
+[datasets.otto]
+builder = "otto"
+temporal_period_hours = 48      # the log is 28 days long
+train_users = "all"
+min_user_support = 5
+item_min_support = 5
+min_value_to_keep = "none"
+set_all_values_to = 1.0
+exclude_seen = false            # Decided: sessions revisit items
+new_item_diagnostic = true
+options = { session_sample = 0.02 }   # first prepare rebuilds the cache once for this sample
+
+# ---------------------------------------------------------------------------
+# Models. `fixed` is passed to every trial; `space` is sampled per trial:
+#   choice = [...]            uniform = [low, high]
+#   loguniform = [low, high]  int = [low, high]   (inclusive)
+# Trial i draws the same configuration on every dataset, and each parameter has
+# its own random stream, so adding a parameter does not move the others.
+# `trials` defaults to trials_per_model, or 1 for a model without a space.
+# `max_items` skips a model on catalogues it cannot hold (EASE is dense).
+#
+# Decided: every range is centred on what the model's own papers report, and
+# still covers what it covered before. Each published value sits inside its
+# range, near the middle on the scale it is searched on (log for rates, sizes
+# and regularisation). Where it cannot be the middle, the line says why: a
+# published value that is the smallest possible (1 head, 1 layer, 1 negative),
+# a learning rate tuned for another optimizer, or a cost bound. Sources:
+#   SASRec   Kang & McAuley, ICDM 2018 (§IV-C), and its repo kang205/SASRec
+#   GRU4Rec  Hidasi et al., ICLR 2016 (Table 2); Hidasi & Czapp, RecSys 2023
+#            (tuned values in hidasib/GRU4Rec paramfiles)
+#   EASE     Steck, WWW 2019 (§5.2)
+#   ELSA     Vančura et al., RecSys 2022: paper not accessible; values from the
+#            official repo recombee/ELSA (ML-20M reproduction), so unconfirmed
+# ---------------------------------------------------------------------------
+
+[models.popularity]
+family = "matrix"
+
+[models.ease]
+family = "matrix"
+max_items = 40000
+[models.ease.space]
+# λ ≈ 500 on ML-20M, 1,000 on Netflix, 200 on MSD, 3,000 with little training
+# data. 1 to 250,000 is centred on 500 in log space and keeps 1 to 10,000.
+l2 = { loguniform = [1.0, 250000.0] }
+
+[models.elsa]
+family = "matrix"
+[models.elsa.space]
+# ML-20M reproduction: 800 factors, batch 32, lr 0.1 with NAdam (the library's
+# optimizer too), 10 epochs. 4096 factors would not fit a V100 with Adam state on
+# the largest catalogues, so the factors stop at 2048, and 800 is listed itself.
+latent_dim = { choice = [128, 256, 512, 800, 1024, 2048] }
+batch_size = { choice = [16, 32, 128, 512, 1024] }
+# 0.1 is inside; the range stops at 1.0 rather than centring on 0.1 (which would
+# need 100), because NAdam diverges long before that.
+lr = { loguniform = [1e-4, 1.0] }
+epochs = { choice = [3, 5, 10, 20, 40] }
+
+[models.gru]
+family = "sequence"
+[models.gru.fixed]
+rnn_type = "gru"
+[models.gru.space]
+# GRU4Rec: 100 units (2016), 224 to 512 when tuned (2023), with input and output
+# embeddings shared, so embedding and hidden sizes cover the same range.
+embedding_dim = { choice = [64, 128, 256, 512] }
+hidden_dim = { choice = [64, 128, 256, 512] }
+num_layers = { choice = [1, 2] }             # 1 is best in both papers, and the smallest
+dropout = { uniform = [0.0, 0.6] }           # tuned 0 to 0.5
+# GRU4Rec's rates (0.01 to 0.25) are for Adagrad and do not carry over to the
+# library's NAdam; centred on NAdam's usual 1e-3 instead.
+lr = { loguniform = [1e-4, 1e-2] }
+batch_size = { choice = [32, 64, 128, 256, 512] }   # tuned 32 to 240
+epochs = { choice = [3, 5, 10, 20, 40] }     # "usually 10, but 5 gets you similar performance"
+max_history_length = { choice = [50, 100, 200] }   # session-based: no published value
+unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }   # N7, as SASRec (library default 0.05)
+
+[models.sasrec]
+family = "sequence"
+[models.sasrec.space]
+# d = 50 (searched 10 to 50, "satisfactory with d >= 40"); 2 blocks; 1 head (two
+# "consistently and slightly worse"); dropout 0.2 dense, 0.5 sparse; lr 1e-3;
+# batch 128; n = 200 dense, 50 sparse, gains saturating near 500; 1 negative;
+# 201 epochs in the repo.
+d_model = { choice = [16, 32, 50, 64, 128] }
+n_blocks = { choice = [1, 2, 3] }
+n_heads = { choice = [1, 2] }                # 1 is published and the smallest
+dropout = { uniform = [0.0, 0.7] }           # centred between 0.2 and 0.5
+lr = { loguniform = [1e-4, 1e-2] }
+batch_size = { choice = [64, 128, 256] }
+# 200 is inside but not centred: centring it while keeping 20 would need 2,000
+# epochs, and with no early stopping every epoch is paid in full.
+epochs = { choice = [20, 50, 100, 200, 400] }
+# Decided 2026-10-01 (N2): negatives are sampled from outside the whole history,
+# as published; on repeat-heavy data that holds back re-consumption (documented).
+n_negatives = { choice = [1, 16, 64, 256] }  # 1 is published and the smallest
+# Decided 2026-10-01 (N7): items first seen after training are read as the unknown
+# token, whose embedding learns only from inputs replaced by it in training. At 0
+# it never learns; the library's GRU defaults to 0.05. Searched for both models.
+unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }
+max_history_length = { choice = [25, 50, 100, 200, 400] }
+
+# ---------------------------------------------------------------------------
+# Non-learned baselines (§5.2), scored by `seqrec-eval analyse`, not models.
+# Each is searched on validation like a model (a small grid of choices in
+# full, otherwise random search with trials_per_model), then scored on test on
+# the models' terms; the strongest is the floor every model has to beat. They
+# keep their full-data setting across every ablation level, as the models keep
+# theirs. First-order Markov is also the instrument of the sequence-signal
+# analysis (shuffled and backwards controls, tied vs real-gap histories).
+# ---------------------------------------------------------------------------
+
+[baselines.popularity]
+kind = "popularity"
+[baselines.popularity.space]
+count = { choice = ["events", "users"] }
+
+[baselines.time_popularity]
+kind = "time_popularity"
+[baselines.time_popularity.space]
+half_life_days = { loguniform = [0.25, 365.0] }   # Decided: from hours to a year, deliberately wide
+
+[baselines.replay]
+kind = "replay"
+[baselines.replay.space]
+order = { choice = ["recency", "frequency"] }
+
+[baselines.markov]
+kind = "markov"
+
+# ---------------------------------------------------------------------------
+# Ablations (research design §5.4). Each sweep refits every model's stage-1
+# configuration at each level, under every seed, and scores it on the test
+# users eligible at every level. "full" is the stage-1 final model itself.
+#   transform   a transform registered in seqrec_eval/ablations.py
+#   levels      what the transform varies; "full" is reserved for the reference
+#   options     transform-specific settings (enter the fingerprint)
+#   scope       "all" (default): training data and inference histories are both
+#               transformed and every model is refitted. "inference": training
+#               is untouched, only the histories given at recommendation time
+#               change, and the stage-1 models are rescored, not refitted
+#   expected_to_move   characteristics the transform moves by construction,
+#               besides its target; overrides the transform's own declaration
+#               (report only)
+#   datasets / models   what the sweep covers (default: all; not fingerprinted)
+#   manipulation_tolerance   relative change beyond which a characteristic the
+#               sweep does not target is flagged (report only; default 0.05)
+#   min_level_users   a level scored on fewer users is reported as descriptive
+#               only (report only; default 1000; Decided 2026-09-29)
+#   knee_margin δ as a fraction of a model's full-data score (report only; default 0.10):
+#               the knee is the smallest level shown, by a one-sided paired
+#               randomisation test against the full data, to lose less than δ,
+#               with every larger level too. The report states the test's power.
+# ---------------------------------------------------------------------------
+
+[ablations.history_length]
+transform = "history_length"
+# Decided: the grid. Level n is a context of n items: training histories keep
+# their last n + 1 events (a history of n + 1 teaches contexts of n; its last
+# event is only a target), input histories their last n, so a model is trained
+# and served with the same context and level 1 trains too (2026-09-29). The
+# knee is read from these levels, so it can be no finer than them.
+levels = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+# Decided: how much of the full-data NDCG a shorter history may cost and still
+# count as "no loss", fixed before any result is read because it decides the knee.
+# Decided 2026-09-30: 10%, was 2%. At 2% a level that loses nothing could be
+# shown "within δ" only 9-25% of the time on ML-20M's 2,942 test users and
+# 10-30% on Yambda's (δ was smaller than the measurement noise); at 10% that is
+# 47-100% and 56-100%, and above 97% on the larger datasets (review H20).
+knee_margin = 0.10
+
+[ablations.history_length_inference]
+transform = "history_length"
+scope = "inference"
+# The serving-cost question: how much history does a trained model need at
+# recommendation time? No refitting, so this sweep is nearly free.
+levels = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+knee_margin = 0.10
+
+[ablations.density]
+transform = "density"
+# Decided: the grid. Each history keeps a random p of its events, spread over
+# its whole length; every training item keeps at least one event.
+levels = [0.1, 0.25, 0.5, 0.75]
+knee_margin = 0.10
+
+[ablations.shuffle]
+transform = "shuffle"
+# Decided: block sizes; "all" shuffles whole histories. Only order changes, so
+# the matrix models are a control that should match the full data.
+levels = [2, 10, "all"]
+
+[ablations.catalogue_top]
+transform = "catalogue"
+# Both catalogue sweeps score each level on its own users (a known next target
+# still in the catalogue), not one fixed set: one set cannot survive the item
+# removal (H01b). Catalogues are nested: a smaller level is part of every larger.
+# Fractions of the training catalogue kept (integers would be item counts).
+# The most popular items by training events are kept, so 0.75 shows whether the
+# long tail matters at all.
+levels = [0.1, 0.25, 0.5, 0.75]
+
+[ablations.catalogue_stratified]
+transform = "catalogue"
+# The same sizes drawn at random within popularity deciles, which keeps the
+# popularity distribution that the top-k cut flattens.
+levels = [0.1, 0.25, 0.5, 0.75]
+options = { strategy = "stratified", strata = 10 }
+
+[ablations.repeat_removal]
+transform = "repeat_removal"
+# Decided: the share of repeat events removed. First occurrences always stay.
+levels = [0.25, 0.5, 1.0]
+knee_margin = 0.10
+
+# Stage-1 results cut by repeat share within history-length bins. No runs.
+[repeat_strata]
+history_bins = [1, 5, 10, 20, 50, 100, 200, 500]
+repeat_bins = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+min_users = 100
+n_resamples = 1999

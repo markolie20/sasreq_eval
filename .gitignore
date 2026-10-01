@@ -1,0 +1,14 @@
+# results and environments: never in the repository
+work/
+work-local/
+work-local-full/
+.venv/
+__pycache__/
+*.egg-info/
+# setuptools output from `uv sync` building the vendored library
+vendor/compresso-recsys/build/
+.pytest_cache/
+# machine-specific Claude Code settings (the review skill under .claude/skills is shared)
+.claude/settings.local.json
+# Mark's scratch notes (the prompt for WALKTHROUGH.md)
+/test
