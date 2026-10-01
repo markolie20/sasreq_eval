@@ -1053,6 +1053,26 @@ already left the handler installed; the test now installs its own first:
 
 ---
 
+## 31. GPU runs on an explicit device failed at once (2026-10-01)
+
+**Problem.** On the first DGX run, every run on `--device cuda:0` (the README's form) failed before any work
+with "RuntimeError: Invalid device argument", popularity included. The runner resets torch's peak-memory counter
+at the start of each run. Until CUDA has started in the process, that call refuses an explicit device, though
+not plain `cuda`. The tests ran on `cuda`, in a process where CUDA had already started, so they never saw it.
+
+**Change.** `runner._reset_peak_memory` starts CUDA (`torch.cuda.init()`, a no-op once started) before the
+reset.
+
+**Effect.** Runs on `cuda:0` and `cuda:1` work. No fingerprint changes; nothing had run.
+
+**Where.** `runner.py`.
+
+**Tests.** `test_a_run_on_an_explicit_gpu_starts_its_memory_counters_in_a_fresh_process` (skipped without a
+GPU; it fails without the fix). 234 pass on CPU, and on the GPU with `SEQREC_EVAL_TEST_DEVICE=cuda:0`, which is
+how the GPU tests should be run from now on.
+
+---
+
 ## Known limitations recorded by the review
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum

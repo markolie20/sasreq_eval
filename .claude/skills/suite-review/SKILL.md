@@ -74,7 +74,7 @@ Tell Mark the mode and the scope in one or two lines before starting.
   never while another test run is going, and check that a test catches it.
 - **The full suite on CPU and GPU after the fixes:**
   `.venv/bin/python -m pytest -q`, and again with
-  `SEQREC_EVAL_TEST_DEVICE=cuda`.
+  `SEQREC_EVAL_TEST_DEVICE=cuda:0`.
 - **A DECISIONS.md entry for every change:** what, why, effect, side effects (fingerprints that change and the
   runs they rerun), where, tests. Update the README where behaviour changed, and ISSUES statuses.
 - **Something new found while fixing is X,** not part of this round. Say so; do not fold it in.

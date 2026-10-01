@@ -424,9 +424,7 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
         write_json(directory / "done.json", record)
         return "skipped"
 
-    cuda = device.startswith("cuda") and torch.cuda.is_available()
-    if cuda:
-        torch.cuda.reset_peak_memory_stats(device)
+    cuda = _reset_peak_memory(device)
     if spec.kind in ("reference", "rescore"):
         checkpoint = Path(work_dir) / spec.condition["checkpoint"]
         if not checkpoint.exists():
@@ -482,6 +480,20 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
     record["status"] = "done"
     write_json(directory / "done.json", record)
     return "done"
+
+
+def _reset_peak_memory(device: str) -> bool:
+    """Start counting the run's peak GPU memory; ``False`` on the CPU.
+
+    CUDA is started first: until it has started, torch's memory counters refuse an explicit device
+    (``cuda:0``) though not plain ``cuda``, so on the first DGX run every run failed at once with "Invalid
+    device argument" (2026-10-01). The tests ran on ``cuda`` and did not see it.
+    """
+    if not (device.startswith("cuda") and torch.cuda.is_available()):
+        return False
+    torch.cuda.init()
+    torch.cuda.reset_peak_memory_stats(device)
+    return True
 
 
 def made_with_another_selection(spec: RunSpec, directory: Path) -> str | None:

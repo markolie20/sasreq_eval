@@ -21,7 +21,7 @@ In Claude Code, `/suite-review` runs one.
 git clone <this repository> seqrec_eval && cd seqrec_eval
 uv sync                                      # torch 2.14.0+cu126, and compresso-recsys from vendor/
 pytest                                       # ~30 s, synthetic data, no downloads
-SEQREC_EVAL_TEST_DEVICE=cuda pytest          # the same, every search, final and ablation run on the GPU
+SEQREC_EVAL_TEST_DEVICE=cuda:0 pytest        # the same, every search, final and ablation run on the GPU
 ```
 
 That is the whole installation, on the laptop and on the DGX alike. Plain `uv sync` and `uv run` are safe: the

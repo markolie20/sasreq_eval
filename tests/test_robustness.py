@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import pytest
+import torch
 
 from seqrec_eval import cli
 from seqrec_eval.protocol import ProtocolError, load_protocol
@@ -100,6 +101,15 @@ def test_a_lock_names_its_last_owner_and_two_claims_in_one_process_fail(tmp_path
     first.release()
     assert second.acquire()
     second.release()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_run_on_an_explicit_gpu_starts_its_memory_counters_in_a_fresh_process():
+    # 2026-10-01, the first DGX run: `--device cuda:0` failed every run, since the counters refuse an explicit
+    # device until CUDA has started. In-process tests had always started it already, so only a fresh one shows it.
+    code = "from seqrec_eval.runner import _reset_peak_memory; print(_reset_peak_memory('cuda:0'))"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0 and out.stdout.strip() == "True", out.stderr
 
 
 def test_exit_codes_tell_failure_from_unfinished_work():
