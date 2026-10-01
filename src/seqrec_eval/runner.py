@@ -484,7 +484,7 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
     return "done"
 
 
-def _made_with_another_selection(spec: RunSpec, directory: Path) -> str | None:
+def made_with_another_selection(spec: RunSpec, directory: Path) -> str | None:
     """Why the finished run in ``directory`` does not belong to ``spec``'s selection, or ``None`` if it does.
 
     A final run (and every ablation run built on one) uses the configuration selected when it was planned. If
@@ -507,7 +507,7 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
     _check_training(spec, split, protocol)
     directory = spec.directory(work_dir)
     if (directory / "done.json").exists():
-        stale = _made_with_another_selection(spec, directory)
+        stale = made_with_another_selection(spec, directory)
         if stale:
             log(f"[{spec.dataset}/{spec.model}] {spec.label}: {stale}")
             return "stale-selection"
@@ -524,7 +524,7 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
             # the stage-1 final it reloads is not made yet -- a seed added to stage 1 and to a sweep at once, run
             # on two GPUs, say. That is an order to wait for, not a failure to record: a later run picks it up.
             return "waiting-for-stage1"
-        stale = _made_with_another_selection(spec, stage1)
+        stale = made_with_another_selection(spec, stage1)
         if stale:
             log(f"[{spec.dataset}/{spec.model}] {spec.label}: the stage-1 final it reloads {stale[0].lower()}"
                 f"{stale[1:]}")
@@ -539,7 +539,8 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
     # A process killed while running it (the kernel's out-of-memory killer, SIGKILL) records nothing, so every
     # restart would run it first, for ever; after MAX_ATTEMPTS starts it is a failure like any other (review B3).
     attempts_path = directory / "attempts.json"
-    attempts = int(read_json(attempts_path).get("started", 0)) if attempts_path.exists() else 0
+    # --retry-failed asks for another try: earlier deaths no longer count (review N31)
+    attempts = int(read_json(attempts_path).get("started", 0)) if attempts_path.exists() and not retry_failed else 0
     if attempts >= MAX_ATTEMPTS:
         write_json(directory / "failed.json", {
             "spec": asdict(spec), "host": socket.gethostname(), "device": device,
@@ -580,15 +581,37 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
             torch.cuda.empty_cache()
 
 
+def stale_final_seeds(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> list[int]:
+    """Seeds whose finished final was made with another trial's configuration than the one selected now.
+
+    Such a final describes another model (see :func:`made_with_another_selection`): every report leaves it out
+    of its values and comparisons, and latency is not measured on it (review N33). Empty while no trial can be
+    selected.
+    """
+    best = summarize_trials(protocol, work_dir, dataset, model).best
+    if best is None:
+        return []
+    root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
+    stale = []
+    for seed in final_seeds(protocol, work_dir, dataset):
+        directory = root / f"final-seed{seed}"
+        if ((directory / "done.json").exists() and (directory / "spec.json").exists()
+                and read_json(directory / "spec.json").get("source_trial") != best.index):
+            stale.append(seed)
+    return stale
+
+
 def load_final_evaluations(protocol: Protocol, work_dir: Path, dataset: str, model: str,
                            stem: str = "test") -> list[tuple[RunSpec, Any]]:
-    """Finished final runs of the selected configuration, with one saved evaluation each."""
+    """Finished final runs of the selected configuration, with one saved evaluation each. A final made with
+    another trial's configuration than the one selected now is left out (:func:`stale_final_seeds`)."""
     fingerprint = protocol.run_fingerprint(dataset, model)
     root = run_root(work_dir, dataset, model, fingerprint)
+    stale = stale_final_seeds(protocol, work_dir, dataset, model)
     out = []
     for seed in final_seeds(protocol, work_dir, dataset):
         directory = root / f"final-seed{seed}"
-        if not (directory / "done.json").exists() or not evaluation_exists(directory / stem):
+        if seed in stale or not (directory / "done.json").exists() or not evaluation_exists(directory / stem):
             continue
         spec = RunSpec(**read_json(directory / "spec.json"))
         out.append((spec, load_evaluation(directory / stem)))

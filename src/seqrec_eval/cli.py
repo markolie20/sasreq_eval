@@ -31,9 +31,12 @@ variables ``SEQREC_EVAL_WORK`` and ``COMPRESSO_DATA_DIR``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import signal
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -172,7 +175,39 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _operator_stop(signum, frame) -> None:
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
+@contextlib.contextmanager
+def _operator_stops():
+    """``kill`` (SIGTERM) and a closed terminal (SIGHUP) stop a command as Ctrl-C does, so the run in progress
+    is not counted as a death (review N31): a ``nohup`` launch cannot be stopped otherwise. A SIGHUP that
+    ``nohup`` ignores stays ignored. SIGKILL (``kill -9``) and the kernel's out-of-memory killer cannot be caught,
+    and still count."""
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(signum) is not signal.SIG_IGN:
+                previous[signum] = signal.signal(signum, _operator_stop)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)
+
+
 def main(argv: list[str] | None = None) -> int:
+    with _operator_stops():
+        try:
+            return _main(argv)
+        except KeyboardInterrupt as stop:
+            print(f"stopped{f' by {stop}' if str(stop) else ''}: the run in progress was not counted as a failed "
+                  "attempt; rerun the command to go on", file=sys.stderr)
+            return 130
+
+
+def _main(argv: list[str] | None) -> int:
     args = _parser().parse_args(argv)
     protocol = load_protocol(args.protocol)
     work_dir = Path(args.work_dir)

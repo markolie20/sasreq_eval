@@ -28,7 +28,7 @@ from .evaluate import ExcludeSeenPolicy, phase_inputs
 from .models import model_spec
 from .protocol import Protocol
 from .results import read_json, write_json
-from .runner import run_root
+from .runner import run_root, stale_final_seeds
 from .search import _stream
 from .splits import Split
 
@@ -69,6 +69,10 @@ def benchmark(protocol: Protocol, work_dir: Path, split: Split, model: str, *,
     checkpoint = directory / "model.zip"
     if not checkpoint.exists():
         raise FileNotFoundError(f"{dataset}/{model}: no saved final model at {checkpoint}; run `final` first")
+    if protocol.seeds[0] in stale_final_seeds(protocol, work_dir, dataset, model):
+        # no saved model of the current selection, only another configuration's (review N33)
+        raise FileNotFoundError(f"{dataset}/{model}: the final at {directory} was made with another trial's "
+                                "configuration than the one selected now; move it aside and rerun `final` first")
 
     if cores:
         os.sched_setaffinity(0, cores)
@@ -127,11 +131,15 @@ def benchmark(protocol: Protocol, work_dir: Path, split: Split, model: str, *,
 
 def latency_table(protocol: Protocol, work_dir: Path, datasets: list[str], models: list[str]) -> str:
     lines = ["| dataset | model | catalogue | threads | P50 ms | P95 ms | P99 ms | worst-bin P95 |", "|---|---|---|---|---|---|---|---|"]
+    stale = []
     for dataset in datasets:
         for model in models:
             path = (run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
                     / f"final-seed{protocol.seeds[0]}" / "latency.json")
             if not path.exists():
+                continue
+            if protocol.seeds[0] in stale_final_seeds(protocol, work_dir, dataset, model):
+                stale.append(f"{dataset}/{model}")  # measured on another configuration's model (review N33)
                 continue
             r = read_json(path)
             # a P95 of a handful of requests is noise: the worst bin is taken over bins with enough of them
@@ -144,4 +152,7 @@ def latency_table(protocol: Protocol, work_dir: Path, datasets: list[str], model
             o = r["overall"]
             lines.append(f"| {dataset} | {model} | {r['catalog_items']:,} | {r['threads']} | {o['p50_ms']:.2f} | "
                          f"{o['p95_ms']:.2f} | {o['p99_ms']:.2f} | {worst} |")
+    if stale:
+        lines += ["", (f"⛔ Not shown: {', '.join(stale)}, measured on a final made with another trial's "
+                       "configuration than the one selected now. Move it aside, rerun `final`, then `latency`.")]
     return "\n".join(lines)

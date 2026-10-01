@@ -40,7 +40,7 @@ missing, and a changed baseline section starts its own search:
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -412,11 +412,14 @@ def condition_results(protocol: Protocol, work_dir: Path, sweep: str, dataset: s
     return out
 
 
-def floor_of(results: dict[str, EvaluationResult], metric: str) -> tuple[str, EvaluationResult] | None:
-    """The strongest baseline on ``metric``: the floor."""
-    if not results:
+def floor_of(results: dict[str, EvaluationResult], metric: str, *,
+             expected: Iterable[str]) -> tuple[str, EvaluationResult] | None:
+    """The strongest baseline on ``metric``: the floor. ``None`` until every baseline in ``expected`` has a
+    result, since the strongest of those finished would be a lower floor, silently (review N34)."""
+    expected = list(expected)
+    if not expected or any(name not in results for name in expected):
         return None
-    name = max(results, key=lambda n: results[n].metrics[metric])
+    name = max(expected, key=lambda n: results[n].metrics[metric])
     return name, results[name]
 
 

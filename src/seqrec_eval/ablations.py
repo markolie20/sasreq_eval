@@ -81,7 +81,7 @@ import pandas as pd
 from compresso_recsys import ItemSequences
 from scipy.sparse import csr_matrix
 
-from .evaluate import reachable_targets, recommendable_next, target_key
+from .evaluate import fills_list, reachable_targets, recommendable_next, target_key
 from .protocol import AblationProtocol, Protocol, ProtocolError
 from .results import durable_replace, read_json, write_json
 from .runner import RunSpec, final_seeds, plan_finals, record_added_seeds, run_root, seeds_with_added
@@ -728,15 +728,25 @@ def condition_name(level: Any, data_seed: int | None) -> str:
 
 
 def _eligible_test_rows(data: dict[str, Any], targets: str = "test_target_matrix", *,
-                        exclude_seen: bool = False) -> np.ndarray:
+                        exclude_seen: bool = False, k: int | None = None) -> np.ndarray:
     """Test rows that can be scored: a non-empty history, and a target -- for next-item targets, one a model
-    can recommend, exactly as :func:`~seqrec_eval.evaluate.scored_rows` scores them (H16, review C4)."""
+    can recommend, exactly as :func:`~seqrec_eval.evaluate.scored_rows` scores them (H16, review C4). With
+    ``exclude_seen``, also a full list of ``k`` unseen items, as :func:`~seqrec_eval.evaluate.evaluate_phase`
+    requires (review N49)."""
     if targets.endswith("next_target_matrix"):
         has_targets = recommendable_next(reachable_targets(data, "test", data[targets], exclude_seen),
                                          len(data["train_item_ids"]))
     else:
         has_targets = np.diff(data[targets].indptr) > 0
-    return has_targets & (data["test_source_sequences"].row_lengths > 0)
+    return has_targets & (data["test_source_sequences"].row_lengths > 0) & _fills(data, exclude_seen, k)
+
+
+def _fills(data: dict[str, Any], exclude_seen: bool, k: int | None) -> np.ndarray | bool:
+    if not exclude_seen:
+        return True
+    if k is None:
+        raise ValueError("with exclude_seen, which test rows can be scored depends on k (max cutoff)")
+    return fills_list(data, "test", k)
 
 
 def apply_condition(protocol: Protocol, split: Split, sweep: str, level: Any,
@@ -771,16 +781,19 @@ def reference_condition(split: Split, sweep: str, test_rows: np.ndarray) -> Spli
                    condition={"sweep": sweep, "level": None, "label": REFERENCE, "data_seed": None})
 
 
-def own_test_rows(data: dict[str, Any], targets: str, *, exclude_seen: bool = False) -> np.ndarray:
+def own_test_rows(data: dict[str, Any], targets: str, *, exclude_seen: bool = False,
+                  k: int | None = None) -> np.ndarray:
     """Test rows a condition can score on its own: a known next target in its catalogue, and a history item.
 
     A known target is one inside the training catalogue (``index < len(train_item_ids)``); an item first seen
     after training can never be recommended, so a user whose targets are all such items scores 0 for every
-    model and says nothing about any of them.
+    model and says nothing about any of them. With ``exclude_seen``, the catalogue must also hold ``k`` items
+    the user has not seen (review N49: at a small catalogue, the heaviest users have seen nearly all of it).
     """
     known = recommendable_next(reachable_targets(data, "test", data[targets], exclude_seen),
                                len(data["train_item_ids"]))
-    return np.flatnonzero(known & (data["test_source_sequences"].row_lengths > 0)).astype(np.int64)
+    usable = known & (data["test_source_sequences"].row_lengths > 0) & _fills(data, exclude_seen, k)
+    return np.flatnonzero(usable).astype(np.int64)
 
 
 def per_condition_users(protocol: Protocol, sweep: str) -> bool:
@@ -792,7 +805,7 @@ def build_reference(protocol: Protocol, work_dir: Path, split: Split, sweep: str
     """The full-data condition of ``sweep``, scored on the fixed set or, where targets change, its own users."""
     if per_condition_users(protocol, sweep):
         rows = own_test_rows(split.data, target_key("test", protocol.targets),
-                             exclude_seen=protocol.dataset(split.dataset).exclude_seen)
+                             exclude_seen=protocol.dataset(split.dataset).exclude_seen, k=max(protocol.cutoffs))
     else:
         rows = fixed_test_rows(protocol, work_dir, split, sweep)
     return reference_condition(split, sweep, rows)
@@ -804,7 +817,8 @@ def build_condition(protocol: Protocol, work_dir: Path, split: Split, sweep: str
     if per_condition_users(protocol, sweep):
         condition = apply_condition(protocol, split, sweep, level, data_seed)
         return replace(condition, test_rows=own_test_rows(condition.data, target_key("test", protocol.targets),
-                                                          exclude_seen=protocol.dataset(split.dataset).exclude_seen))
+                                                          exclude_seen=protocol.dataset(split.dataset).exclude_seen,
+                                                          k=max(protocol.cutoffs)))
     rows = fixed_test_rows(protocol, work_dir, split, sweep)
     return apply_condition(protocol, split, sweep, level, data_seed, test_rows=rows)
 
@@ -835,11 +849,12 @@ def fixed_test_rows(protocol: Protocol, work_dir: Path, split: Split, sweep: str
             write_json(record, {"data_seeds": checked + missing, "n_rows": int(rows.size)})
         return rows
     exclude_seen = protocol.dataset(split.dataset).exclude_seen
-    eligible = _eligible_test_rows(split.data, targets, exclude_seen=exclude_seen)
+    k = max(protocol.cutoffs)
+    eligible = _eligible_test_rows(split.data, targets, exclude_seen=exclude_seen, k=k)
     for level in protocol.ablation(sweep).levels:
         for data_seed in seeds:
             eligible &= _eligible_test_rows(apply_condition(protocol, split, sweep, level, data_seed).data, targets,
-                                            exclude_seen=exclude_seen)
+                                            exclude_seen=exclude_seen, k=k)
     rows = np.flatnonzero(eligible).astype(np.int64)
     if rows.size == 0:
         raise RuntimeError(f"{sweep} on {split.dataset}: no test user is eligible at every level")
@@ -858,7 +873,8 @@ def _check_subsamples(protocol: Protocol, split: Split, sweep: str, rows: np.nda
     for data_seed in seeds:
         for level in protocol.ablation(sweep).levels:
             eligible = _eligible_test_rows(apply_condition(protocol, split, sweep, level, data_seed).data, targets,
-                                           exclude_seen=protocol.dataset(split.dataset).exclude_seen)
+                                           exclude_seen=protocol.dataset(split.dataset).exclude_seen,
+                                           k=max(protocol.cutoffs))
             lost = int((~eligible[rows]).sum())
             if lost:
                 raise RuntimeError(

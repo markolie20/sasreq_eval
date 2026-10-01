@@ -220,6 +220,24 @@ def seen_history(data: dict[str, Any], phase: str) -> csr_matrix:
     return data[f"{phase}_source_matrix"] if seen is None else seen
 
 
+def fills_list(data: dict[str, Any], phase: str, k: int) -> np.ndarray:
+    """Per row: does the training catalogue hold ``k`` items the user has not seen, so excluding seen items
+    still leaves a full top-k list?
+
+    False only where the catalogue is small beside a history: a catalogue sweep's smallest levels, for its
+    heaviest users (review N49). Such a row would stop the whole evaluation (:class:`ExcludeSeenPolicy`), so
+    it is not scored under ``exclude_seen``.
+    """
+    seen = seen_history(data, phase).tocsr()
+    if not seen.has_canonical_format:
+        seen = seen.copy()
+        seen.sum_duplicates()
+    limit = len(data["train_item_ids"])  # the training catalogue is the first columns of the phase's
+    rows = np.repeat(np.arange(seen.shape[0], dtype=np.int64), np.diff(seen.indptr))
+    inside = np.bincount(rows, weights=seen.indices < limit, minlength=seen.shape[0])
+    return limit - inside >= k
+
+
 def reachable_targets(data: dict[str, Any], phase: str, targets: csr_matrix, exclude_seen: bool) -> csr_matrix:
     """``targets`` less those that excluding seen items puts out of reach: an item already in the history."""
     return new_item_targets(targets, seen_history(data, phase)) if exclude_seen else targets
@@ -325,6 +343,16 @@ def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protoco
     scorable = scored_rows(split, phase, definition, exclude_seen=exclude_seen, targets=target_matrix)
     if scorable is not None:
         rows = scorable if rows is None else rows[np.isin(rows, scorable)]
+    unrecommendable = 0 if scorable is None else asked - len(rows)
+    too_few_unseen = 0
+    if exclude_seen:
+        # a user who has seen all but fewer than k items of the catalogue cannot be given k unseen ones: left
+        # out and counted, rather than stopping the evaluation (review N49)
+        fills = fills_list(split.data, phase, max(protocol.cutoffs))
+        if not fills.all():
+            before = fills.size if rows is None else len(rows)
+            rows = np.flatnonzero(fills).astype(np.int64) if rows is None else rows[fills[rows]]
+            too_few_unseen = before - len(rows)
     adapter, source = phase_inputs(model, split, phase, family)
     sample_ids = split.eval_user_ids(phase)
     # Seen items are excluded after the model ranks, against the whole history, in every evaluation: inside
@@ -354,7 +382,9 @@ def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protoco
         metadata={"phase": phase, "exclude_seen": exclude_seen, "targets": targets, "definition": definition,
                   "rows_sampled": None if rows is None else len(rows),
                   # of the rows asked for (all, or the given sample), those whose next item no model can recommend
-                  "rows_unrecommendable_next": 0 if scorable is None else asked - len(rows)},
+                  "rows_unrecommendable_next": unrecommendable,
+                  # of the rest, those left out because the catalogue holds fewer than k items they have not seen
+                  "rows_too_few_unseen": too_few_unseen},
     )
     policy.finish()
     return result

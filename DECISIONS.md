@@ -973,6 +973,86 @@ README's Install section, `scripts/local-run.sh`, the review skill and `review-p
 
 ---
 
+## 30. Four fixes before the DGX: N49, N31, N34, N33 (2026-10-01)
+
+**Decision (Mark).** Of the change review's open findings, fix these four before deploying. The others stay
+open (ISSUES.md). There is no change review of these fixes, at Mark's request.
+
+**N49: a catalogue too small for a history stopped the run.**
+- *Problem.* Under `exclude_seen`, a user who has seen all but fewer than k items of the training catalogue
+  cannot be given k unseen ones, and `ExcludeSeenPolicy` stops the whole evaluation ("fewer than k unseen").
+  At a catalogue sweep's level 0.1 on ML-20M or Amazon, the heaviest users do exactly that.
+- *Change.* `evaluate.fills_list`: per row, does the training catalogue hold k = max(cutoffs) items the user
+  has not seen? Under `exclude_seen`, `evaluate_phase` leaves out the rows that do not, and counts them in the
+  run's metadata (`rows_too_few_unseen`, beside `rows_unrecommendable_next`). `own_test_rows` and
+  `_eligible_test_rows` apply the same rule, so the users a condition lists are the users it scores; they
+  refuse `exclude_seen` without k.
+- *Effect.* The run goes on, without those users.
+- *Side effects.* No fingerprint changes. Every result that exists is unchanged: the users left out are
+  exactly those that stopped the run before. The fixed test rows of the other sweeps are unchanged too, since
+  those sweeps keep the item space. A selection effect at the smallest catalogues is a limitation (below).
+
+**N31: stopping a run counted as a death.**
+- *Problem.* A `nohup` launch can only be stopped by `kill` (SIGTERM). That counted as a death like an
+  out-of-memory kill, so two stops marked the run failed for good. And under `--retry-failed`, a run already
+  at two deaths was marked failed without running.
+- *Change.*
+  - `cli.main` turns SIGTERM, and SIGHUP unless `nohup` ignores it, into the same stop as Ctrl-C. The run in
+    progress is not counted, and its claim is released. The command prints why it stopped and exits 130.
+  - `--retry-failed` starts the count of deaths over.
+- *Effect.* Stop and restart as often as needed. Only SIGKILL and the out-of-memory killer still count.
+- *Side effects.* Ctrl-C now ends with that message and exit code 130 instead of a traceback. No fingerprint
+  changes.
+
+**N34: the stage-1 floor came from whichever baselines had finished.**
+- *Problem.* After an interrupted `analyse`, the floor was the strongest of the baselines with a result, so it
+  could be lower than the real floor, silently.
+- *Change.* `analysis.floor_of` requires `expected`, the protocol's baselines, and returns no floor until all
+  of them have a result. The stage-1 report then says which baselines are missing; the analysis report marks
+  no floor. The ablation report already required every baseline, and now uses the same rule.
+- *Effect.* No floor rather than a wrong one.
+- *Side effects.* None on runs.
+
+**N33: runs made under an older selection were still counted.**
+- *Problem.* A final made with another trial's configuration than the one selected now describes another model.
+  The stage-1 report flagged it ⛔ but still averaged it into the table, the comparisons, the cross-dataset
+  table, the CSV and the diagnostics. The ablation report loaded such runs without saying so.
+- *Change.*
+  - `runner.stale_final_seeds` lists those finals, and `load_final_evaluations` leaves them out. Every reader
+    of the finals goes through it: the stage-1 report and its diagnostics, `repeat-strata`.
+  - The stage-1 report lists them ⛔ and no longer calls them "not run yet".
+  - The ablation report checks every run with `made_with_another_selection`, the runner's own refusal (made
+    public). A stale run is left out and listed ⛔. Its level then lacks a seed, so it leaves the comparisons,
+    the gap and the knee, as a failed run's level does.
+  - Latency is not measured on a stale final (`latency` names it) and not shown in the table (a ⛔ note).
+- *Effect.* Nothing from another selection reaches a value, a test or a table. `final` and `ablate` already
+  refused to redo such runs in place, and still do.
+- *Side effects.* No fingerprint changes. Every place that read the finals now also reads the trial summary.
+
+**Where.**
+- `evaluate.py` (`fills_list`, `evaluate_phase`); `ablations.py` (`own_test_rows`, `_eligible_test_rows`,
+  their callers).
+- `cli.py` (`main`, `_operator_stops`); `runner.py` (`execute`, `stale_final_seeds`,
+  `load_final_evaluations`, `made_with_another_selection`).
+- `analysis.py` (`floor_of`); `report.py`; `analysis_report.py`; `ablation_report.py` (`_load`,
+  `dataset_ablation`); `latency.py`.
+- README: the analysis steps, the per-condition users, the ablation report, "Unattended runs are safe", and
+  the launch notes.
+
+**Tests.** Seven new; 233 pass on CPU and on GPU. A deliberately broken version of each piece of each fix was
+caught, 16 of 16. One (the SIGTERM handler not put back) survived at first, because the test fixture had
+already left the handler installed; the test now installs its own first:
+- `test_a_catalogue_smaller_than_a_history_leaves_out_the_user_not_the_run` and
+  `test_a_condition_lists_as_its_users_only_those_it_can_give_k_unseen_items` (N49);
+- `test_retry_failed_starts_the_count_of_deaths_over` and `test_kill_stops_a_run_as_ctrl_c_does_not_as_a_death`
+  (N31);
+- `test_the_floor_waits_for_every_baseline` (N34);
+- `test_the_report_flags_finals_made_under_another_selection` (extended),
+  `test_latency_is_neither_measured_nor_shown_for_a_final_of_another_selection` and
+  `test_an_ablation_run_made_under_an_old_selection_is_left_out_of_the_report` (N33).
+
+---
+
 ## Known limitations recorded by the review
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum
@@ -991,6 +1071,9 @@ README's Install section, `scripts/local-run.sh`, the review skill and `review-p
   chosen model needs, not what is achievable with that much data. A retuning spot-check is planned after the
   main runs (final review E).
 - **Users whose next item they already had are not scored where seen items are excluded** (entry 26, C4).
+- **At the smallest catalogues, the heaviest users are not scored where seen items are excluded**
+  (entry 30, N49): they have seen all but fewer than k of the catalogue. Their number is in each run's
+  metadata (`rows_too_few_unseen`).
 
 ## Open decisions
 

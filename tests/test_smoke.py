@@ -597,6 +597,27 @@ def test_the_report_lists_failures_and_the_code_the_runs_used(workspace, tmp_pat
     assert "⚠ These results come from 2 different code builds" in report
 
 
+def test_the_floor_waits_for_every_baseline(workspace, tmp_path):
+    # review N34: after an interrupted `analyse`, the floor was the strongest of the baselines that had finished
+    import shutil
+
+    from seqrec_eval.analysis import _baseline_dir
+    from seqrec_eval.analysis_report import dataset_analysis
+    from seqrec_eval.report import build_report
+
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    for path in _baseline_dir(protocol, work, "synth", "markov").glob("test.*"):
+        path.unlink()  # the floor, here: Markov wins on the synthetic chain
+    report, _ = build_report(protocol, work, ["synth"], ["popularity", "elsa", "gru", "sasrec"], "elsa")
+    assert "Against the floor" not in report
+    assert "_No floor yet: markov not analysed." in report
+    analysis, _ = dataset_analysis(protocol, work, "synth")
+    assert "(floor)" not in analysis and "_No floor yet:" in analysis
+
+
 def test_the_library_version_is_the_checkouts_when_imported_from_one(tmp_path, monkeypatch):
     """Imported from a checkout (PYTHONPATH=<checkout>/src), the metadata Python finds can be another build's or
     a stale egg-info left in src/ (2026-09-30: 0.3.6 reported for the 0.3.7+trainusers branch)."""
@@ -665,6 +686,68 @@ def test_a_run_whose_process_keeps_dying_becomes_a_failure(workspace, tmp_path):
     assert not (spec.directory(tmp_path / "fine") / "attempts.json").exists()
 
 
+def test_retry_failed_starts_the_count_of_deaths_over(workspace, tmp_path):
+    # review N31: under --retry-failed, a run at the limit was marked failed without running
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    spec = plan_trials(protocol, "synth", "popularity")[0]
+    directory = spec.directory(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / "attempts.json").write_text(json.dumps({"started": 2}))
+    assert execute(spec, load_split(root / "work", "synth"), protocol, tmp_path, device="cpu", retry_failed=True,
+                   log=lambda _: None) == "done"
+    assert not (directory / "attempts.json").exists() and not (directory / "failed.json").exists()
+
+
+def test_kill_stops_a_run_as_ctrl_c_does_not_as_a_death(workspace, tmp_path, monkeypatch):
+    # review N31: `kill` is how a nohup launch is stopped; counted as a death, two stops failed the run for good
+    import signal
+    import time
+
+    from seqrec_eval import cli, runner
+
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    spec = plan_trials(protocol, "synth", "popularity")[0]
+    directory = spec.directory(tmp_path)
+
+    def killed(*args, **kwargs):
+        assert (directory / "attempts.json").exists()  # counted while it runs
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(5)  # the handler interrupts this
+        raise AssertionError("SIGTERM did not stop the run")
+
+    def own(signum, frame):  # whatever handled SIGTERM before the command
+        raise AssertionError("the command's handler was not in place")
+
+    monkeypatch.setattr(runner, "_execute", killed)
+    previous = signal.signal(signal.SIGTERM, own)
+    try:
+        with cli._operator_stops(), pytest.raises(KeyboardInterrupt):
+            execute(spec, load_split(root / "work", "synth"), protocol, tmp_path, device="cpu", log=lambda _: None)
+        assert signal.getsignal(signal.SIGTERM) is own  # put back after the command
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert not (directory / "attempts.json").exists() and not (directory / "failed.json").exists()
+    lock = runner.RunLock(directory)
+    assert lock.acquire()  # and the claim is released
+    lock.release()
+
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as under nohup
+    try:
+        with cli._operator_stops():
+            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN  # nohup's choice is kept
+            assert signal.getsignal(signal.SIGTERM) is cli._operator_stop
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    def stopped(argv):
+        raise KeyboardInterrupt("SIGTERM")
+
+    monkeypatch.setattr(cli, "_main", stopped)
+    assert cli.main(["status"]) == 130  # neither 1 (failed) nor 3 (work left): `search && final` stops
+
+
 def test_a_split_from_other_settings_is_refused_and_scoring_flags_are_not_build_settings(workspace, tmp_path):
     # review A4 and B10
     from seqrec_eval.analysis import _controls_fingerprint
@@ -715,9 +798,38 @@ def test_the_report_flags_finals_made_under_another_selection(workspace, tmp_pat
     final = plan_finals(protocol, work, "synth", "gru")[1].directory(work)
     made = json.loads((final / "spec.json").read_text())
     (final / "spec.json").write_text(json.dumps({**made, "source_trial": 1 - best}))
-    report, _ = build_report(protocol, work, ["synth"], ["popularity", "elsa", "gru", "sasrec"], "elsa")
+    report, table = build_report(protocol, work, ["synth"], ["popularity", "elsa", "gru", "sasrec"], "elsa")
     assert f"⛔ **gru**: final seed(s) [1] were made with another trial's configuration than the one selected now " \
            f"(#{best})" in report
+    # and left out of everything, not only flagged (review N33): its values rest on seed 0 alone
+    import csv
+    import io
+
+    assert [row["seed"] for row in csv.DictReader(io.StringIO(table)) if row["model"] == "gru"] == ["0"]
+    assert next(line for line in report.splitlines() if line.startswith("| gru |")).split(" | ")[4] == "1/2"
+    assert "**gru**: final seed(s) [1] have not run yet" not in report
+
+
+def test_latency_is_neither_measured_nor_shown_for_a_final_of_another_selection(workspace, tmp_path):
+    # review N33: latency times the first seed's saved model, which would be another configuration's
+    import shutil
+
+    from seqrec_eval.latency import benchmark, latency_table
+    from seqrec_eval.runner import summarize_trials
+
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    assert "| synth | gru |" in latency_table(protocol, work, ["synth"], ["gru"])
+    best = summarize_trials(protocol, work, "synth", "gru").best.index
+    final = plan_finals(protocol, work, "synth", "gru")[0].directory(work)
+    made = json.loads((final / "spec.json").read_text())
+    (final / "spec.json").write_text(json.dumps({**made, "source_trial": 1 - best}))
+    table = latency_table(protocol, work, ["synth"], ["gru"])
+    assert "| synth | gru |" not in table and "⛔ Not shown: synth/gru" in table
+    with pytest.raises(FileNotFoundError, match="another trial's configuration"):
+        benchmark(protocol, work, final_split(protocol, load_split(work, "synth")), "gru", threads=1)
 
 
 def test_every_batch_of_a_phase_asks_the_model_for_the_same_length(workspace):

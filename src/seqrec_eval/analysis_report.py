@@ -98,7 +98,7 @@ def dataset_analysis(protocol: Protocol, work_dir: Path, dataset: str) -> tuple[
     lines += ["### Data profile", "", profile_table(found["profile"]), ""]
 
     baselines = found["baselines"]
-    floor = floor_of(baselines, primary)
+    floor = floor_of(baselines, primary, expected=protocol.baselines)
     table = []
     for name in protocol.baselines:
         selected = found["selected"].get(name)
@@ -119,6 +119,9 @@ def dataset_analysis(protocol: Protocol, work_dir: Path, dataset: str) -> tuple[
               f"setting. The strongest on test {primary} is the floor every model has to beat."), "",
               _table(["baseline", "kind", "selected", "trials", f"val {primary}"] + [f"test {m}" for m in shown],
                      table)]
+    if floor is None:
+        lines += ["", "_No floor yet: it is the strongest of every baseline, and those marked — have no test "
+                  "result._"]
 
     markov = next((baselines[n] for n in protocol.baselines if protocol.baseline(n).kind == "markov"
                    and n in baselines), None)

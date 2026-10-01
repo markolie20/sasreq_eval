@@ -87,6 +87,7 @@ from .plots import gap_figure
 from .protocol import Protocol
 from .report import ALPHA, CONFIDENCE, _mean_sd, _table, pool_over_seeds
 from .results import evaluation_exists, load_evaluation, read_json
+from .runner import made_with_another_selection
 from .seedstats import compare as compare_seeds
 from .seedstats import holm, noninferiority, variance
 
@@ -232,13 +233,18 @@ def find_knee(per_user: dict[str, np.ndarray], position: dict[str, float], *, ma
     return Knee(reference=reference, margin=margin, knee=knee, tested=tuple(tested), stopped_at=stopped_at,
                 power=power)
 
-def _load(work_dir: Path, specs) -> list[tuple[Any, EvaluationResult]]:
-    out = []
+def _load(work_dir: Path, specs) -> tuple[list[tuple[Any, EvaluationResult]], list[Any]]:
+    """The finished runs of ``specs`` with their evaluations, and the specs whose finished run was made under
+    another selection than the current one: it describes another model, so it is not loaded (review N33)."""
+    out, stale = [], []
     for spec in specs:
         directory = spec.directory(work_dir)
         if (directory / "done.json").exists() and evaluation_exists(directory / "test"):
-            out.append((spec, load_evaluation(directory / "test")))
-    return out
+            if made_with_another_selection(spec, directory):
+                stale.append(spec)
+            else:
+                out.append((spec, load_evaluation(directory / "test")))
+    return out, stale
 
 
 def _share(value: float | None) -> str:
@@ -339,14 +345,15 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
             notes.append(f"- **{model}** was skipped in stage 1")
             continue
         by_column: dict[str, list] = {}
-        failed, pending = [], []
+        failed, pending, stale = [], [], []
         for name, specs in plans.items():
             column = name.split("/")[0]
-            finished = _load(work_dir, specs)
+            finished, old = _load(work_dir, specs)
+            stale += [(name, spec.seed) for spec in old]
             if transform.changes_targets:
                 finished = [(spec, replace(e, target_fingerprint=None)) for spec, e in finished]
             by_column.setdefault(column, []).extend(finished)
-            done = {spec.seed for spec, _ in finished}
+            done = {spec.seed for spec, _ in finished} | {spec.seed for spec in old}
             for spec in specs:
                 if spec.seed in done:
                     continue
@@ -372,6 +379,12 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
             shown = "; ".join(f"{name} seed {seed}: {error[:90]}" for name, seed, error in failed[:3])
             notes.append(f"- ⛔ **{model}**: {len(failed)} run(s) failed ({shown}). Their levels are left out of the "
                          "comparisons, the gap and the knee until rerun (`ablate --retry-failed`).")
+        if stale:
+            shown = ", ".join(f"{name} seed {seed}" for name, seed in stale[:4]) + (", …" if len(stale) > 4 else "")
+            notes.append(f"- ⛔ **{model}**: {len(stale)} run(s) were made with another configuration than the one "
+                         f"selected now ({shown}), so they describe another model. Their levels are left out of the "
+                         "comparisons, the gap and the knee; `ablate` refuses them until they are moved aside and "
+                         "redone.")
         if pending:
             names = sorted({name.split("/")[0] for name, _ in pending}, key=columns.index)
             notes.append(f"- **{model}**: {len(pending)} run(s) not finished yet, at {', '.join(names)}; those "
@@ -571,7 +584,7 @@ def _analysis_section(protocol: Protocol, work_dir: Path, sweep: str, dataset: s
             partial.append(f"{column} ({min(short.values())} of {expected} subsamples)")
         baselines = {n: means[n] for n in protocol.baselines if n in means}
         # the floor needs every baseline: the strongest of some is not the floor
-        floor = floor_of(baselines, primary) if len(baselines) == len(protocol.baselines) else None
+        floor = floor_of(baselines, primary, expected=protocol.baselines)
 
         def cell(name: str) -> str:
             if name in means:

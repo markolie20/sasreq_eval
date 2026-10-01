@@ -579,6 +579,23 @@ def test_failed_and_unfinished_ablation_runs_are_listed_not_dropped(workspace, t
     assert "| sasrec | " in knees and "| gru | " not in knees  # the other models keep their knee
 
 
+def test_an_ablation_run_made_under_an_old_selection_is_left_out_of_the_report(workspace, tmp_path):
+    # review N33: the ablation report loaded such runs silently, into the comparisons, the gap and the knee
+    from seqrec_eval.ablation_report import build_ablation_report
+
+    protocol, work = _copied(workspace, tmp_path)
+    run = plan_ablation(protocol, work, "history", "synth", "gru")["2"][0].directory(work)
+    made = json.loads((run / "spec.json").read_text())
+    (run / "spec.json").write_text(json.dumps({**made, "source_trial": 99}))
+    built = build_ablation_report(protocol, work, "history", ["synth"], list(protocol.models))
+    report = built["markdown"]
+    assert "⛔ **gru**: 1 run(s) were made with another configuration than the one selected now (2 seed 0)" in report
+    assert "No knee for **gru** (incomplete: 2)" in report
+    assert "**gru**: 1 run(s) not finished yet" not in report  # not passed off as pending either
+    knees = report.split("### Knee")[1].split("Sensitivity")[0]
+    assert "| sasrec | " in knees and "| gru | " not in knees
+
+
 def test_an_ablation_run_built_on_an_old_selection_is_refused(workspace, tmp_path):
     # review A3: a reference reloads stage 1's model, so it must belong to the selection its conditions refit
     protocol, work = _copied(workspace, tmp_path)
@@ -835,7 +852,8 @@ def test_the_analysis_finds_the_order_the_synthetic_data_was_built_with(workspac
     root, _, protocol = workspace
     found = full_results(protocol, root / "work", "synth")
     markov = found["baselines"]["markov"].metrics["ndcg@5"]
-    assert floor_of(found["baselines"], "ndcg@5")[0] == "markov"  # each user walks a first-order chain
+    # each user walks a first-order chain
+    assert floor_of(found["baselines"], "ndcg@5", expected=protocol.baselines)[0] == "markov"
     assert found["controls"]["markov_shuffled"].metrics["ndcg@5"] < markov
     assert found["controls"]["markov_backwards"].metrics["ndcg@5"] < markov
     assert found["profile"]["train"]["tie_rate"] == 0.0  # one event a day per user
@@ -982,6 +1000,47 @@ def test_a_next_item_already_seen_is_out_of_reach_when_seen_items_are_excluded(w
     for row in kept:
         assert set(targets[row].indices) - set(history[row].indices)
     assert allowed - kept  # the synthetic users loop, so their next items are repeats
+
+
+def test_a_catalogue_smaller_than_a_history_leaves_out_the_user_not_the_run(workspace):
+    # review N49: excluding seen items, a user who has seen all but fewer than k items of a small catalogue cannot
+    # be given k unseen ones; the evaluation stopped with "fewer than k unseen", now that user is left out, counted
+    from seqrec_eval.analysis import fit_baseline
+    from seqrec_eval.evaluate import evaluate_phase, fills_list
+
+    root, _, protocol = workspace
+    condition = apply_condition(protocol, final_split(protocol, load_split(root / "work", "synth")), "catalogue", 12)
+    k = max(protocol.cutoffs)
+    fills = fills_list(condition.data, "test", k)
+    assert 0 < fills.sum() < fills.size  # some users have seen nearly all of the 12 items, others not
+    model = fit_baseline("popularity", {}, condition)
+    result = evaluate_phase(model, condition, "test", family="sequence", protocol=protocol, exclude_seen=True,
+                            targets="window")  # every row asked: under exclude_seen, the synthetic next items repeat
+    with_targets = np.diff(condition.data["test_target_matrix"].indptr) > 0  # the library scores only those
+    assert set(result.sample_ids) == set(condition.eval_user_ids("test")[fills & with_targets])
+    assert result.metadata["rows_too_few_unseen"] == int((~fills).sum())
+
+
+def test_a_condition_lists_as_its_users_only_those_it_can_give_k_unseen_items():
+    # review N49, where a catalogue sweep picks its users: the same rule as the evaluation's
+    from scipy.sparse import csr_matrix
+
+    from seqrec_eval.ablations import own_test_rows
+
+    # items 0-6 are the training catalogue, 7 is first seen after training; k = 5 leaves room for 2 seen items.
+    # Row 1 has seen 3 of the catalogue; row 2 has seen 2 of it and the new item, which is not in the catalogue.
+    history = [[0, 1], [0, 1, 2], [0, 1, 7]]
+    rows = np.repeat(np.arange(3), [len(items) for items in history])
+    data = {"train_item_ids": np.array(list("abcdefg")),
+            "test_next_target_matrix": csr_matrix((np.ones(3, np.float32), ([0, 1, 2], [3, 4, 5])), shape=(3, 8)),
+            "test_source_matrix": csr_matrix((np.ones(rows.size, np.float32), (rows, np.concatenate(history))),
+                                             shape=(3, 8)),
+            "test_source_sequences": ItemSequences.from_rows(history, n_items=8)}
+    assert own_test_rows(data, "test_next_target_matrix", exclude_seen=True, k=5).tolist() == [0, 2]
+    assert own_test_rows(data, "test_next_target_matrix", exclude_seen=True, k=4).tolist() == [0, 1, 2]
+    assert own_test_rows(data, "test_next_target_matrix").tolist() == [0, 1, 2]  # nothing excluded, all fill
+    with pytest.raises(ValueError, match="depends on k"):
+        own_test_rows(data, "test_next_target_matrix", exclude_seen=True)
 
 
 def test_an_inference_sweep_keeps_the_full_datas_shuffled_control(workspace):

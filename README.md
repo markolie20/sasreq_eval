@@ -104,8 +104,9 @@ nohup seqrec-eval search --device cuda:0 > search0.log 2>&1 &
 nohup seqrec-eval search --device cuda:1 > search1.log 2>&1 &
 seqrec-eval status                           # progress, failures, current best
 # search, final and ablate exit 0 when all they planned is done, 1 when a run failed or was
-# refused, 3 when work is left (the other GPU still running, a model not ready): so
-# `search && final && ablate` stops where a step is unfinished.
+# refused, 3 when work is left (the other GPU still running, a model not ready), 130 when
+# stopped: so `search && final && ablate` stops where a step is unfinished.
+# Stop a nohup launch with `kill <pid>`: the run it was on is redone, not counted as a crash.
 
 seqrec-eval final --device cuda:0            # the selected configuration × every seed, with test
 # final refuses while a model has a failed trial: rerun it (search --retry-failed),
@@ -162,7 +163,7 @@ round has run:
      popularity, repeats, self-transitions, ties, gaps, spans, new items);
    - **baselines and the floor**: the non-learned baselines, each searched on
      validation like a model and scored on test on the models' terms. The
-     strongest is the **floor**;
+     strongest is the **floor**, shown only once every baseline has a result;
    - **sequence signal**: first-order Markov against itself fitted on
      shuffled training histories (order removed) and reversed ones (direction
      removed), and split by whether a test history's last two events tie in
@@ -421,9 +422,15 @@ Windows and time decay use only differences, so that is harmless.
   unless you pass `--retry-failed`, so an out-of-memory configuration does not
   loop all weekend; a process killed outright (the kernel's out-of-memory
   killer) leaves no failure behind, so a run whose process dies twice is
-  recorded as failed. A final made under another selection than the current one
-  (after `--accept-failed` and a successful retry, say) is refused, not passed
-  off as the new selection's: move it aside to redo it.
+  recorded as failed; `--retry-failed` starts that count over. Stopping a command
+  is not a death: Ctrl-C, `kill <pid>` (how a `nohup` launch is stopped) and a
+  closed terminal all end it with exit code 130 and leave the run in progress to
+  be redone; only `kill -9` and the out-of-memory killer count (N31). A final
+  made under another selection than the current one (after `--accept-failed`
+  and a successful retry, say) is refused, not passed off as the new
+  selection's: move it aside to redo it. Until then every report leaves it, and
+  the ablation runs built on it, out of its values and comparisons and lists it
+  ⛔, and latency is neither measured nor shown for it (N33).
 - **No model is chosen around a failure.** A failed trial, or one whose
   validation score is not a finite number, blocks `final` for that model: a
   search that silently lost trials would not be the equal budget the comparison
@@ -506,10 +513,13 @@ whichever subsamples are drawn, and seeds can be added to these sweeps later
   target is a known item survives every random catalogue only by chance, so a
   fixed set shrinks to users whose targets are all unseen, who score 0 for every
   model (H01b). There, each condition is scored on **its own users**: a known
-  next target still in its catalogue, and a history item left. Seeds of the
-  stratified catalogue score different users and are pooled per user. Models are
-  compared within a level, through the gap, and the level-against-full test is
-  not run.
+  next target still in its catalogue, and a history item left. Where seen items
+  are excluded, the catalogue must also hold k items the user has not seen: at
+  the smallest catalogues, the heaviest users have seen nearly all of it, and are
+  left out and counted (`rows_too_few_unseen` in the run's metadata, N49).
+  Seeds of the stratified catalogue score different users and are pooled per
+  user. Models are compared within a level, through the gap, and the
+  level-against-full test is not run.
 - **Nested catalogues.** Within a seed, a smaller catalogue is part of every
   larger one: the stratified sweep draws one random order per seed that keeps
   each popularity stratum in proportion at every prefix, and each level takes a
@@ -544,8 +554,9 @@ whichever subsamples are drawn, and seeds can be added to these sweeps later
   baseline and the floor, the shuffled and backwards Markov controls, and Markov
   split by tied history ends; a random sweep's condition is shown only once every
   subsample is analysed. The gap plot draws the floor on the same scale, so a
-  model under it has not beaten the floor. Runs that failed or have not finished
-  are listed per model, never dropped silently, and a level scored on fewer than
+  model under it has not beaten the floor. Runs that failed, have not finished,
+  or were made under another selection than the current one are listed per
+  model, never dropped silently, and a level scored on fewer than
   `min_level_users` users gets "descriptive" in place of a verdict.
   `ablation-<sweep>-gap.csv` is the plot input.
 - **The knee.** δ is `knee_margin` (10%) of the model's score on the **full

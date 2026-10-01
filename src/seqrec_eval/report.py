@@ -46,6 +46,7 @@ from .runner import (
     final_seeds,
     incomplete_selection_path,
     load_final_evaluations,
+    stale_final_seeds,
     plan_trials,
     run_root,
     summarize_trials,
@@ -242,7 +243,8 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
         if summary.skipped == summary.planned and summary.planned:
             notes.append(f"- **{model}** skipped: {summary.skip_reason}")
             continue
-        finals = load_final_evaluations(protocol, work_dir, dataset, model)
+        finals = load_final_evaluations(protocol, work_dir, dataset, model)  # without stale finals (review N33)
+        stale = stale_final_seeds(protocol, work_dir, dataset, model)
         per_metric = {name: [e.metrics[name] for _, e in finals] for name in shown}
         best = "—" if summary.best is None else f"#{summary.best.index}"
         val = "—" if summary.best_value is None else f"{summary.best_value:.4f}"
@@ -266,17 +268,17 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                          f"of {record['planned']} trials, `final --allow-incomplete`), so with a smaller budget than "
                          "the others" + ("; the search has finished since." if summary.done + summary.skipped
                                          + summary.failed >= summary.planned else "."))
-        stale = [spec.seed for spec, _ in finals if summary.best is not None
-                 and spec.source_trial != summary.best.index]
         if stale:
             notes.append(f"- ⛔ **{model}**: final seed(s) {stale} were made with another trial's configuration than "
-                         f"the one selected now (#{summary.best.index}); `final` refuses them until they are moved "
+                         f"the one selected now (#{summary.best.index}), so they describe another model. They are "
+                         "left out of its values and every comparison; `final` refuses them until they are moved "
                          "aside and redone.")
         failed = [seed for seed in seeds if (root / f"final-seed{seed}" / "failed.json").exists()]
         if failed:
             notes.append(f"- ⛔ **{model}**: final seed(s) {failed} failed, so its test values rest on fewer seeds "
                          "than the protocol asks; rerun them (`final --retry-failed`).")
-        waiting = [seed for seed in seeds if seed not in {spec.seed for spec, _ in finals} and seed not in failed]
+        waiting = [seed for seed in seeds if seed not in {spec.seed for spec, _ in finals} and seed not in failed
+                   and seed not in stale]
         if finals and waiting:
             notes.append(f"- **{model}**: final seed(s) {waiting} have not run yet, so its values and comparisons "
                          f"rest on {len(finals)} of {len(seeds)} seeds for now.")
@@ -354,9 +356,12 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                       f"**{protocol.targets}** targets), test {protocol.primary_metric}:"), "",
                   _table(["model", f"{protocol.targets} (primary)", f"{other} (diagnostic)"], diagnostic_rows)]
 
-    floor = floor_of(full_results(protocol, work_dir, dataset)["baselines"], protocol.primary_metric)
+    baselines = full_results(protocol, work_dir, dataset)["baselines"]
+    floor = floor_of(baselines, protocol.primary_metric, expected=protocol.baselines)
     if floor is None:
-        lines += ["", "_No floor yet: run `seqrec-eval analyse` for the baselines._"]
+        missing = ", ".join(name for name in protocol.baselines if name not in baselines)
+        lines += ["", (f"_No floor yet: {missing or 'no baseline'} not analysed. The floor is the strongest of "
+                       "every baseline, so it waits for all of them (`seqrec-eval analyse`)._")]
     elif averaged:
         name, result = floor
         key = f"floor: {name}"
