@@ -48,7 +48,21 @@ the sweep measured nothing.
 
 **Side effects.** No cache exists for 50% yet: the first `prepare` (on the DGX) builds one from the raw
 parquet, about 23M listens. Samples are nested by user hash, so the 20% users are all inside the 50%.
-`organic_only` and a pinned download revision are still open (H14).
+`organic_only` and the download revision: decided 2026-10-05, below.
+
+**H14 (Mark, 2026-10-05).**
+- `organic_only` stays `false`, the library default. Every Yambda listen has an `is_organic` flag: 1 when the
+  user started it, 0 when Yandex's recommender served it. The adapter would filter on it once, at load, from
+  histories, training data and targets alike. Recommender-served listens are kept, for three reasons:
+  - a listen is recorded only once at least half the track has played (Yambda documentation), so it records
+    the user's engagement, not mere exposure;
+  - Recombee's own clients' logs also hold interactions their recommendations caused;
+  - none of the other datasets can separate the two kinds.
+- **The download is pinned by checksum.** The release was fetched from its latest version on Hugging Face on
+  2026-09-09: `listens-50m.parquet`, sha256 `eed9cbd094af1e189507d2f8132a0dc9653b90e65480125c7cdccd601e0592d1`, 369,110,332 bytes. The DGX copy is that file, and the
+  library does not download again while it is present. Check it there with `sha256sum`.
+- **Limitation:** part of Yambda's targets, and of its repeat rate, comes from Yandex's recommender (the radio).
+- **Effect:** none: the settings are those the protocol already had. A comment in both protocols records it.
 
 ## 3. Matrix models read their input in their own catalogue (2026-09-29, N0, bug fix)
 
@@ -1223,6 +1237,7 @@ How it runs:
 - A step left with work (exit 3) is repeated, up to `ROUNDS`; a failure stops it with the log to read.
 - A SIGTERM to the script reaches every process it started (they stop cleanly, §30).
 - A log per process in `$WORK/logs`.
+- `SWEEPS=none` runs stage 1 alone, so it can start before the ablation datasets are chosen.
 
 **Where.** `scripts/project-time.py`, `scripts/dgx-run.sh`; README (Workflow, How long it takes).
 
@@ -1237,10 +1252,11 @@ How it runs:
   - a stop after `ROUNDS`;
   - a failure stopping before the next step;
   - SIGTERM leaving no process behind;
-  - settings checked first.
+  - settings checked first;
+  - `SWEEPS=none` running stage 1 alone.
 
-  8 breaks, caught.
-- 251 tests pass on CPU and on the GPU (`cuda:0`).
+  10 breaks, caught.
+- 252 tests pass on CPU and on the GPU (`cuda:0`).
 
 ---
 
@@ -1251,7 +1267,12 @@ How it runs:
 - **Amazon keeps only reviews of products in the 2023 metadata snapshot.** The source is the 0-core file, so
   there is no k-core.
 - **Source selection not checked:** how the Music4All-Onion, Yambda-50M and OTTO releases were drawn.
-- **OTTO is loaded as clicks only** (H13, open).
+- **Yambda keeps the listens Yandex's recommender served** (H14, entry 2): part of its targets and of its
+  repeat rate come from the platform's radio.
+- **OTTO is loaded as clicks only** (H13, decided 2026-10-05: kept). Carts and orders, about a tenth of the
+  events, are left out rather than recorded as the same kind of event as a click. The research design
+  (`producten/tussenproducten/research_design.odt`, §5.4) says so since 2026-10-05; it listed three
+  interaction types before.
 - **Matrix models rank an all-cold history by tie order** (entry 3); not yet counted.
 - **Refitted models use settings chosen on less data** (entry 4); BERT4Rec keeps one off-by-one (entry 4).
 - **Matrix models train on the max of two windows' counts and read the sum at test** (entry 25, N5): the
@@ -1276,7 +1297,6 @@ In `review-plan/ISSUES.md`:
   variants?
 - N8: SASRec's out-of-memory search corner (fixed with H35 in memory; kept here as a check on the DGX).
 - H26: registering BERT4Rec.
-- H14: Yambda's `organic_only` and download revision.
 - SANSA: in or out of the research question (entry 27).
 - The retuning spot-check after the main runs (entry 27).
 

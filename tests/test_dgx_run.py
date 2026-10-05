@@ -137,3 +137,13 @@ def test_settings_are_checked_first(tmp_path):
     done = _run(tmp_path, WORK="", SEQREC_EVAL_WORK="")
     assert done.returncode == 2 and "set WORK" in done.stderr
     assert not _calls(tmp_path)
+
+
+def test_stage1_alone_runs_no_sweep(tmp_path):
+    # the ablation datasets are chosen after stage 1 has run (review-plan/plans/week-budget.md, B4)
+    done = _run(tmp_path, SWEEPS="none")
+    assert done.returncode == 0, done.stdout + done.stderr
+    calls = _calls(tmp_path)
+    assert not _index(calls, "ablate") and not _index(calls, "ablation-report")
+    assert [call["args"][1:] for call in calls if call["args"][0] == "analyse"] == [["--sweep", "none"]]
+    assert _index(calls, "final") and _index(calls, "latency") and calls[-1]["args"][0] == "status"

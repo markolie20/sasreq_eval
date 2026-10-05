@@ -26,7 +26,7 @@
 #   CPU_MODELS  models run on the CPU process    (default: "popularity ease"; "" for none)
 #   DATASETS    datasets                         (default: every one in the protocol)
 #   SWEEPS      sweeps, in this order            (default: history_length_inference shuffle history_length density
-#                                                 repeat_removal catalogue_top)
+#                                                 repeat_removal catalogue_top; "none": stage 1 only)
 #   LATENCY_THREADS, LATENCY_CORES   latency's --threads (default 4) and --cores (default: none)
 #   LOGS        a log per process                (default: $WORK/logs)
 #   ROUNDS      repeats of a step with work left (default: 3)
@@ -42,6 +42,7 @@ read -r -a GPU_MODEL_LIST <<< "${GPU_MODELS:-elsa gru sasrec}"
 read -r -a CPU_MODEL_LIST <<< "${CPU_MODELS-popularity ease}"
 read -r -a DATASET_LIST <<< "${DATASETS:-}"
 read -r -a SWEEP_LIST <<< "${SWEEPS:-history_length_inference shuffle history_length density repeat_removal catalogue_top}"
+[[ ${SWEEP_LIST[*]} == none ]] && SWEEP_LIST=()  # stage 1 only
 LATENCY_THREADS=${LATENCY_THREADS:-4}
 LATENCY_CORES=${LATENCY_CORES:-}
 ROUNDS=${ROUNDS:-3}
@@ -185,6 +186,6 @@ alone latency "${latency[@]}"
 alone report report "${SELECT[@]}" --reference elsa
 alone analysis-report analysis-report "${SELECT[@]}"
 alone repeat-strata repeat-strata "${SELECT[@]}"
-alone ablation-report ablation-report "${SELECT[@]}" --sweep "${SWEEP_LIST[@]}"
+(( ${#SWEEP_LIST[@]} )) && alone ablation-report ablation-report "${SELECT[@]}" --sweep "${SWEEP_LIST[@]}"
 alone status status "${SELECT[@]}"
 say "done: reports in $WORK/reports"

@@ -124,6 +124,11 @@ new_item_diagnostic = true
 options = { start = "2014-01-01", end = "2015-01-01" }
 
 [datasets.yambda]
+# Decided 2026-10-05 (H14): organic_only stays false (the library default): listens a
+# recommender served are kept, since a listen is recorded only once at least half the
+# track has played (Yambda documentation), so it records engagement, not exposure.
+# The download is pinned by its checksum (listens-50m.parquet, fetched 2026-09-09):
+# sha256 eed9cbd094af1e189507d2f8132a0dc9653b90e65480125c7cdccd601e0592d1, 369,110,332 bytes.
 builder = "yambda"
 temporal_period_hours = 720
 train_users = "all"
@@ -139,6 +144,8 @@ new_item_diagnostic = true
 options = { user_sample = 0.5 }
 
 [datasets.otto]
+# Decided 2026-10-05 (H13): clicks only, as the library loads it (about 9 in 10 of the
+# events); carts and orders are left out rather than folded into one event kind.
 builder = "otto"
 temporal_period_hours = 48      # the log is 28 days long
 train_users = "all"

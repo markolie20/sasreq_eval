@@ -137,6 +137,7 @@ The commands above, in order of importance, with several processes sharing each 
 # in the container (or any shell with the .venv): WORK and DATA_DIR default to the two variables above
 GPUS="cuda:0 cuda:0" scripts/dgx-run.sh > run.log 2>&1 &   # two processes on one GPU, one CPU process beside
 DRY=1 scripts/dgx-run.sh                                    # print the steps, run nothing
+SWEEPS=none scripts/dgx-run.sh                             # stage 1 only (search, final, latency, reports)
 kill <pid of the script>                                    # stops every process it started, cleanly
 ```
 
