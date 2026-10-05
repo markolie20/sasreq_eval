@@ -247,11 +247,12 @@ def _main(argv: list[str] | None) -> int:
             ablation = protocol.ablation(sweep)
             work = "rescorings" if scope_of(ablation) == "inference" else "fits"
             print(f"\nablation {sweep}: {ablation.transform} at {list(ablation.levels)}, scope "
-                  f"{scope_of(ablation)}; {len(ablation.levels) * len(protocol.seeds)} {work} + {len(protocol.seeds)} reference rescorings per dataset and model, on "
+                  f"{scope_of(ablation)}, seeds {list(ablation.seeds)}; {len(ablation.levels) * len(ablation.seeds)} "
+                  f"{work} + {len(ablation.seeds)} reference rescorings per dataset and model, on "
                   f"{list(ablation.datasets)} x {list(ablation.models)}")
             for dataset in ablation.datasets:
                 seeds = sweep_seeds(protocol, work_dir, sweep, dataset)
-                if len(seeds) > len(protocol.seeds):
+                if len(seeds) > len(ablation.seeds):
                     print(f"  on {dataset} under seeds {list(seeds)}, with those added: "
                           f"{len(ablation.levels) * len(seeds)} {work} + {len(seeds)} reference rescorings per model")
         return 0

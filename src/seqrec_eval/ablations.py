@@ -690,8 +690,9 @@ def sweep_seeds_path(work_dir: Path, sweep: str, dataset: str) -> Path:
 
 
 def sweep_seeds(protocol: Protocol, work_dir: Path, sweep: str, dataset: str) -> tuple[int, ...]:
-    """The seeds of ``sweep`` on ``dataset``: the protocol's, then any added with ``ablate --add-seeds``."""
-    return seeds_with_added(protocol.seeds, sweep_seeds_path(work_dir, sweep, dataset))
+    """The seeds of ``sweep`` on ``dataset``: the sweep's own (the protocol's unless it names a subset), then any
+    added with ``ablate --add-seeds``."""
+    return seeds_with_added(protocol.ablation(sweep).seeds, sweep_seeds_path(work_dir, sweep, dataset))
 
 
 def check_stage1_seeds(protocol: Protocol, work_dir: Path, sweep: str, dataset: str, seeds: list[int]) -> None:

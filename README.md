@@ -41,7 +41,9 @@ branch `local-temporal-train-all-users`, at version `0.3.7+trainusers`. It adds:
   file that differs from upstream; `CHANGES.patch` holds the full difference.
 - Changed library files start with a one-line notice, as the license asks.
 - To take in later changes to the library, run `scripts/vendor-cr.sh [CHECKOUT]`, then `uv sync`; never edit the
-  copy by hand.
+  copy by hand. The script also adds uv `cache-keys` to the copy's `pyproject.toml`, so `uv sync` reinstalls it
+  whenever its source changes, a `git pull` of a library change included (by default uv watches
+  `pyproject.toml` alone, and would keep the old build).
 - Nothing is pushed to the library itself.
 
 The tests run every command end to end on a small synthetic dataset, through the installed library's real
@@ -127,6 +129,28 @@ seqrec-eval analyse --dataset amazon --sweep density   # a random sweep's floor,
 Every command takes `--dataset` and `--model` to narrow what it does, e.g.
 `seqrec-eval search --dataset amazon ml20m --model sasrec gru`.
 
+### The whole suite on the DGX: `scripts/dgx-run.sh`
+
+The commands above, in order of importance, with several processes sharing each step:
+
+```bash
+# in the container (or any shell with the .venv): WORK and DATA_DIR default to the two variables above
+GPUS="cuda:0 cuda:0" scripts/dgx-run.sh > run.log 2>&1 &   # two processes on one GPU, one CPU process beside
+DRY=1 scripts/dgx-run.sh                                    # print the steps, run nothing
+kill <pid of the script>                                    # stops every process it started, cleanly
+```
+
+- **Order:** `prepare`; `search` and `final` (stage 1), with the full data's `analyse` beside them; the stage-1
+  report; each sweep in turn (the inference sweep, `shuffle`, `history_length`, `density`, `repeat_removal`,
+  `catalogue_top`), each one's `analyse` beside the next; `latency` last and alone, since it times the CPU; then
+  every report. A stop at any point leaves every finished run whole: rerun the script and it skips them.
+- **Who runs what:** one process per entry in `GPUS` takes the GPU models (`GPU_MODELS`: ELSA, GRU, SASRec); one
+  CPU process takes EASE and popularity (`CPU_MODELS`). The run locks keep them apart.
+- **Exit codes:** a step whose processes leave work over (exit 3) is repeated, up to `ROUNDS`; a failure stops
+  the script with the log to read (`$WORK/logs/<step>-r<round>-<process>.log`) and what to do.
+- Settings and defaults are at the top of the script: `DATASETS`, `SWEEPS`, `LATENCY_THREADS`,
+  `LATENCY_CORES`, `PROTOCOL`.
+
 ### Adding seeds
 
 Only the first seed is in any fingerprint: it seeds every search trial, so it
@@ -143,6 +167,11 @@ round has run:
   already be a stage-1 seed of the dataset, since its reference is that seed's
   stage-1 model. A sweep may keep fewer seeds than stage 1; its reference then
   uses only its own seeds.
+- A sweep can also *start* with fewer: `seeds = [0]` in its section runs it under
+  seed 0 alone, as every retraining sweep of `protocol.toml` does (DECISIONS §32).
+  The key is in no fingerprint, so `ablate --add-seeds 1 2` grows it later beside
+  the runs already made. With one seed, its tests are over users only, and the
+  report says so.
 - In a random sweep, a seed is also a subsample. An added seed adds one at every
   level, and the fixed test users must stay eligible under it, because every run
   already made was scored on them. Every current transform keeps them eligible by
@@ -381,9 +410,12 @@ Windows and time decay use only differences, so that is harmless.
 - **Test is never seen during selection.** Search trials score validation only,
   on one fixed sample of users per dataset. Test is scored only in the final
   runs of the configuration already selected.
-- **Equal budget.** Every model gets `trials_per_model` random-search trials.
-  Trial *i* is the same configuration on every dataset. `final` refuses to
-  select from an unfinished search unless you pass `--allow-incomplete`.
+- **Equal budget.** Every model gets `trials_per_model` random-search trials
+  (10). Trial *i* is the same configuration on every dataset. `final` refuses to
+  select from an unfinished search unless you pass `--allow-incomplete`. The
+  epoch grids cap training (SASRec at 100 epochs, DECISIONS §32), so the stage-1
+  report flags ⚠ a selected trial or final whose training loss still fell by more
+  than 1% over its last tenth of epochs: the cap may hold that model back.
 - **Frozen means checked.** Each run is stored under a fingerprint of the
   protocol sections that determine its result. Editing a section starts fresh
   runs for exactly the (dataset, model) pairs it affects, and the report only
@@ -472,8 +504,17 @@ Windows and time decay use only differences, so that is harmless.
 
 Each `[ablations.<sweep>]` section applies one transform to the prepared split
 at each of its levels. Every model uses its **stage-1 configuration** at each
-level under every seed; nothing is searched again, so `ablate` waits for the
-stage-1 search (and uses its final models) exactly as `final` does.
+level under every seed of the sweep; nothing is searched again, so `ablate` waits
+for the stage-1 search (and uses its final models) exactly as `final` does.
+
+`protocol.toml` runs, to fit a week on one GPU (DECISIONS §32): the inference
+sweep of `history_length` at all 10 levels and 3 seeds (it only rescores), and
+the retraining sweeps at seed 0 with 13 levels in all: `history_length`
+`[5, 20, 100, 500]`, `shuffle` `[2, 10, all]`, `density` `[0.25, 0.5]`,
+`repeat_removal` `[0.5, 1.0]` (for the repeat-heavy dataset: it removes nothing
+where users do not repeat) and `catalogue_top` `[0.25, 0.5]`. The stratified
+catalogue sweep is dropped; its code stays. Which datasets the retraining sweeps
+run on is decided after the per-dataset timing; until then they list all five.
 
 | transform | level | what it does | knee |
 |---|---|---|---|
@@ -618,6 +659,27 @@ the machine's load before and after, and which trial's configuration was timed.
 The report's worst-bin P95 counts only bins with at least 50 requests. Latency is
 measured again every time the command runs, so the last run's numbers stand:
 state the hardware with them (the DGX's CPU is a 2016 Xeon E5-2698 v4).
+
+## How long it takes
+
+`scripts/local-run.sh` with `TRIALS=10 EPOCHS=2` on a dataset is a **timing run**:
+its trials are the real search's first ten configurations with the epochs
+changed, and each records its `fit_seconds` and `eval_seconds`. From one or more
+of them, `scripts/project-time.py` prices a protocol: the planned trials, the
+finals, every retraining level and rescoring, per dataset and model, in GPU
+hours. Another dataset is priced by its measured ratio on configurations timed
+on both (a short timing run, `TRIALS=3 EPOCHS=1`), or by a `--factor` you give.
+
+```bash
+.venv/bin/python scripts/project-time.py --timing ml20m=/path/to/timing/ml20m \
+    --timing amazon=/path/to/timing/amazon --factor otto=3 --speedup 1.7
+```
+
+On the V100 (2026-10-01, ML-20M): ELSA 3–96 s an epoch, GRU 20–137 s, SASRec
+25–90 s (310–365 s at a history length of 400); at most 2.7 GB of GPU memory per
+run. The protocol as written then cost about 15 GPU-days per ML-20M-sized
+dataset, which DECISIONS §32 brought to about 8.6 days for all five datasets, if
+each costs what ML-20M does.
 
 ## Layout
 

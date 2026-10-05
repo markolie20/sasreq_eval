@@ -1,3 +1,4 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
 from __future__ import annotations
 
 import numpy as np
@@ -90,6 +91,32 @@ def test_predict_matches_predict_on_batch(interactions, source):
     assert actual.k == 3
     torch.testing.assert_close(actual.cols, expected.cols)
     torch.testing.assert_close(actual.vals, expected.vals)
+
+
+class _UnindexableWeights(np.ndarray):
+    """EASE weights that refuse to be indexed: a column selection copies all of them."""
+
+    def __getitem__(self, key):
+        raise AssertionError("the weights were indexed")
+
+
+def test_scoring_every_item_does_not_copy_the_weights(interactions, source):
+    # selecting every column copied the items x items matrix on every call (seconds per
+    # request on ML-20M); with every item a candidate the weights are used as they are
+    model = EASE().fit(interactions)
+    expected = model.predict_on_batch(source, k=3)
+    model.coefficients_ = model.coefficients_.view(_UnindexableWeights)
+    actual = model.predict_on_batch(source, k=3)
+
+    torch.testing.assert_close(actual.cols, expected.cols, rtol=0, atol=0)
+    torch.testing.assert_close(actual.vals, expected.vals, rtol=0, atol=0)
+    scores = np.asarray(source @ np.asarray(model.coefficients_), dtype=np.float32)
+    np.testing.assert_array_equal(
+        actual.vals.numpy(), np.take_along_axis(scores, actual.cols.numpy(), axis=1)
+    )
+    with pytest.raises(AssertionError, match="indexed"):
+        # a subset of candidates still selects its columns
+        model.predict_on_batch(source, k=1, candidate_ids=np.arange(3))
 
 
 def test_predictions_exclude_seen_items(interactions, source):

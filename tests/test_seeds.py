@@ -17,7 +17,7 @@ from seqrec_eval.ablations import (REFERENCE, ablation_fingerprint, ablation_roo
                                    condition_fingerprint, fixed_test_rows, plan_ablation, sweep_seeds,
                                    sweep_seeds_path)
 from seqrec_eval.analysis import condition_results
-from seqrec_eval.protocol import load_protocol
+from seqrec_eval.protocol import ProtocolError, load_protocol
 from seqrec_eval.runner import (added_seeds_path, execute, final_seeds, load_final_evaluations, plan_finals,
                                 plan_trials)
 from seqrec_eval.splits import final_split, load_split
@@ -189,7 +189,7 @@ def test_the_ablation_report_uses_every_seed_of_the_sweep(workspace):
     root, _, protocol, _ = workspace
     reports = root / "work" / "reports"
     density = (reports / "ablation-density.md").read_text()
-    assert "Seeds [0, 1, 2]: the protocol's, and [2] added later (`ablate --add-seeds`)" in density
+    assert "Seeds [0, 1, 2]: the sweep's, and [2] added later (`ablate --add-seeds`)" in density
     assert "### Each level against the full data" in density  # every seed finished, so the condition entered
     metrics = (reports / "ablation-density-metrics.csv").read_text().splitlines()
     assert len(metrics) - 1 == len(MODELS) * 2 * 3  # reference and one level, three seeds each
@@ -199,6 +199,50 @@ def test_the_ablation_report_uses_every_seed_of_the_sweep(workspace):
     # the floor and controls were analysed on the new subsample too
     results = condition_results(protocol, root / "work", "density", "synth")
     assert results and all(len(columns["0.5"]) == 3 for columns in results.values())
+
+
+SHUFFLE = 'transform = "shuffle"\nlevels = [3]'
+
+
+@pytest.mark.parametrize("seeds, message", [
+    ("[3]", r"seeds \[3\] are not stage-1 seeds"), ("[]", "non-empty list"), ("[0, 0]", "distinct seeds"),
+    ("[true]", "distinct seeds"), ('["0"]', "distinct seeds"),
+])
+def test_a_sweeps_own_seeds_must_be_stage1_seeds(tmp_path, seeds, message):
+    with pytest.raises(ProtocolError, match=message):
+        _edited(tmp_path, SHUFFLE, f"{SHUFFLE}\nseeds = {seeds}")
+
+
+def test_a_sweep_runs_under_its_own_seeds_and_grows_with_add_seeds(workspace, tmp_path):
+    # a retraining sweep at one seed costs a third (review-plan/plans/week-budget.md, B3). The seeds are in no
+    # fingerprint, so the sweep can grow to more seeds later, beside the runs already made.
+    root, _, protocol, _ = workspace
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    one = _edited(tmp_path, SHUFFLE, f"{SHUFFLE}\nseeds = [0]")
+    assert one.ablation("shuffle").seeds == (0,) and one.ablation("density").seeds == (0, 1)
+    assert condition_fingerprint(one, "shuffle", "synth") == condition_fingerprint(protocol, "shuffle", "synth")
+    assert ablation_fingerprint(one, "shuffle", "synth", "gru") == ablation_fingerprint(protocol, "shuffle", "synth",
+                                                                                       "gru")
+    assert sweep_seeds(one, work, "shuffle", "synth") == (0,)
+    for model in MODELS:
+        plan = plan_ablation(one, work, "shuffle", "synth", model)
+        assert {name: [spec.seed for spec in specs] for name, specs in plan.items()} == {REFERENCE: [0],
+                                                                                         "3/seed0": [0]}
+    common = ["--protocol", str(tmp_path / "protocol.toml"), "--work-dir", str(work)]
+    before = _stamps(work)
+    assert cli.main(common + ["ablate", "--device", DEVICE, "--sweep", "shuffle"]) == 0
+    assert _stamps(work) == before  # seed 0's runs were made already: nothing reruns
+    assert cli.main(common + ["ablation-report", "--sweep", "shuffle"]) == 0
+    report = (work / "reports" / "ablation-shuffle.md").read_text()
+    assert "under seeds [0] of stage 1’s [0, 1]" in report
+    assert "With one seed there is no seed spread: every test below is over users only." in report
+    assert "### Each level against the full data" in report  # the one seed finished: the comparisons are made
+    assert len((work / "reports" / "ablation-shuffle-metrics.csv").read_text().splitlines()) - 1 == len(MODELS) * 2
+    # grown later, as any sweep is: seed 1 joins, and its runs (made by the workspace) are reused
+    assert cli.main(common + ["ablate", "--device", DEVICE, "--sweep", "shuffle", "--add-seeds", "1"]) == 0
+    assert sweep_seeds(one, work, "shuffle", "synth") == (0, 1)
+    assert _stamps(work) == before
 
 
 def test_a_subsample_that_would_shrink_the_fixed_users_is_refused(workspace, monkeypatch, tmp_path):

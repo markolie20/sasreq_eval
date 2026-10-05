@@ -1073,6 +1073,177 @@ how the GPU tests should be run from now on.
 
 ---
 
+## 32. The suite fits one to two weeks on one GPU (2026-10-05)
+
+**Decision (Mark).** The whole suite must run in a week or two, not 2–4 months. Plan:
+`review-plan/plans/week-budget.md`, B1–B4.
+
+**Basis.** The DGX timing run on ML-20M (10 configurations per model × 2 epochs on a V100, 2026-10-01). Priced
+from it, the protocol as written cost about 15 GPU-days per ML-20M-sized dataset, 90% of it SASRec: its epoch
+grid reached 400, and its history length 400 costs 5× per epoch.
+
+**Changes, in `protocol.toml` and `protocol.local.toml`:**
+- **SASRec epochs** `[20, 50, 100, 200, 400]` → `[10, 20, 50, 100]`. An epoch is (training users ÷ batch)
+  steps: about 1,000 on ML-20M against about 50 on ML-1M, where the published 200 epochs were set. So 100 epochs
+  is still ~10× the published training in steps.
+- **Trials** 20 → 10 per model. The first 10 draws are unchanged: they are exactly the configurations the timing
+  run measured, apart from SASRec's epochs, which come from the new grid. Checked with `plan_trials`.
+- **Ablations:**
+  - every retraining sweep runs under seed 0 only (`seeds = [0]`, below);
+  - fewer levels, 13 in all where there were 28: `history_length` `[5, 20, 100, 500]`, `density`
+    `[0.25, 0.5]`, `repeat_removal` `[0.5, 1.0]`, `catalogue_top` `[0.25, 0.5]`; `shuffle` unchanged;
+  - `catalogue_stratified` dropped from the protocol (its code stays);
+  - the inference sweep keeps every level and seed: it only rescores.
+- **Their datasets** are chosen after the per-dataset timing (plan A1). Until then they list every dataset.
+- **Kept:** all 5 datasets and 3 seeds in stage 1; every model; SASRec's history length up to 400 (capping it
+  saved only ~15%, and long histories are part of the question); the GRU and ELSA grids.
+
+**A sweep's own seeds (code).**
+- `[ablations.*]` takes `seeds`: a non-empty list of distinct stage-1 seeds. The default is the protocol's.
+  Booleans, strings, repeats and seeds stage 1 lacks are refused at load.
+- `ablations.sweep_seeds` starts from them.
+- Not in any fingerprint (the condition fingerprint holds transform, levels, options and scope), so
+  `ablate --add-seeds` grows a sweep later beside the runs already made.
+- A random transform then draws one subsample per sweep seed.
+- With one seed, the sweep's tests are over users only. The paired seed term needs k > 1, and the report already
+  said so.
+- `plan`, the ablation report's header and its added-seeds line name the sweep's seeds.
+- `scripts/local-run.sh` sets a sweep's own seeds to the first quick seed. It rewrote every `seeds` line before,
+  and refused the protocol once the sweeps had their own.
+
+**Effect.**
+- About 24 GPU-hours of stage 1 and 17.5 h of retraining ablations per ML-20M-sized dataset.
+- About 8.6 days for the whole suite on one process if all five datasets cost what ML-20M does: 6.4 days with
+  the retraining sweeps on two datasets.
+- Two processes on one GPU (memory allows: at most 2.7 GB per run) may divide that by ~1.7, not yet measured.
+
+**Side effects.**
+- Every run fingerprint changes (trials, epochs), as do the condition fingerprints of the sweeps whose levels
+  changed. No real run existed.
+- The timing runs keep their own fingerprints and stay valid as timing.
+- The review checklist's "full = stage 1" must compare seed for seed when a sweep has fewer seeds
+  (REVIEW_FRAMEWORK §6).
+
+**Where.** Both protocols; `protocol.py` (`_ALLOWED_KEYS`, `AblationProtocol.seeds`, `_parse_ablation`);
+`ablations.sweep_seeds`; `ablation_report.py`; `cli.py` (`plan`); `scripts/local-run.sh`; README (Adding seeds,
+Ablations, the guarantees, How long it takes).
+
+**Tests.**
+- `test_a_sweeps_own_seeds_must_be_stage1_seeds` and
+  `test_a_sweep_runs_under_its_own_seeds_and_grows_with_add_seeds`: fingerprints unchanged; seed-0 plan; nothing
+  rerun; report wording; `--add-seeds` reuses the runs.
+- `test_the_quick_protocol_shortens_only_trials_seeds_and_epochs` (extended).
+- 12 deliberate breaks, all caught.
+
+---
+
+## 33. EASE no longer copies its weights on every call (2026-10-05)
+
+**Problem (the DGX timing run).** The library's EASE scored with `coefficients_[:, candidate_rows]`. With every
+item a candidate (every suite call), that copies the whole items × items matrix on each call: 1.6 GB on ML-20M.
+The result:
+- 3.8 s per latency request;
+- ~80 s per validation scoring;
+- `latency` alone took 1.5 h;
+- the latency table claimed EASE misses 100 ms by 40×. That was the copy, not EASE.
+
+**Change (Mark approved).**
+- In the cr checkout's working tree (`local-temporal-train-all-users`, not committed): with every item a
+  candidate, `ease.py` scores with the matrix itself; a subset still selects its columns. Same numbers: a
+  sorted, unique selection of all n items is `arange(n)`.
+- Re-vendored with `scripts/vendor-cr.sh`.
+- The script now also appends uv `cache-keys` to the copy's `pyproject.toml`
+  (`[{ file = "pyproject.toml" }, { file = "src/**/*.py" }]`). By default uv reinstalls a path dependency only
+  when its `pyproject.toml` changes, which a `git pull` of a library change leaves alone, so the DGX would have
+  kept the old copy without a word.
+
+**Effect.**
+- A request on a 20k-item EASE: 2 ms, where the copy alone took 1.3 s.
+- EASE's validation scoring and `latency` take seconds instead of minutes.
+- EASE runs on the CPU, so the GPU time is unchanged.
+
+**Side effects.**
+- The library's source hash in run records changes: the vendored copy differs.
+- The other models only select columns of each batch's scores, not of a weight matrix (checked; their latency
+  of 2–6 ms agrees).
+
+**Where.** cr `src/compresso_recsys/models/ease.py`, `tests/test_ease.py`; `vendor/compresso-recsys`
+(re-vendored); `scripts/vendor-cr.sh`; README Install.
+
+**Tests.**
+- cr: `test_scoring_every_item_does_not_copy_the_weights`. The weights refuse indexing; scores are exactly
+  equal; a subset still selects. It fails with the copy back.
+- cr's EASE tests (22) and every cr test that touches EASE (127) pass.
+- uv: a source-only change to the vendored copy is reinstalled by `uv sync --locked` (checked by hand).
+
+---
+
+## 34. The report flags runs still improving at their last epoch (2026-10-05)
+
+**Why.** §32 caps SASRec at 100 epochs. If the cap binds, the model is under-trained, and that should show
+rather than pass for its best.
+
+**Change.**
+- `report.still_improving`: a run whose training loss fell by more than 1% over its last tenth of epochs (at
+  least the last one) was stopped while still improving. A model trained in phases is judged on its last phase.
+  NaN losses are skipped. EASE and popularity have no loss per epoch.
+- The stage-1 report adds a ⚠ note per model, naming the selected trial and the finals concerned and their fall.
+- A diagnostic only: it changes no selection.
+
+**Where.** `report.py`; README (the guarantees).
+
+**Tests.** `test_a_run_still_improving_at_its_last_epoch_is_recognised` and
+`test_the_report_flags_finals_still_improving_at_their_last_epoch`. 5 deliberate breaks, all caught after the
+phase case was strengthened.
+
+---
+
+## 35. Two scripts: the time estimate and the DGX run (2026-10-05)
+
+**`scripts/project-time.py`** prices a protocol from timing runs, per dataset and GPU model: search, finals,
+retraining levels and rescorings, in GPU hours, with a worst case.
+- **Cost per epoch:** measured where a configuration was timed, otherwise a log-linear fit over the
+  configuration's sizes. Within 15–23% on the timed ML-20M configurations.
+- **Other datasets:** priced by their measured ratio on configurations timed on both, or by a `--factor`.
+- **Finals and refits:** at the mean planned configuration × the measured final/trial ratio. Refits also ×
+  `--refit-share` (0.6).
+- **Check:** on the ML-20M timing and §32's protocol it gives 206 h (8.6 days) with every dataset at 1×, the hand
+  estimate.
+
+**`scripts/dgx-run.sh`** runs the whole suite in order of importance:
+1. `prepare`;
+2. `search` and `final`, with the full data's `analyse` beside them;
+3. the stage-1 report;
+4. each sweep, with its `analyse` beside the next;
+5. `latency` last and alone;
+6. every report.
+
+How it runs:
+- One process per entry in `GPUS` takes the GPU models; one CPU process takes EASE and popularity.
+- A step left with work (exit 3) is repeated, up to `ROUNDS`; a failure stops it with the log to read.
+- A SIGTERM to the script reaches every process it started (they stop cleanly, §30).
+- A log per process in `$WORK/logs`.
+
+**Where.** `scripts/project-time.py`, `scripts/dgx-run.sh`; README (Workflow, How long it takes).
+
+**Tests.**
+- `tests/test_project_time.py`: an exactly log-linear cost law is recovered; search, finals, refits, rescorings
+  and the worst case are all checked; dataset ratios and factors; a timed configuration keeps its measured time.
+  7 breaks, caught.
+- `tests/test_dgx_run.py`, against a fake `seqrec-eval` that records calls and exits as told:
+  - the order, devices and models;
+  - latency starting only after every background analysis has finished;
+  - a step repeated on exit 3;
+  - a stop after `ROUNDS`;
+  - a failure stopping before the next step;
+  - SIGTERM leaving no process behind;
+  - settings checked first.
+
+  8 breaks, caught.
+- 251 tests pass on CPU and on the GPU (`cuda:0`).
+
+---
+
 ## Known limitations recorded by the review
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum
@@ -1091,6 +1262,9 @@ how the GPU tests should be run from now on.
   chosen model needs, not what is achievable with that much data. A retuning spot-check is planned after the
   main runs (final review E).
 - **Users whose next item they already had are not scored where seen items are excluded** (entry 26, C4).
+- **The budget (entry 32):** 10 search trials per model; SASRec trained for at most 100 epochs (the report
+  flags a selected run still improving, entry 34); retraining ablations at one seed, with tests over users
+  only, at 13 levels where there were 28, and on the datasets chosen after the timing.
 - **At the smallest catalogues, the heaviest users are not scored where seen items are excluded**
   (entry 30, N49): they have seen all but fewer than k of the catalogue. Their number is in each run's
   metadata (`rows_too_few_unseen`).

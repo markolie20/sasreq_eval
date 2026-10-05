@@ -47,6 +47,17 @@ for file in "${changed[@]}" "${untracked[@]}"; do
     fi
 done
 
+# uv reinstalls a path dependency only when one of its cache keys changes, by default its pyproject.toml alone.
+# A `git pull` that changes only library source leaves that file untouched, so the old copy would stay installed
+# without a word: watch the source too.
+grep -q '^\[tool\.uv\]' "$DEST/pyproject.toml" && { echo "the library's pyproject.toml has a [tool.uv] of its own" >&2; exit 1; }
+cat >> "$DEST/pyproject.toml" <<'EOF'
+
+# Added by seqrec_eval's scripts/vendor-cr.sh: reinstall whenever the source changes, not only this file.
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
+EOF
+
 {
     echo "# Vendored compresso-recsys"
     echo
@@ -54,6 +65,8 @@ done
     echo "\`LICENSE\`), kept here so the evaluation suite runs on exactly the library it was built and reviewed"
     echo "against, without pushing the local changes to the library. \`uv sync\` installs it (the suite's"
     echo "\`pyproject.toml\`: \`[tool.uv.sources]\`). Refresh it with \`scripts/vendor-cr.sh\`; never edit it by hand."
+    echo "The script adds one thing of its own: a \`[tool.uv]\` \`cache-keys\` at the end of \`pyproject.toml\`, so"
+    echo "\`uv sync\` reinstalls the copy whenever its source changes (by default uv watches \`pyproject.toml\` alone)."
     echo
     echo "| | |"
     echo "|---|---|"

@@ -9,10 +9,11 @@
 #   FULL=1 scripts/local-run.sh ml20m gru                                # protocol.local.toml as it is
 #   DRY=1 scripts/local-run.sh ml20m gru                                 # print the commands, run nothing
 #
-# Quick means a protocol of its own, written next to the results: TRIALS trials per model, SEEDS, and EPOCHS
-# for every trained model (ELSA, GRU, SASRec); everything else as in protocol.local.toml. Its fingerprints are
-# its own, so nothing here can be mistaken for, or mixed with, a real run. FULL=1 copies protocol.local.toml
-# unchanged instead (20 trials, 3 seeds: hours per model on real data).
+# Quick means a protocol of its own, written next to the results: TRIALS trials per model, SEEDS (a sweep with
+# seeds of its own runs under the first), and EPOCHS for every trained model (ELSA, GRU, SASRec); everything
+# else as in protocol.local.toml. Its fingerprints are its own, so nothing here can be mistaken for, or mixed
+# with, a real run. FULL=1 copies protocol.local.toml unchanged instead (10 trials, 3 seeds: hours per model on
+# real data).
 #
 # Settings, from the environment:
 #   WORK       results                (default: work-local/<dataset>, or work-local-full/<dataset> with FULL=1)
@@ -64,12 +65,16 @@ PROTOCOL=$WORK/protocol.toml
 if [[ $FULL == 1 ]]; then
     cp "$HERE/protocol.local.toml" "$PROTOCOL"
 else
-    sed -e "s/^seeds = \[[^]]*\]/seeds = [$SEEDS]/" \
+    # stage 1 runs under SEEDS; a sweep with seeds of its own (a retraining sweep: one seed) under the first
+    first_seed=${SEEDS%%,*}
+    first_seed=${first_seed// /}
+    sed -e "s/^seeds = \[[^]]*\]/seeds = [$first_seed]/" \
+        -e "/^\[protocol\]/,/^\[/ s/^seeds = \[[^]]*\]/seeds = [$SEEDS]/" \
         -e "s/^trials_per_model = [0-9]*/trials_per_model = $TRIALS/" \
         -e "s/^epochs = { choice = \[[^]]*\] }/epochs = { choice = [$EPOCHS] }/" \
         "$HERE/protocol.local.toml" > "$PROTOCOL.new"
     # every substitution must have happened, or this would not be the quick run it says it is
-    if [[ $(grep -c "^seeds = \[$SEEDS\]" "$PROTOCOL.new") != 1 ||
+    if [[ $(sed -n '/^\[protocol\]/,/^\[/p' "$PROTOCOL.new" | grep -c "^seeds = \[$SEEDS\]") != 1 ||
           $(grep -c "^trials_per_model = $TRIALS\b" "$PROTOCOL.new") != 1 ||
           $(grep -c "^epochs = " "$PROTOCOL.new") != $(grep -c "^epochs = { choice = \[$EPOCHS\] }" "$PROTOCOL.new") ]]; then
         echo "protocol.local.toml no longer has the lines this script shortens (seeds, trials_per_model, epochs)" >&2

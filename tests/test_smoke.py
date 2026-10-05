@@ -810,6 +810,56 @@ def test_the_report_flags_finals_made_under_another_selection(workspace, tmp_pat
     assert "**gru**: final seed(s) [1] have not run yet" not in report
 
 
+def test_a_run_still_improving_at_its_last_epoch_is_recognised():
+    # the epoch grid is capped (SASRec at 100, DECISIONS §32): a run stopped while its loss still fell is flagged
+    from seqrec_eval.report import still_improving
+
+    def history(losses, **extra):
+        return [{"epoch": float(i + 1), "loss": loss, **extra} for i, loss in enumerate(losses)]
+
+    assert still_improving(None) is None and still_improving(history([0.5])) is None  # nothing to compare
+    assert still_improving(history([0.5, 0.5])) is None
+    assert still_improving(history([0.5, 0.48])) == pytest.approx((0.04, 1, 2))
+    flat_end = [1.0 - 0.01 * i for i in range(80)] + [0.2] * 20  # fell, then levelled off
+    assert still_improving(history(flat_end)) is None
+    steady = [1.0 - 0.005 * i for i in range(100)]  # still falling by 0.5% of 1.0 an epoch at the end
+    fall, window, epochs = still_improving(history(steady))
+    assert (window, epochs) == (10, 100) and fall == pytest.approx(0.05 / 0.555)
+    assert still_improving(history([0.5, 0.499])) is None  # 0.2%: noise
+    assert still_improving(history([0.5, float("nan"), 0.4])) == pytest.approx((0.2, 1, 2))
+    # in phases, the last phase alone counts: losses of different phases are not comparable
+    assert still_improving(history([1.0, 0.5], phase="warmup") + history([0.3], phase="main")) is None
+    assert still_improving(history([0.2, 0.1], phase="warmup") + history([0.5, 0.4], phase="main")) == \
+        pytest.approx((0.2, 1, 2))
+
+
+def test_the_report_flags_finals_still_improving_at_their_last_epoch(workspace, tmp_path):
+    import shutil
+
+    from seqrec_eval.report import build_report
+
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    models = ["popularity", "elsa", "gru", "sasrec"]
+    for done in (work / "runs").rglob("done.json"):  # every trained run converged
+        record = json.loads(done.read_text())
+        if "history" in record:
+            record["history"] = [{"epoch": 1.0, "loss": 0.5}, {"epoch": 2.0, "loss": 0.5}]
+            done.write_text(json.dumps(record))
+    report, _ = build_report(protocol, work, ["synth"], models, "elsa")
+    assert "still improving when training stopped" not in report
+    final = plan_finals(protocol, work, "synth", "gru")[1].directory(work) / "done.json"
+    record = json.loads(final.read_text())
+    record["history"] = [{"epoch": 1.0, "loss": 0.5}, {"epoch": 2.0, "loss": 0.45}]
+    final.write_text(json.dumps(record))
+    report, _ = build_report(protocol, work, ["synth"], models, "elsa")
+    assert ("⚠ **gru**: still improving when training stopped: final seed 1 (training loss −10.0% over the last 1 "
+            "of 2 epochs)") in report
+    assert "**sasrec**: still improving" not in report
+
+
 def test_latency_is_neither_measured_nor_shown_for_a_final_of_another_selection(workspace, tmp_path):
     # review N33: latency times the first seed's saved model, which would be another configuration's
     import shutil

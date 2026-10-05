@@ -31,6 +31,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,26 @@ from .splits import PHASES, split_dir
 #: Significance level and interval coverage of every comparison in the reports.
 ALPHA = 0.05
 CONFIDENCE = 1.0 - ALPHA
+#: a run whose training loss fell by more than this share over the last tenth of its epochs was stopped while still
+#: improving: the epoch grid (SASRec's capped at 100, DECISIONS §32) may hold the model back
+STILL_IMPROVING = 0.01
+
+
+def still_improving(history: list[dict[str, Any]] | None) -> tuple[float, int, int] | None:
+    """``(fall, window, epochs)`` if the training loss fell by more than :data:`STILL_IMPROVING` over the last
+    ``window`` epochs (a tenth of them, at least one), else ``None``; also ``None`` without a loss per epoch
+    (EASE, popularity). A model trained in phases is judged on its last phase."""
+    if not history:
+        return None
+    phase = history[-1].get("phase")
+    losses = [float(h["loss"]) for h in history if h.get("phase") == phase
+              and isinstance(h.get("loss"), (int, float)) and math.isfinite(h["loss"])]
+    if len(losses) < 2:
+        return None
+    window = max(1, round(0.1 * len(losses)))
+    before, last = losses[-window - 1], losses[-1]
+    fall = (before - last) / abs(before) if before else 0.0
+    return (fall, window, len(losses)) if fall > STILL_IMPROVING else None
 
 
 def mean_over_seeds(evaluations: list[EvaluationResult]) -> EvaluationResult:
@@ -227,6 +248,20 @@ def _builds_note(builds: dict[str, int]) -> list[str]:
                 "check (review H05)."]
 
 
+def _still_improving_runs(work_dir: Path, root: Path, summary, finals) -> list[str]:
+    """The selected trial and the finals whose training loss was still falling at the last epoch, described."""
+    runs = [(f"selected trial #{summary.best.index}", summary.best.directory(work_dir))] if summary.best else []
+    runs += [(f"final seed {spec.seed}", root / f"final-seed{spec.seed}") for spec, _ in finals]
+    out = []
+    for label, directory in runs:
+        done = directory / "done.json"
+        found = still_improving(read_json(done).get("history")) if done.exists() else None
+        if found:
+            fall, window, epochs = found
+            out.append(f"{label} (training loss −{fall:.1%} over the last {window} of {epochs} epochs)")
+    return out
+
+
 def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: list[str],
                    reference: str | None) -> tuple[str, list[dict[str, Any]]]:
     k = protocol.primary_metric.split("@")[1]
@@ -268,6 +303,10 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                          f"of {record['planned']} trials, `final --allow-incomplete`), so with a smaller budget than "
                          "the others" + ("; the search has finished since." if summary.done + summary.skipped
                                          + summary.failed >= summary.planned else "."))
+        improving = _still_improving_runs(work_dir, root, summary, finals)
+        if improving:
+            notes.append(f"- ⚠ **{model}**: still improving when training stopped: {'; '.join(improving)}. The epoch "
+                         "cap may hold it back: it could score higher with longer training.")
         if stale:
             notes.append(f"- ⛔ **{model}**: final seed(s) {stale} were made with another trial's configuration than "
                          f"the one selected now (#{summary.best.index}), so they describe another model. They are "

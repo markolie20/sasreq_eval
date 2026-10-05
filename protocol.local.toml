@@ -23,7 +23,7 @@ cutoffs = [5, 10, 20]
 metrics = ["ndcg", "recall", "calibrated_recall", "hit_rate", "precision", "map", "mrr"]
 primary_metric = "ndcg@10"      # the ranking metric of §5.3; the rest are diagnostics
 seeds = [0, 1, 2]               # final runs per selected configuration (§6.1)
-trials_per_model = 20           # equal random-search budget per model (§5.2)
+trials_per_model = 10           # equal random-search budget per model (§5.2); 10, was 20: the budget (DECISIONS §32)
 search_seed = 20260923
 # Decided: validation rows scored per search trial. One sample per dataset,
 # drawn once when the split is prepared, so every trial of every model is scored
@@ -235,9 +235,13 @@ n_heads = { choice = [1, 2] }                # 1 is published and the smallest
 dropout = { uniform = [0.0, 0.7] }           # centred between 0.2 and 0.5
 lr = { loguniform = [1e-4, 1e-2] }
 batch_size = { choice = [64, 128, 256] }
-# 200 is inside but not centred: centring it while keeping 20 would need 2,000
-# epochs, and with no early stopping every epoch is paid in full.
-epochs = { choice = [20, 50, 100, 200, 400] }
+# Decided 2026-10-05 (the one-week budget, DECISIONS §32): 10 to 100, was 20 to
+# 400, which made SASRec 90% of the suite's GPU time. An epoch is (training users /
+# batch) steps: about 1,000 on ML-20M at batch 128 against about 50 on ML-1M, where
+# the repo's 201 epochs were set, so 100 epochs is ~10x the published training in
+# steps, and more on the larger datasets. Every epoch is paid in full (no early
+# stopping); the stage-1 report flags a selected run still improving at its last.
+epochs = { choice = [10, 20, 50, 100] }
 # Decided 2026-10-01 (N2): negatives are sampled from outside the whole history,
 # as published; on repeat-heavy data that holds back re-consumption (documented).
 n_negatives = { choice = [1, 16, 64, 256] }  # 1 is published and the smallest
@@ -290,6 +294,8 @@ kind = "markov"
 #               besides its target; overrides the transform's own declaration
 #               (report only)
 #   datasets / models   what the sweep covers (default: all; not fingerprinted)
+#   seeds       the stage-1 seeds it runs under (default: all of them; not
+#               fingerprinted, so `ablate --add-seeds` can grow it later)
 #   manipulation_tolerance   relative change beyond which a characteristic the
 #               sweep does not target is flagged (report only; default 0.05)
 #   min_level_users   a level scored on fewer users is reported as descriptive
@@ -298,6 +304,13 @@ kind = "markov"
 #               the knee is the smallest level shown, by a one-sided paired
 #               randomisation test against the full data, to lose less than δ,
 #               with every larger level too. The report states the test's power.
+#
+# Decided 2026-10-05 (the one-week budget, DECISIONS §32): every retraining sweep
+# runs under seed 0 only, with fewer levels (13 in all, was 28), and
+# catalogue_stratified is dropped. The inference sweep, which only rescores, keeps
+# every level and seed. Which two datasets the retraining sweeps run on is decided
+# after the per-dataset timing (review-plan/plans/week-budget.md); until then they
+# list every dataset.
 # ---------------------------------------------------------------------------
 
 [ablations.history_length]
@@ -307,7 +320,9 @@ transform = "history_length"
 # event is only a target), input histories their last n, so a model is trained
 # and served with the same context and level 1 trains too (2026-09-29). The
 # knee is read from these levels, so it can be no finer than them.
-levels = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+# Decided 2026-10-05 (budget): 4 of the 10 levels; the inference sweep keeps all 10.
+levels = [5, 20, 100, 500]
+seeds = [0]
 # Decided: how much of the full-data NDCG a shorter history may cost and still
 # count as "no loss", fixed before any result is read because it decides the knee.
 # Decided 2026-09-30: 10%, was 2%. At 2% a level that loses nothing could be
@@ -328,7 +343,9 @@ knee_margin = 0.10
 transform = "density"
 # Decided: the grid. Each history keeps a random p of its events, spread over
 # its whole length; every training item keeps at least one event.
-levels = [0.1, 0.25, 0.5, 0.75]
+# Decided 2026-10-05 (budget): 2 of the 4 levels.
+levels = [0.25, 0.5]
+seeds = [0]
 knee_margin = 0.10
 
 [ablations.shuffle]
@@ -336,6 +353,7 @@ transform = "shuffle"
 # Decided: block sizes; "all" shuffles whole histories. Only order changes, so
 # the matrix models are a control that should match the full data.
 levels = [2, 10, "all"]
+seeds = [0]
 
 [ablations.catalogue_top]
 transform = "catalogue"
@@ -343,21 +361,21 @@ transform = "catalogue"
 # still in the catalogue), not one fixed set: one set cannot survive the item
 # removal (H01b). Catalogues are nested: a smaller level is part of every larger.
 # Fractions of the training catalogue kept (integers would be item counts).
-# The most popular items by training events are kept, so 0.75 shows whether the
-# long tail matters at all.
-levels = [0.1, 0.25, 0.5, 0.75]
-
-[ablations.catalogue_stratified]
-transform = "catalogue"
-# The same sizes drawn at random within popularity deciles, which keeps the
-# popularity distribution that the top-k cut flattens.
-levels = [0.1, 0.25, 0.5, 0.75]
-options = { strategy = "stratified", strata = 10 }
+# The most popular items by training events are kept.
+# Decided 2026-10-05 (budget): 2 of the 4 levels, and catalogue_stratified (the
+# same sizes drawn at random within popularity deciles) is dropped: it mostly
+# overlaps this sweep, and at small catalogues it scores few users (N49). Its code
+# stays: `options = { strategy = "stratified", strata = 10 }` brings it back.
+levels = [0.25, 0.5]
+seeds = [0]
 
 [ablations.repeat_removal]
 transform = "repeat_removal"
 # Decided: the share of repeat events removed. First occurrences always stay.
-levels = [0.25, 0.5, 1.0]
+# Decided 2026-10-05 (budget): 2 of the 3 levels. It removes nothing where users do
+# not repeat (ML-20M, Amazon), so it is to run on the repeat-heavy dataset only.
+levels = [0.5, 1.0]
+seeds = [0]
 knee_margin = 0.10
 
 # Stage-1 results cut by repeat share within history-length bins. No runs.

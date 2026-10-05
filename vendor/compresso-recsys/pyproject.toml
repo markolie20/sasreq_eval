@@ -104,3 +104,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+# Added by seqrec_eval's scripts/vendor-cr.sh: reinstall whenever the source changes, not only this file.
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]

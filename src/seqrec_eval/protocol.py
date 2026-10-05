@@ -75,7 +75,7 @@ _ALLOWED_KEYS = {
                  "min_value_to_keep", "set_all_values_to", "exclude_seen", "new_item_diagnostic",
                  "amazon_category", "options"},
     "models": {"family", "trials", "fixed", "space", "max_items"},
-    "ablations": {"transform", "levels", "options", "scope", "datasets", "models", "expected_to_move",
+    "ablations": {"transform", "levels", "options", "scope", "datasets", "models", "seeds", "expected_to_move",
                   "manipulation_tolerance", "knee_margin", "min_level_users"},
     "baselines": {"kind", "trials", "fixed", "space"},
     "repeat_strata": {"history_bins", "repeat_bins", "min_users", "n_resamples"},
@@ -189,6 +189,10 @@ class AblationProtocol:
 
     ``levels`` and ``options`` are checked by the transform itself, in
     :mod:`seqrec_eval.ablations`, since only it knows what a level means.
+    ``seeds`` are the stage-1 seeds the sweep runs under: the protocol's,
+    unless the sweep names a subset (a retraining sweep at one seed costs a
+    third). It is in no fingerprint, so seeds added later with
+    ``ablate --add-seeds`` sit beside the runs already made.
     """
 
     name: str
@@ -198,6 +202,7 @@ class AblationProtocol:
     models: tuple[str, ...]
     options: dict[str, Any]
     raw: dict[str, Any]
+    seeds: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -403,7 +408,8 @@ def _parse_baseline(name: str, table: dict, default_trials: int) -> BaselineProt
     return BaselineProtocol(name=name, kind=kind, trials=trials, grid=grid, fixed=fixed, space=space, raw=table)
 
 
-def _parse_ablation(name: str, table: dict, datasets: dict, models: dict) -> AblationProtocol:
+def _parse_ablation(name: str, table: dict, datasets: dict, models: dict,
+                    protocol_seeds: tuple[int, ...]) -> AblationProtocol:
     where = f"[ablations.{name}]"
     _check_keys(table, "ablations", where)
     levels = _require(table, "levels", where)
@@ -421,9 +427,20 @@ def _parse_ablation(name: str, table: dict, datasets: dict, models: dict) -> Abl
         if unknown:
             raise ProtocolError(f"{where}.{key} names {unknown}, which the protocol does not define")
         chosen[key] = tuple(names)
+    seeds = table.get("seeds", list(protocol_seeds))
+    if (not isinstance(seeds, list) or not seeds
+            or not all(isinstance(s, int) and not isinstance(s, bool) and s >= 0 for s in seeds)
+            or len(set(seeds)) != len(seeds)):
+        raise ProtocolError(f"{where}.seeds must be a non-empty list of distinct seeds, got {seeds!r}")
+    outside = [s for s in seeds if s not in protocol_seeds]
+    if outside:
+        # a condition of seed s reuses stage 1's model or configuration of seed s
+        raise ProtocolError(f"{where}.seeds {outside} are not stage-1 seeds {list(protocol_seeds)}: a sweep "
+                            "can only run under seeds stage 1 has")
     return AblationProtocol(
         name=name, transform=str(_require(table, "transform", where)), levels=tuple(levels),
         datasets=chosen["datasets"], models=chosen["models"], options=dict(options), raw=table,
+        seeds=tuple(int(s) for s in seeds),
     )
 
 
@@ -482,7 +499,7 @@ def load_protocol(path: str | Path) -> Protocol:
         raise ProtocolError("the protocol defines no [datasets.*]")
     if not models:
         raise ProtocolError("the protocol defines no [models.*]")
-    ablations = {name: _parse_ablation(name, table, datasets, models)
+    ablations = {name: _parse_ablation(name, table, datasets, models, seeds)
                  for name, table in raw.get("ablations", {}).items()}
     baselines = {name: _parse_baseline(name, table, trials_per_model)
                  for name, table in raw.get("baselines", {}).items()}

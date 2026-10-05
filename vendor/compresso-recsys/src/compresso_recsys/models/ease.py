@@ -1,3 +1,4 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -187,10 +188,15 @@ class EASE(BaseCollaborativeRecommender):
             )
 
         assert self.coefficients_ is not None
-        scores = np.asarray(
-            source @ self.coefficients_[:, candidate_rows],
-            dtype=self.dtype,
+        # Every item a candidate (no candidate_ids): the weights themselves. Selecting all
+        # their columns copies the whole items x items matrix on every call (1.6 GB on
+        # ML-20M, seconds per request), for the same scores.
+        weights = (
+            self.coefficients_
+            if candidate_count == self.coefficients_.shape[1]
+            else self.coefficients_[:, candidate_rows]
         )
+        scores = np.asarray(source @ weights, dtype=self.dtype)
         seen_rows = np.repeat(
             np.arange(source.shape[0], dtype=np.int64),
             seen_counts,

@@ -314,9 +314,9 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
     minimum = int(ablation.raw.get("min_level_users", DEFAULT_MIN_LEVEL_USERS))
     own_users = per_condition_users(protocol, sweep)
     lines = [f"## {dataset}", ""]
-    if len(seeds) > len(protocol.seeds):
-        added = list(seeds[len(protocol.seeds):])
-        lines += [(f"Seeds {list(seeds)}: the protocol's, and {added} added later (`ablate --add-seeds`). Every "
+    if len(seeds) > len(ablation.seeds):
+        added = list(seeds[len(ablation.seeds):])
+        lines += [(f"Seeds {list(seeds)}: the sweep's, and {added} added later (`ablate --add-seeds`). Every "
                    "condition enters the comparisons only once all of them have finished."), ""]
     rows_path = ablation_root(protocol, work_dir, sweep, dataset) / "test_rows.npy"
     if own_users:
@@ -667,7 +667,8 @@ def build_ablation_report(protocol: Protocol, work_dir: Path, sweep: str, datase
     options = f", options {ablation.options}" if ablation.options else ""
     seeds = ("one subsample per seed" if transform.stochastic(ablation.options) else "the same data for every seed")
     header = (f"# Ablation: {sweep}\n\nTransform `{transform.name}` (version {transform.version}), levels "
-              f"{list(ablation.levels)}{options}. {how}, under the protocol's seeds {list(protocol.seeds)} (and any a "
+              f"{list(ablation.levels)}{options}. {how}, under seeds {list(ablation.seeds)}"
+              f"{'' if ablation.seeds == protocol.seeds else f' of stage 1’s {list(protocol.seeds)}'} (and any a "
               f"dataset lists as added), with {seeds}. "
               f"**{REFERENCE}** is the stage-1 final model itself, rescored on the same users. "
               f"Primary metric {protocol.primary_metric}.\n")
