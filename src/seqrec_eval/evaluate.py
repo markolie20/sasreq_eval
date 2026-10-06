@@ -323,11 +323,13 @@ def _take(source, rows: np.ndarray):
 
 def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protocol: Protocol,
                    exclude_seen: bool, rows: np.ndarray | None = None,
-                   targets: str = "primary") -> EvaluationResult:
+                   targets: str = "primary", lists: list | None = None) -> EvaluationResult:
     """Score ``model`` on ``phase``.
 
     ``targets`` is "primary" (the protocol's definition), "next" or "window"
     explicitly, or "new": the protocol's targets not already in the history.
+    ``lists``, if given, receives each batch's ranked item columns (phase catalogue indices), in the order the
+    rows are scored: the very lists the metrics were computed from (the diversity diagnostics read them).
     """
     if targets not in ("primary", "new", *TARGET_DEFINITIONS):
         raise ValueError(f"targets must be 'primary', 'new' or one of {TARGET_DEFINITIONS}, got {targets!r}")
@@ -371,6 +373,15 @@ def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protoco
                                # a matrix source was projected onto the training catalogue; seen is the phase's
                                source_columns=adapter.train_to_catalog if family == "matrix" else None,
                                source=source, extra=extra)
+    if lists is not None:
+        ranked_by = policy.predict_on_batch
+
+        def recording(batch, *, k):
+            ranked = ranked_by(batch, k=k)
+            lists.append(ranked.cols.cpu().numpy())
+            return ranked
+
+        policy.predict_on_batch = recording
     result = evaluate_recommender(
         policy,
         source=source,

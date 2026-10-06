@@ -810,6 +810,52 @@ def test_the_report_flags_finals_made_under_another_selection(workspace, tmp_pat
     assert "**gru**: final seed(s) [1] have not run yet" not in report
 
 
+BERT4REC = """
+[models.bert4rec]
+family = "sequence"
+[models.bert4rec.fixed]
+epochs = 2
+batch_size = 16
+d_model = 8
+n_blocks = 1
+n_heads = 1
+duplication_factor = 2
+lr = 0.001
+[models.bert4rec.space]
+max_history_length = { choice = [10, 20] }
+"""
+
+
+def test_bert4rec_runs_through_every_step(workspace, tmp_path):
+    # H26, registered 2026-10-06: the trainer builds its own batcher, with the [MASK] token BERT4Rec reads
+    import shutil
+
+    from seqrec_eval.report import build_report
+
+    root, _ = workspace
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    (tmp_path / "protocol.toml").write_text(PROTOCOL + BERT4REC)
+    protocol = load_protocol(tmp_path / "protocol.toml")
+    # a model added to the protocol leaves every other model's runs where they are
+    before = load_protocol(root / "protocol.toml")
+    assert all(protocol.run_fingerprint("synth", m) == before.run_fingerprint("synth", m) for m in before.models)
+    common = ["--protocol", str(tmp_path / "protocol.toml"), "--work-dir", str(work)]
+    for step in (["search", "--model", "bert4rec", "--device", DEVICE],
+                 ["final", "--model", "bert4rec", "--device", DEVICE],
+                 ["latency", "--model", "bert4rec", "--threads", "1"]):
+        assert cli.main(common + step) == 0, step
+    for spec in plan_trials(protocol, "synth", "bert4rec") + plan_finals(protocol, work, "synth", "bert4rec"):
+        record = json.loads((spec.directory(work) / "done.json").read_text())
+        assert record["status"] == "done" and len(record["history"]) == 2
+    report, _ = build_report(protocol, work, ["synth"], ["popularity", "elsa", "gru", "sasrec", "bert4rec"], "elsa")
+    row = next(line for line in report.splitlines() if line.startswith("| bert4rec |"))
+    assert row.split(" | ")[1:5] == ["2/2", row.split(" | ")[2], row.split(" | ")[3], "2"]  # 2 trials, 2 seeds
+    from seqrec_eval.latency import latency_table
+
+    assert "| synth | bert4rec |" in latency_table(protocol, work, ["synth"], ["bert4rec"])
+
+
 def test_a_run_still_improving_at_its_last_epoch_is_recognised():
     # the epoch grid is capped (SASRec at 100, DECISIONS §32): a run stopped while its loss still fell is flagged
     from seqrec_eval.report import still_improving

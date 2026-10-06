@@ -76,7 +76,7 @@ def test_the_suite_runs_in_order_with_every_step_shared(tmp_path):
         assert devices == ["cpu", "cuda:0", "cuda:1"], (step, extra)
         for args in group:
             models = args[args.index("--model") + 1:args.index("--device")]
-            assert models == (["popularity", "ease"] if "cpu" in args else ["elsa", "gru", "sasrec"])
+            assert models == (["popularity", "ease"] if "cpu" in args else ["elsa", "gru", "sasrec", "bert4rec"])
     # the order: prepare, stage 1, its report, the sweeps in order, latency alone, then the reports
     last = lambda command, *e: max(_index(calls, command, *e))  # noqa: E731
     first = lambda command, *e: min(_index(calls, command, *e))  # noqa: E731

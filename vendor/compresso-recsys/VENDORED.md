@@ -9,10 +9,10 @@ The script adds one thing of its own: a `[tool.uv]` `cache-keys` at the end of `
 
 | | |
 |---|---|
-| Copied | 2026-10-05 11:03:51 from `/home/mark/Documents/recombee/compresso-recsys` |
+| Copied | 2026-10-06 13:44:23 from `/home/mark/Documents/recombee/compresso-recsys` |
 | Version | `0.3.7+trainusers` |
 | Branch | `local-temporal-train-all-users` at `6547522` (`65475227e226f0eabae5f0471d3813ad86f22f9e`) |
-| Uncommitted changes copied | 11 file(s) |
+| Uncommitted changes copied | 13 file(s) |
 | Upstream compared against | `origin/main` at `1016bfe` |
 
 ## Changes from upstream
@@ -25,6 +25,7 @@ training on every user (`temporal_train_users`, entry 4 and before), bounded tra
 - `README.md`
 - `pyproject.toml`
 - `src/compresso_recsys/builder.py`
+- `src/compresso_recsys/datasets/amazon2023.py`
 - `src/compresso_recsys/models/__init__.py`
 - `src/compresso_recsys/models/bert4rec/__init__.py`
 - `src/compresso_recsys/models/bert4rec/config.py`
@@ -34,6 +35,7 @@ training on every user (`temporal_train_users`, entry 4 and before), bounded tra
 - `src/compresso_recsys/models/elsa.py`
 - `src/compresso_recsys/models/sasrec.py`
 - `src/compresso_recsys/models/simple_rnn.py`
+- `tests/test_amazon2023_dataset.py`
 - `tests/test_bert4rec.py`
 - `tests/test_ease.py`
 - `tests/test_elsa.py`

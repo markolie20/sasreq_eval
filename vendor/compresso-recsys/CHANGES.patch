@@ -173,6 +173,73 @@ index 556b913..45a828b 100644
          amazon_category=amazon_category,
          metadata_text_fields=metadata_text_fields,
          min_entity_text_words=min_entity_text_words,
+diff --git a/src/compresso_recsys/datasets/amazon2023.py b/src/compresso_recsys/datasets/amazon2023.py
+index dbb8955..146f941 100644
+--- a/src/compresso_recsys/datasets/amazon2023.py
++++ b/src/compresso_recsys/datasets/amazon2023.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import re
+@@ -32,6 +33,13 @@ class AmazonReviews2023(RecSysDataset):
+ 
+     The recommender pipeline only needs compact rating-only interactions plus
+     item metadata. Reviews are intentionally not downloaded.
++
++    ``user_sample`` keeps a deterministic fraction of users, chosen by hashing
++    the user id, as :class:`~compresso_recsys.datasets.yambda.Yambda` does.
++    Sampling users rather than reviews keeps every surviving history exactly as
++    it was. A large category (Toys and Games has about 430,000 users with five
++    reviews or more over 447,000 products) costs a model that scores the whole
++    catalogue for every user in proportion to both.
+     """
+ 
+     name = "amazon2023"
+@@ -49,7 +57,11 @@ class AmazonReviews2023(RecSysDataset):
+         min_entity_text_words: int = 0,
+         include_image_urls: bool = False,
+         show_progress: bool = True,
++        user_sample: float | None = None,
+     ) -> None:
++        if user_sample is not None and not 0.0 < user_sample <= 1.0:
++            raise ValueError(f"user_sample must lie in (0, 1], got {user_sample!r}")
++        self.user_sample = user_sample
+         self.category = self.normalize_category(category)
+         self.default_text_fields = self.text_fields_for_category(self.category)
+         if isinstance(metadata_text_fields, str):
+@@ -442,6 +454,21 @@ class AmazonReviews2023(RecSysDataset):
+             "test": self._load_hf_dataframe(config, split="test"),
+         }
+ 
++    def _keeps(self, users: pd.Series) -> pd.Series:
++        """Deterministic membership for a batch of user ids, by the hash Yambda uses.
++
++        ``hash()`` is salted per process, so a sample drawn with it would differ
++        between runs. Hashing the distinct ids keeps this a per-user cost.
++        """
++        if self.user_sample is None:
++            return pd.Series(True, index=users.index)
++        threshold = self.user_sample * 2**32
++        keep = {
++            user for user in users.unique()
++            if int.from_bytes(hashlib.sha256(user.encode()).digest()[:4], "big") < threshold
++        }
++        return users.isin(keep)
++
+     def prepare(self) -> None:
+         self.download()
+ 
+@@ -473,6 +500,7 @@ class AmazonReviews2023(RecSysDataset):
+         interactions["value"] = pd.to_numeric(interactions["value"], errors="coerce")
+         interactions["timestamp"] = pd.to_numeric(interactions["timestamp"], errors="coerce")
+         interactions = interactions.dropna(subset=["user_id", "item_id", "value"])
++        interactions = interactions[self._keeps(interactions["user_id"])]
+ 
+         interactions = self.restrict_interactions_to_metadata_items(interactions, meta)
+ 
 diff --git a/src/compresso_recsys/models/__init__.py b/src/compresso_recsys/models/__init__.py
 index 7573931..ece0733 100644
 --- a/src/compresso_recsys/models/__init__.py
@@ -2010,6 +2077,45 @@ index 5780706..bc15fee 100644
  
      def _with_unk_dropout(
          self, inputs: torch.Tensor, mask: torch.Tensor
+diff --git a/tests/test_amazon2023_dataset.py b/tests/test_amazon2023_dataset.py
+index 8d12b9a..1fccb57 100644
+--- a/tests/test_amazon2023_dataset.py
++++ b/tests/test_amazon2023_dataset.py
+@@ -230,3 +230,34 @@ def test_amazon2023_can_include_image_url_metadata(tmp_path):
+     assert by_item.loc["A", "image_url"] == "https://example.com/a-hires.jpg"
+     assert by_item.loc["C", "image_url"] == "https://example.com/c-large.jpg"
+     assert "https://example.com/a-large.jpg" in by_item.loc["A", "image_urls"]
++
++
++class ManyUsersAmazon2023(FakeAmazon2023):
++    def _load_hf_dataframe(self, config: str, *, split: str = "full") -> pd.DataFrame:
++        if config.startswith("0core_rating_only_"):
++            users = [f"user{n}" for n in range(400)]
++            return pd.DataFrame({"user_id": [u for u in users for _ in range(2)],
++                                 "parent_asin": ["A", "C"] * len(users),
++                                 "rating": ["5.0"] * 2 * len(users),
++                                 "timestamp": [str(t) for t in range(2 * len(users))]})
++        return super()._load_hf_dataframe(config, split=split)
++
++
++def test_amazon2023_user_sample_keeps_whole_users_by_hash(tmp_path):
++    import hashlib
++
++    def build(sample):
++        return ManyUsersAmazon2023(data_dir=tmp_path, category="Toys_and_Games", user_sample=sample).get_interactions()
++
++    full, sampled = build(None), build(0.25)
++    assert full["user_id"].nunique() == 400
++    kept = set(sampled["user_id"])
++    assert 60 <= len(kept) <= 140  # about a quarter
++    assert kept == {u for u in full["user_id"].unique()
++                    if int.from_bytes(hashlib.sha256(u.encode()).digest()[:4], "big") < 0.25 * 2**32}
++    assert (sampled.groupby("user_id").size() == 2).all()  # every kept history whole
++    assert set(build(0.25)["user_id"]) == kept  # the same sample every time
++    assert kept <= set(build(0.5)["user_id"])  # nested: a smaller sample lies inside a larger one
++    for bad in (0.0, 1.5):
++        with pytest.raises(ValueError, match="user_sample"):
++            ManyUsersAmazon2023(data_dir=tmp_path, category="Toys_and_Games", user_sample=bad)
 diff --git a/tests/test_bert4rec.py b/tests/test_bert4rec.py
 new file mode 100644
 index 0000000..211b4c3

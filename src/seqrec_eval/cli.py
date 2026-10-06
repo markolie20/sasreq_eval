@@ -6,6 +6,7 @@
     seqrec-eval analysis-report            work/reports/analysis.md
     seqrec-eval search  --device cuda:0    random-search trials, validation only
     seqrec-eval final   --device cuda:0    selected configuration x seeds, with test
+    seqrec-eval diversity --device cuda:0  coverage and intra-list diversity of the saved final models
     seqrec-eval status | report | latency
     seqrec-eval ablate  --device cuda:0    each [ablations.*] sweep on the stage-1 configurations
     seqrec-eval ablation-report            work/reports/ablation-<sweep>.md and its CSVs
@@ -63,6 +64,7 @@ from .ablations import (
 )
 from .analysis import analyse_full, analyse_sweep
 from .analysis_report import build_analysis_report
+from .diversity import diversity_table, measure as measure_diversity
 from .latency import benchmark, latency_table, parse_cores
 from .models import model_spec
 from .protocol import load_protocol
@@ -139,6 +141,11 @@ def _parser() -> argparse.ArgumentParser:
     report = commands.add_parser("report", help="write work/reports/stage1.md and final_metrics.csv")
     selection(report)
     report.add_argument("--reference", default="elsa", help="model every other is compared against (default: %(default)s)")
+
+    diversity = commands.add_parser("diversity", help="coverage and intra-list diversity of the saved finals")
+    selection(diversity)
+    diversity.add_argument("--device", default=_default_device(), help="torch device (default: %(default)s)")
+    diversity.add_argument("--force", action="store_true", help="measure again finals that have a record")
 
     latency = commands.add_parser("latency", help="CPU inference latency of the saved final models")
     selection(latency)
@@ -320,6 +327,13 @@ def _main(argv: list[str] | None) -> int:
         latency = latency_table(protocol, work_dir, datasets, models)
         if latency.count("\n") > 1:
             markdown += "\n## CPU inference latency\n\n" + latency + "\n"
+        diversity = diversity_table(protocol, work_dir, datasets, models)
+        if diversity.count("\n") > 1:
+            markdown += ("\n## Diversity (diagnostics)\n\nOn the same test users and lists as the metrics, mean ± sd "
+                         "over seeds. Coverage: the share of the training catalogue in anyone's top k. Intra-list "
+                         "diversity: the mean dissimilarity of the pairs in a list, two items being similar when the "
+                         "same users interacted with them in training (the cosine on a rank-64 factorisation). "
+                         "Nothing is selected on these (`seqrec-eval diversity`).\n\n" + diversity + "\n")
         out = work_dir / "reports"
         out.mkdir(parents=True, exist_ok=True)
         (out / "stage1.md").write_text(markdown)
@@ -416,6 +430,14 @@ def _main(argv: list[str] | None) -> int:
             (out / "repeat-strata.csv").write_text(table)
         print(markdown)
         _log(f"wrote {out / 'repeat-strata.md'}")
+        return 0
+
+    if args.command == "diversity":
+        for dataset in datasets:
+            split = final_split(protocol, load_split(work_dir, dataset, protocol))
+            for model in models:
+                measure_diversity(protocol, work_dir, split, model, device=args.device, force=args.force, log=_log)
+            del split
         return 0
 
     if args.command == "latency":

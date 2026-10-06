@@ -1,5 +1,7 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -32,6 +34,13 @@ class AmazonReviews2023(RecSysDataset):
 
     The recommender pipeline only needs compact rating-only interactions plus
     item metadata. Reviews are intentionally not downloaded.
+
+    ``user_sample`` keeps a deterministic fraction of users, chosen by hashing
+    the user id, as :class:`~compresso_recsys.datasets.yambda.Yambda` does.
+    Sampling users rather than reviews keeps every surviving history exactly as
+    it was. A large category (Toys and Games has about 430,000 users with five
+    reviews or more over 447,000 products) costs a model that scores the whole
+    catalogue for every user in proportion to both.
     """
 
     name = "amazon2023"
@@ -49,7 +58,11 @@ class AmazonReviews2023(RecSysDataset):
         min_entity_text_words: int = 0,
         include_image_urls: bool = False,
         show_progress: bool = True,
+        user_sample: float | None = None,
     ) -> None:
+        if user_sample is not None and not 0.0 < user_sample <= 1.0:
+            raise ValueError(f"user_sample must lie in (0, 1], got {user_sample!r}")
+        self.user_sample = user_sample
         self.category = self.normalize_category(category)
         self.default_text_fields = self.text_fields_for_category(self.category)
         if isinstance(metadata_text_fields, str):
@@ -442,6 +455,21 @@ class AmazonReviews2023(RecSysDataset):
             "test": self._load_hf_dataframe(config, split="test"),
         }
 
+    def _keeps(self, users: pd.Series) -> pd.Series:
+        """Deterministic membership for a batch of user ids, by the hash Yambda uses.
+
+        ``hash()`` is salted per process, so a sample drawn with it would differ
+        between runs. Hashing the distinct ids keeps this a per-user cost.
+        """
+        if self.user_sample is None:
+            return pd.Series(True, index=users.index)
+        threshold = self.user_sample * 2**32
+        keep = {
+            user for user in users.unique()
+            if int.from_bytes(hashlib.sha256(user.encode()).digest()[:4], "big") < threshold
+        }
+        return users.isin(keep)
+
     def prepare(self) -> None:
         self.download()
 
@@ -473,6 +501,7 @@ class AmazonReviews2023(RecSysDataset):
         interactions["value"] = pd.to_numeric(interactions["value"], errors="coerce")
         interactions["timestamp"] = pd.to_numeric(interactions["timestamp"], errors="coerce")
         interactions = interactions.dropna(subset=["user_id", "item_id", "value"])
+        interactions = interactions[self._keeps(interactions["user_id"])]
 
         interactions = self.restrict_interactions_to_metadata_items(interactions, meta)
 

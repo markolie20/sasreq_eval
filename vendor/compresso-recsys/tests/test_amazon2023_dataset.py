@@ -1,3 +1,4 @@
+# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md
 from __future__ import annotations
 
 import pandas as pd
@@ -230,3 +231,34 @@ def test_amazon2023_can_include_image_url_metadata(tmp_path):
     assert by_item.loc["A", "image_url"] == "https://example.com/a-hires.jpg"
     assert by_item.loc["C", "image_url"] == "https://example.com/c-large.jpg"
     assert "https://example.com/a-large.jpg" in by_item.loc["A", "image_urls"]
+
+
+class ManyUsersAmazon2023(FakeAmazon2023):
+    def _load_hf_dataframe(self, config: str, *, split: str = "full") -> pd.DataFrame:
+        if config.startswith("0core_rating_only_"):
+            users = [f"user{n}" for n in range(400)]
+            return pd.DataFrame({"user_id": [u for u in users for _ in range(2)],
+                                 "parent_asin": ["A", "C"] * len(users),
+                                 "rating": ["5.0"] * 2 * len(users),
+                                 "timestamp": [str(t) for t in range(2 * len(users))]})
+        return super()._load_hf_dataframe(config, split=split)
+
+
+def test_amazon2023_user_sample_keeps_whole_users_by_hash(tmp_path):
+    import hashlib
+
+    def build(sample):
+        return ManyUsersAmazon2023(data_dir=tmp_path, category="Toys_and_Games", user_sample=sample).get_interactions()
+
+    full, sampled = build(None), build(0.25)
+    assert full["user_id"].nunique() == 400
+    kept = set(sampled["user_id"])
+    assert 60 <= len(kept) <= 140  # about a quarter
+    assert kept == {u for u in full["user_id"].unique()
+                    if int.from_bytes(hashlib.sha256(u.encode()).digest()[:4], "big") < 0.25 * 2**32}
+    assert (sampled.groupby("user_id").size() == 2).all()  # every kept history whole
+    assert set(build(0.25)["user_id"]) == kept  # the same sample every time
+    assert kept <= set(build(0.5)["user_id"])  # nested: a smaller sample lies inside a larger one
+    for bad in (0.0, 1.5):
+        with pytest.raises(ValueError, match="user_sample"):
+            ManyUsersAmazon2023(data_dir=tmp_path, category="Toys_and_Games", user_sample=bad)

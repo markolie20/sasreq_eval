@@ -1260,6 +1260,115 @@ How it runs:
 
 ---
 
+## 36. Decisions of 2026-10-06: Amazon sampled, the ablation datasets, BERT4Rec in, ELSA as it is
+
+**Decisions (Mark), on the questions left open by entries 32–35.**
+
+**Amazon at 25% of its users.**
+- *Why.* At full size (428,896 training users, 447,069 items) ELSA cost 55 times its ML-20M cost per epoch on the
+  DGX, and Amazon alone projected to about 8 GPU-days.
+- *Change.* The library's Amazon loader gains `user_sample`, the hashed user sample Yambda's loader has (cr
+  working tree, `datasets/amazon2023.py`, with a test; re-vendored). `[datasets.amazon]` sets
+  `options = { user_sample = 0.25 }`.
+- *Effect.* About 27,000 test users remain. Amazon's dataset fingerprint changes, so its split is prepared again.
+  Its 6 finished ELSA trials are not reused, and nothing else of Amazon had run.
+
+**The retraining ablations run on Music4All and OTTO.**
+- *Why.* Both have enough scored test users for a 10% knee, and they contrast on almost everything: music
+  against shopping, histories of hundreds against sessions of a dozen, heavy repetition against little.
+- *Change.* Every retraining sweep lists `datasets = ["music4all", "otto"]`; `repeat_removal` lists Music4All
+  alone. The inference sweep keeps all five. Not in any fingerprint (entry 21).
+
+**BERT4Rec is compared too (H26).**
+- *Change.* Registered (`models.py`; the trainer builds its own batcher, which has the `[MASK]` token). A
+  `[models.bert4rec]` section is centred on the published settings: d 64, 2 blocks, 2 heads, mask proportion
+  0.2–0.6, N 50–200, batch 256, lr 1e-4 (Sun et al. 2019, and the authors' run scripts as the library cites
+  them).
+  - The learning rate is searched around 1e-3, as SASRec's is, since the published 1e-4 under-trains with the
+    fixed warm-up and decay (H53).
+  - One epoch is 11 passes: the published 10 re-maskings plus the last-item samples. So `epochs` 1–10 matches
+    SASRec's 10–100 passes.
+  - `unk_dropout` is searched as for SASRec and GRU (N7).
+- *Kept as published:* positions count from the oldest item (N1). Since the refit, that leaves a mask on an
+  untrained position only for users whose history is exactly the longest training sequence, and only where no
+  user fills the window. On ML-20M, Music4All and Yambda some user always fills it; on OTTO and Amazon it is a
+  handful of users. A limitation, below.
+- *Effect.* A sixth model, and the third sequential one. `scripts/dgx-run.sh` trains it on the GPU by default.
+  Its cost is unmeasured: it is priced from its first trials on the DGX. The full softmax at up to 20 masked
+  positions per sequence fits a 32 GB V100 at batch 256 even on Yambda's 122,162 items (about 8 GB), so no
+  memory change was needed.
+
+**ELSA runs only as Recombee runs it (N3, N4 closed).** The published variants, without the ReLU or with the
+self-term subtracted, are not run.
+
+**N43 and N48 are accepted as limitations.**
+- *N43:* a seen item tied with the next item stays a target where seen items are excluded. It is out of reach
+  for every model alike.
+- *N48:* ELSA's scores move by about 1e-6 with the batch's composition.
+
+Both are below any difference the tests can show; changing either would redo every run on ML-20M and
+Amazon (N43) or change the production ELSA (N48).
+
+**A retuning spot-check of the ablations runs after the main runs, if time is left.**
+
+**Side effect for runs already made.** The library copy changed (EASE's scoring path in entry 33, the Amazon loader here), so its source hash differs between runs made before and after the update, and the stage-1 report warns that a dataset's results come from two builds. Neither change alters anything those runs computed: EASE's scores are bit-identical (entry 33), and only Amazon reads the loader.
+
+**Still open:** SANSA.
+
+**Where.**
+- cr: `datasets/amazon2023.py`, `tests/test_amazon2023_dataset.py`.
+- Suite: `vendor/compresso-recsys` (re-vendored); `models.py`; both protocols; `scripts/dgx-run.sh`; README.
+
+**Tests.**
+- `test_amazon2023_user_sample_keeps_whole_users_by_hash` (cr): whole users, the hash rule, the same sample
+  every time, nested samples, bad values refused. It fails with the filter removed; cr's 436 Amazon tests pass.
+- `test_bert4rec_runs_through_every_step`: search, final and latency on synthetic data; adding a model moves
+  no other model's runs. It fails with the registration removed.
+
+---
+
+## 37. Diversity: catalogue coverage and intra-list diversity of the finals (2026-10-06)
+
+**Decision (Mark).** The design's diversity diagnostics are added. Two items are similar when the same users
+interacted with them: co-occurrence, since not every dataset has item attributes (OTTO has none), and those
+that exist differ in kind between datasets.
+
+**Change.**
+- `evaluate_phase(..., lists=)` hands back each batch's ranked lists, the very lists the metrics are computed
+  from: the same users and the same exclusion of seen items.
+- `seqrec-eval diversity` (`diversity.py`) scores each finished, current stage-1 final once more on test, keeps
+  its lists, and writes `diversity.json` beside the run:
+  - **Coverage@K:** the share of the training catalogue in anyone's top K. Exact.
+  - **Intra-list diversity@K:** the mean of 1 − cos(i, j) over the pairs in a list, averaged over users.
+    The cosine is taken on the best rank-64 approximation of the binarised training matrix, i.e. the cosine of
+    that approximation's columns. The exact co-occurrence cosine does not scale to catalogues of 100,000 items
+    and more. An item no user had is dissimilar to every other.
+- A final with a record is not measured again (`--force` re-measures). A stale or unfinished final is skipped.
+- The stage-1 report gains a "Diversity (diagnostics)" table: coverage and intra-list diversity at the primary
+  cutoff, mean ± sd over seeds.
+- `scripts/dgx-run.sh` runs `diversity` after the finals, on the first GPU device.
+
+**Effect.** Diagnostics only: nothing is selected on them, and no fingerprint changes. It costs one more test
+scoring per final, and one factorisation per dataset.
+
+**Where.** `diversity.py`, `evaluate.py`, `cli.py`, `scripts/dgx-run.sh`, README.
+
+**Tests.** `tests/test_diversity.py`:
+- the two measures on vectors with known answers, items outside the catalogue included;
+- the factorisation reproducing exact co-occurrence cosines on a matrix of low rank, with uneven counts
+  (binarised first);
+- end to end:
+  - every current final is measured on exactly its scored users;
+  - a stale final and an unfinished one are skipped;
+  - a rerun measures nothing;
+  - the report shows the table;
+  - row for row, each recorded top 5 holds a next item exactly when the user is a hit at 5, on a model whose
+    users both hit and miss.
+
+10 deliberate breaks, all caught after two tests were strengthened. 256 tests pass on CPU and on the GPU.
+
+---
+
 ## Known limitations recorded by the review
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum
@@ -1274,7 +1383,14 @@ How it runs:
   (`producten/tussenproducten/research_design.odt`, §5.4) says so since 2026-10-05; it listed three
   interaction types before.
 - **Matrix models rank an all-cold history by tie order** (entry 3); not yet counted.
-- **Refitted models use settings chosen on less data** (entry 4); BERT4Rec keeps one off-by-one (entry 4).
+- **Refitted models use settings chosen on less data** (entry 4).
+- **BERT4Rec keeps its published position numbering** (entries 4 and 36, N1): a user whose history is exactly the
+  longest training sequence meets an untrained mask position, where no user fills the window (a handful on
+  OTTO and Amazon).
+- **A seen item tied with the next item stays a target where seen items are excluded** (N43, entry 36): out of
+  reach for every model alike.
+- **ELSA's scores depend on the batch's composition by about 1e-6** (N48, entry 36).
+- **Amazon is a 25% sample of Toys and Games' users** (entry 36), hashed, every history whole.
 - **Matrix models train on the max of two windows' counts and read the sum at test** (entry 25, N5): the
   library's design, which matters on the repeat-heavy datasets only.
 - **SASRec's negatives come from outside the whole history, as published** (entry 25, N2): seen items are never
@@ -1292,13 +1408,9 @@ How it runs:
 
 ## Open decisions
 
-In `review-plan/ISSUES.md`:
-- N3 and N4: keep ELSA's ReLU and self-term as production behaviour (entry 14), or also run the published
-  variants?
+- SANSA: in or out of the comparison (entry 27). It can be added later without redoing any other run.
+- The retuning spot-check of the ablations after the main runs, if time is left (entries 27 and 36).
 - N8: SASRec's out-of-memory search corner (fixed with H35 in memory; kept here as a check on the DGX).
-- H26: registering BERT4Rec.
-- SANSA: in or out of the research question (entry 27).
-- The retuning spot-check after the main runs (entry 27).
 
 ## Decisions before the freeze (2026-09-23 to 09-25)
 

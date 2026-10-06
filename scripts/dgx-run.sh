@@ -7,7 +7,7 @@
 #   DRY=1 scripts/dgx-run.sh                   print the steps, run nothing
 #
 # Order: prepare; search and final (stage 1: the main result) with the full data's analysis beside them; the
-# stage-1 report; then the sweeps one by one, each sweep's analysis beside the next; latency last, alone, since
+# finals' diversity; the stage-1 report; then the sweeps one by one, each sweep's analysis beside the next; latency last, alone, since
 # it times the CPU; then every report. A stop at any point leaves every finished run whole: rerun the script and
 # it skips them. GPU models run on the GPU processes, EASE and popularity on one CPU process beside them.
 #
@@ -22,7 +22,7 @@
 #   DATA_DIR    raw data and caches              (default: $COMPRESSO_DATA_DIR)
 #   PROTOCOL    the protocol                     (default: protocol.toml beside this folder)
 #   GPUS        one torch device per GPU process (default: "cuda:0")
-#   GPU_MODELS  models run on the GPU processes  (default: "elsa gru sasrec")
+#   GPU_MODELS  models run on the GPU processes  (default: "elsa gru sasrec bert4rec")
 #   CPU_MODELS  models run on the CPU process    (default: "popularity ease"; "" for none)
 #   DATASETS    datasets                         (default: every one in the protocol)
 #   SWEEPS      sweeps, in this order            (default: history_length_inference shuffle history_length density
@@ -38,7 +38,7 @@ WORK=${WORK:-${SEQREC_EVAL_WORK:-}}
 DATA_DIR=${DATA_DIR:-${COMPRESSO_DATA_DIR:-}}
 PROTOCOL=${PROTOCOL:-$HERE/protocol.toml}
 read -r -a GPU_DEVICES <<< "${GPUS:-cuda:0}"
-read -r -a GPU_MODEL_LIST <<< "${GPU_MODELS:-elsa gru sasrec}"
+read -r -a GPU_MODEL_LIST <<< "${GPU_MODELS:-elsa gru sasrec bert4rec}"
 read -r -a CPU_MODEL_LIST <<< "${CPU_MODELS-popularity ease}"
 read -r -a DATASET_LIST <<< "${DATASETS:-}"
 read -r -a SWEEP_LIST <<< "${SWEEPS:-history_length_inference shuffle history_length density repeat_removal catalogue_top}"
@@ -168,6 +168,8 @@ alone prepare prepare "${SELECT[@]}" --data-dir "$DATA_DIR"
 beside analyse-full analyse "${SELECT[@]}" --sweep none
 shared search search
 shared final final
+# coverage and intra-list diversity of the finals: one more test scoring each, on the GPU (diagnostics)
+alone diversity diversity "${SELECT[@]}" --device "${GPU_DEVICES[0]}"
 finish_background
 alone report-stage1 report "${SELECT[@]}" --reference elsa
 

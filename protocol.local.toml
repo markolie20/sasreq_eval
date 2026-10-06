@@ -107,6 +107,10 @@ builder = "amazon2023"
 # about 78,000 (emulated; the first prepare gives the real count). 16.1M rated
 # events and a 447,069-item training catalogue: EASE (max_items 40,000) is skipped
 # here, as on Yambda and OTTO. The ratings and metadata are already downloaded.
+# Decided 2026-10-06: a quarter of its users, hashed as Yambda's and OTTO's are,
+# so every history kept is whole. At full size (428,896 training users, 447,069
+# items) ELSA cost 55 times what it does on ML-20M, and Amazon alone would have
+# taken about 8 GPU-days; at 25% about 27,000 test users remain.
 amazon_category = "Toys_and_Games"
 temporal_period_hours = 8136
 train_users = "all"
@@ -116,6 +120,7 @@ min_value_to_keep = "none"
 set_all_values_to = 1.0
 exclude_seen = true             # Decided: repeats could be removed from the recommendations and stay valid
 new_item_diagnostic = false
+options = { user_sample = 0.25 }
 
 [datasets.music4all]
 builder = "music4all-onion"
@@ -179,6 +184,7 @@ options = { session_sample = 0.02 }   # first prepare rebuilds the cache once fo
 # published value that is the smallest possible (1 head, 1 layer, 1 negative),
 # a learning rate tuned for another optimizer, or a cost bound. Sources:
 #   SASRec   Kang & McAuley, ICDM 2018 (§IV-C), and its repo kang205/SASRec
+#   BERT4Rec Sun et al., CIKM 2019 (§4.3), and its repo FeiSun/BERT4Rec (run scripts)
 #   GRU4Rec  Hidasi et al., ICLR 2016 (Table 2); Hidasi & Czapp, RecSys 2023
 #            (tuned values in hidasib/GRU4Rec paramfiles)
 #   EASE     Steck, WWW 2019 (§5.2)
@@ -258,6 +264,34 @@ n_negatives = { choice = [1, 16, 64, 256] }  # 1 is published and the smallest
 unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }
 max_history_length = { choice = [25, 50, 100, 200, 400] }
 
+[models.bert4rec]
+# Decided 2026-10-06 (H26): BERT4Rec is compared too. The library's model, as
+# published: positions count from the oldest item, which since the refit leaves
+# only users whose history is exactly the longest training sequence with a mask
+# on an untrained position, and only where no user fills the window (N1).
+family = "sequence"
+[models.bert4rec.space]
+# d = 64, 2 blocks, 2 heads, dropout 0.1-0.2, mask proportion 0.2 (MovieLens),
+# 0.4 (Steam), 0.6 (Beauty), N = 200 dense and 50 sparse, lr 1e-4, batch 256,
+# each sequence masked 10 times per pass (Sun et al. 2019, section 4.3, and the
+# authors' run scripts, as cited in the library's Bert4RecConfig).
+d_model = { choice = [32, 64, 128] }
+n_blocks = { choice = [1, 2, 3] }
+n_heads = { choice = [1, 2, 4] }
+dropout = { uniform = [0.0, 0.4] }           # centred on 0.2
+mask_proportion = { choice = [0.2, 0.4, 0.6] }
+# 1e-4 is published but sits at the edge: with the fixed 100-step warm-up and
+# linear decay it badly under-trains on these data (review H53), so the range is
+# centred on 1e-3, as SASRec's is.
+lr = { loguniform = [1e-4, 1e-2] }
+batch_size = { choice = [64, 128, 256] }     # 256 is published; the full softmax bounds it
+# One epoch is 11 passes over the training windows: the published 10 re-maskings
+# plus one sample with the last item masked. 1 to 10 epochs is therefore 11 to
+# 110 passes, matching SASRec's 10 to 100 (DECISIONS §32) rather than its numbers.
+epochs = { choice = [1, 2, 5, 10] }
+unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }   # N7, as SASRec and GRU
+max_history_length = { choice = [25, 50, 100, 200, 400] }   # as SASRec's, centred between 50 and 200
+
 # ---------------------------------------------------------------------------
 # Non-learned baselines (§5.2), scored by `seqrec-eval analyse`, not models.
 # Each is searched on validation like a model (a small grid of choices in
@@ -315,9 +349,11 @@ kind = "markov"
 # Decided 2026-10-05 (the one-week budget, DECISIONS §32): every retraining sweep
 # runs under seed 0 only, with fewer levels (13 in all, was 28), and
 # catalogue_stratified is dropped. The inference sweep, which only rescores, keeps
-# every level and seed. Which two datasets the retraining sweeps run on is decided
-# after the per-dataset timing (review-plan/plans/week-budget.md); until then they
-# list every dataset.
+# every level and seed, on every dataset.
+# Decided 2026-10-06: the retraining sweeps run on Music4All and OTTO: both have
+# enough scored test users for a 10% knee, and they contrast on almost everything
+# (music against shopping, histories of hundreds against sessions of a dozen,
+# heavy repetition against little). repeat_removal runs on Music4All alone.
 # ---------------------------------------------------------------------------
 
 [ablations.history_length]
@@ -330,6 +366,7 @@ transform = "history_length"
 # Decided 2026-10-05 (budget): 4 of the 10 levels; the inference sweep keeps all 10.
 levels = [5, 20, 100, 500]
 seeds = [0]
+datasets = ["music4all", "otto"]
 # Decided: how much of the full-data NDCG a shorter history may cost and still
 # count as "no loss", fixed before any result is read because it decides the knee.
 # Decided 2026-09-30: 10%, was 2%. At 2% a level that loses nothing could be
@@ -353,6 +390,7 @@ transform = "density"
 # Decided 2026-10-05 (budget): 2 of the 4 levels.
 levels = [0.25, 0.5]
 seeds = [0]
+datasets = ["music4all", "otto"]
 knee_margin = 0.10
 
 [ablations.shuffle]
@@ -361,6 +399,7 @@ transform = "shuffle"
 # the matrix models are a control that should match the full data.
 levels = [2, 10, "all"]
 seeds = [0]
+datasets = ["music4all", "otto"]
 
 [ablations.catalogue_top]
 transform = "catalogue"
@@ -375,6 +414,7 @@ transform = "catalogue"
 # stays: `options = { strategy = "stratified", strata = 10 }` brings it back.
 levels = [0.25, 0.5]
 seeds = [0]
+datasets = ["music4all", "otto"]
 
 [ablations.repeat_removal]
 transform = "repeat_removal"
@@ -383,6 +423,7 @@ transform = "repeat_removal"
 # not repeat (ML-20M, Amazon), so it is to run on the repeat-heavy dataset only.
 levels = [0.5, 1.0]
 seeds = [0]
+datasets = ["music4all"]
 knee_margin = 0.10
 
 # Stage-1 results cut by repeat share within history-length bins. No runs.

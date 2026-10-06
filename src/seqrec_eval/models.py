@@ -27,6 +27,8 @@ from typing import Any
 
 from compresso_recsys.models import (
     EASE,
+    Bert4RecConfig,
+    Bert4RecTrainer,
     EASEConfig,
     ELSAConfig,
     ELSATrainer,
@@ -103,3 +105,10 @@ def _gru(params, *, n_items, device, seed):
 @register("sasrec", family="sequence", cls=SASRecTrainer)
 def _sasrec(params, *, n_items, device, seed):
     return SASRecTrainer(SASRecConfig(**params, device=device, seed=seed, show_progress=False))
+
+
+@register("bert4rec", family="sequence", cls=Bert4RecTrainer)
+def _bert4rec(params, *, n_items, device, seed):
+    # The trainer builds its own batcher, whose tokenizer has the [MASK] token BERT4Rec needs; a batcher built
+    # here on a plain ItemTokenizer would not (review H26).
+    return Bert4RecTrainer(Bert4RecConfig(**params, device=device, seed=seed, show_progress=False))

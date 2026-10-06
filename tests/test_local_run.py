@@ -30,7 +30,7 @@ def test_the_quick_protocol_shortens_only_trials_seeds_and_epochs(tmp_path):
     expected = copy.deepcopy(local.raw)
     expected["protocol"].update(seeds=[0], trials_per_model=2)
     trained = [name for name, model in local.models.items() if "epochs" in model.space]
-    assert sorted(trained) == ["elsa", "gru", "sasrec"]
+    assert sorted(trained) == ["bert4rec", "elsa", "gru", "sasrec"]
     for name in trained:
         expected["models"][name]["space"]["epochs"] = {"choice": [1]}
     own = [name for name, sweep in local.raw["ablations"].items() if "seeds" in sweep]

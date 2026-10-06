@@ -145,7 +145,7 @@ kill <pid of the script>                                    # stops every proces
   report; each sweep in turn (the inference sweep, `shuffle`, `history_length`, `density`, `repeat_removal`,
   `catalogue_top`), each one's `analyse` beside the next; `latency` last and alone, since it times the CPU; then
   every report. A stop at any point leaves every finished run whole: rerun the script and it skips them.
-- **Who runs what:** one process per entry in `GPUS` takes the GPU models (`GPU_MODELS`: ELSA, GRU, SASRec); one
+- **Who runs what:** one process per entry in `GPUS` takes the GPU models (`GPU_MODELS`: ELSA, GRU, SASRec, BERT4Rec); one
   CPU process takes EASE and popularity (`CPU_MODELS`). The run locks keep them apart.
 - **Exit codes:** a step whose processes leave work over (exit 3) is repeated, up to `ROUNDS`; a failure stops
   the script with the log to read (`$WORK/logs/<step>-r<round>-<process>.log`) and what to do.
@@ -215,6 +215,12 @@ best non-sequential model beside it as a descriptive line. `gru` is the
 library's `SimpleRNN` with a GRU cell and a full softmax: GRU4Rec's architecture
 and objective family, not GRU4Rec's sampled BPR-max/TOP1-max losses, so it is
 reported as "GRU (full softmax)", not as GRU4Rec.
+
+`bert4rec` is the library's BERT4Rec, as published (DECISIONS.md §36): one epoch is 11 passes over the
+training windows (10 re-maskings and the last-item samples), so its `epochs` of 1–10 match SASRec's 10–100 passes,
+and its learning rate is searched around 1e-3, since the published 1e-4 under-trains here. Its positions count
+from the oldest item, as published; since the refit that leaves an untrained mask position only for users whose
+history is exactly the longest training sequence, where no user fills the window.
 
 Two behaviours come with the library and are kept, documented (DECISIONS.md §25):
 - **Matrix inputs (N5).** cr's builder trains ELSA and EASE on the larger of the
@@ -295,7 +301,7 @@ Test users scored, with refit (and before these rules):
 | dataset | before | after |
 |---|---|---|
 | ML-20M | 3,321 | 2,942 |
-| Amazon Toys_and_Games | 109,774 | 77,976 |
+| Amazon Toys_and_Games (all users; 25% since DECISIONS §36, about a quarter of these) | 109,774 | 77,976 |
 | Music4All | 30,369 | 30,180 |
 | Yambda 50% | 4,373 | 3,840 |
 | OTTO 2% | 18,458 | 14,605 |
@@ -514,8 +520,8 @@ the retraining sweeps at seed 0 with 13 levels in all: `history_length`
 `[5, 20, 100, 500]`, `shuffle` `[2, 10, all]`, `density` `[0.25, 0.5]`,
 `repeat_removal` `[0.5, 1.0]` (for the repeat-heavy dataset: it removes nothing
 where users do not repeat) and `catalogue_top` `[0.25, 0.5]`. The stratified
-catalogue sweep is dropped; its code stays. Which datasets the retraining sweeps
-run on is decided after the per-dataset timing; until then they list all five.
+catalogue sweep is dropped; its code stays. The retraining sweeps run on Music4All
+and OTTO, `repeat_removal` on Music4All alone (DECISIONS §36).
 
 | transform | level | what it does | knee |
 |---|---|---|---|
@@ -661,6 +667,21 @@ The report's worst-bin P95 counts only bins with at least 50 requests. Latency i
 measured again every time the command runs, so the last run's numbers stand:
 state the hardware with them (the DGX's CPU is a 2016 Xeon E5-2698 v4).
 
+## Diversity
+
+`seqrec-eval diversity` scores every finished stage-1 final once more on test, through the same evaluation as
+its metrics (the same users, the same exclusion of seen items), keeps the ranked lists, and writes
+`diversity.json` beside the run (DECISIONS §37):
+- **coverage@K:** the share of the training catalogue that appears in anyone's top K;
+- **intra-list diversity@K:** the mean dissimilarity 1 − cos(i, j) of the pairs in a list, averaged over users.
+  Two items are similar when the same users interacted with them in training, measured as the cosine on the best
+  rank-64 approximation of the binarised training matrix. Item attributes are not used: OTTO has none, and the
+  others' differ in kind.
+
+A final with a record is skipped (`--force` measures again). The stage-1 report shows both at the primary cutoff,
+mean ± sd over seeds. They are diagnostics: nothing is selected on them. `scripts/dgx-run.sh` runs the step after
+the finals.
+
 ## How long it takes
 
 `scripts/local-run.sh` with `TRIALS=10 EPOCHS=2` on a dataset is a **timing run**:
@@ -692,9 +713,11 @@ work/runs/<dataset>/<model>/<fp>/trial-007/ spec.json, done.json | failed.json, 
                                             attempts.json while a run is under way (2 deaths: failed)
 work/runs/<dataset>/<model>/<fp>/incomplete_selection.json   final --allow-incomplete was used
 work/tmp/                                   the library's temporary files (unless TMPDIR is set)
-work/runs/<dataset>/<model>/<fp>/final-seed1/  test, test_new (diagnostic), model.zip, latency.json; no val under refit
+work/runs/<dataset>/<model>/<fp>/final-seed1/  test, test_window and test_new (diagnostics), model.zip, latency.json,
+                                            diversity.json; no val under refit
 work/runs/<dataset>/added_seeds.json        seeds added with final --add-seeds (which, when, where)
-work/reports/stage1.md, final_metrics.csv
+work/reports/stage1.md, final_metrics.csv     (stage 1, with the latency and diversity tables)
+work/logs/<step>-r<round>-<process>.log     one log per process of scripts/dgx-run.sh
 work/ablations/<sweep>/<dataset>/added_seeds.json   seeds added with ablate --add-seeds
 work/ablations/<sweep>/<dataset>/<cfp>/test_rows.npy, test_rows.json (subsamples checked), conditions/<level>[/seedS].json (characteristics)
 work/ablations/<sweep>/<dataset>/<cfp>/runs/<model>/<fp>/<level|full>/final-seed1/   done.json, test.{json,npz}
