@@ -347,7 +347,9 @@ kind = "markov"
 # Decided 2026-10-06: the retraining sweeps run on Music4All and OTTO: both have
 # enough scored test users for a 10% knee, and they contrast on almost everything
 # (music against shopping, histories of hundreds against sessions of a dozen,
-# heavy repetition against little). repeat_removal runs on Music4All alone.
+# heavy repetition against little). repeat_removal runs on both (2026-10-07; it ran
+# on Music4All alone before). On both, every ablation run is also scored on new
+# items only (DECISIONS §38).
 # ---------------------------------------------------------------------------
 
 [ablations.history_length]
@@ -414,10 +416,11 @@ datasets = ["music4all", "otto"]
 transform = "repeat_removal"
 # Decided: the share of repeat events removed. First occurrences always stay.
 # Decided 2026-10-05 (budget): 2 of the 3 levels. It removes nothing where users do
-# not repeat (ML-20M, Amazon), so it is to run on the repeat-heavy dataset only.
+# not repeat (ML-20M, Amazon). Decided 2026-10-07: on OTTO too (35% of its events
+# are repeats), so both ablation datasets have it.
 levels = [0.5, 1.0]
 seeds = [0]
-datasets = ["music4all"]
+datasets = ["music4all", "otto"]
 knee_margin = 0.10
 
 # Stage-1 results cut by repeat share within history-length bins. No runs.

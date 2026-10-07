@@ -21,6 +21,8 @@
 #   WORK        work dir                         (default: $SEQREC_EVAL_WORK)
 #   DATA_DIR    raw data and caches              (default: $COMPRESSO_DATA_DIR)
 #   PROTOCOL    the protocol                     (default: protocol.toml beside this folder)
+#   SEQREC_EVAL_PROTOCOL_EXTRA  extra protocol files of [models.*] sections, ':'-separated, which every step
+#               reads (DECISIONS §39); list their models in GPU_MODELS or CPU_MODELS to train them
 #   GPUS        one torch device per GPU process (default: "cuda:0")
 #   GPU_MODELS  models run on the GPU processes  (default: "elsa gru sasrec bert4rec")
 #   CPU_MODELS  models run on the CPU process    (default: "popularity ease"; "" for none)
@@ -160,7 +162,8 @@ finish_background() {
     (( code == 0 )) || { say "a background analysis ended with exit code $code; see $LOGS/analyse-*.log"; exit "$code"; }
 }
 
-say "seqrec-eval suite: protocol $PROTOCOL, work $WORK, GPU processes ${GPU_DEVICES[*]}, logs $LOGS"
+say "seqrec-eval suite: protocol $PROTOCOL${SEQREC_EVAL_PROTOCOL_EXTRA:+ with the models of $SEQREC_EVAL_PROTOCOL_EXTRA}," \
+    "work $WORK, GPU processes ${GPU_DEVICES[*]}, logs $LOGS"
 alone plan plan
 alone prepare prepare "${SELECT[@]}" --data-dir "$DATA_DIR"
 

@@ -66,7 +66,7 @@ from .analysis import analyse_full, analyse_sweep
 from .analysis_report import build_analysis_report
 from .diversity import diversity_table, measure as measure_diversity
 from .latency import benchmark, latency_table, parse_cores
-from .models import model_spec
+from .models import PLUGIN_ERRORS, model_spec
 from .protocol import load_protocol
 from .report import build_report, status_table
 from .results import read_json
@@ -90,6 +90,16 @@ def _select(requested: list[str] | None, available: dict, kind: str) -> list[str
     return requested
 
 
+#: the environment variable that names extra protocol files when ``--protocol-extra`` is not given
+EXTRA_ENV = "SEQREC_EVAL_PROTOCOL_EXTRA"
+
+
+def _extras(given: list[str] | None) -> list[str]:
+    if given is not None:
+        return given
+    return [path for path in os.environ.get(EXTRA_ENV, "").split(os.pathsep) if path]
+
+
 def _default_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -98,6 +108,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="seqrec-eval", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--protocol", default="protocol.toml", help="protocol file (default: %(default)s)")
+    parser.add_argument("--protocol-extra", action="append", metavar="FILE",
+                        help="an extra protocol file of [models.*] sections only, added to the protocol's: a model "
+                             "kept out of the repository (repeatable; default: the files in $" + EXTRA_ENV + ", "
+                             "separated by " + repr(os.pathsep) + ")")
     parser.add_argument("--work-dir", default=os.environ.get("SEQREC_EVAL_WORK", "work"),
                         help="splits, runs and reports (default: $SEQREC_EVAL_WORK or ./work)")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -216,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None) -> int:
     args = _parser().parse_args(argv)
-    protocol = load_protocol(args.protocol)
+    protocol = load_protocol(args.protocol, extra=_extras(args.protocol_extra))
     work_dir = Path(args.work_dir)
     if "TMPDIR" not in os.environ:
         # the library stages every model save and load in a temporary directory: keep that on the work dir's
@@ -233,6 +247,10 @@ def _main(argv: list[str] | None) -> int:
         total = 0
         print(f"protocol {protocol.path} v{protocol.version}: primary {protocol.primary_metric}, "
               f"seeds {list(protocol.seeds)}, cutoffs {list(protocol.cutoffs)}")
+        for extra in protocol.extras:
+            print(f"  with the models of {extra}")
+        for plugin, error in PLUGIN_ERRORS.items():
+            print(f"  ⚠ model plugin {plugin!r} failed to load: {error}")
         for dataset in datasets:
             prepared = (split_dir(work_dir, dataset) / "split_info.json").exists()
             seeds = final_seeds(protocol, work_dir, dataset)

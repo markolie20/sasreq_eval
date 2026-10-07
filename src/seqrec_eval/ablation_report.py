@@ -334,6 +334,7 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
     seeds_of: dict[str, dict[str, list[EvaluationResult]]] = {}
     seeds_done: dict[str, dict[str, list[float]]] = {}
     incomplete: dict[str, list[str]] = {}
+    new_items: dict[str, dict[str, list[EvaluationResult]]] = {}  # model -> column -> one per finished seed
     csv_rows, notes = [], []
     for model in models:
         try:
@@ -350,6 +351,10 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
             column = name.split("/")[0]
             finished, old = _load(work_dir, specs)
             stale += [(name, spec.seed) for spec in old]
+            for spec, _ in finished:
+                stem = spec.directory(work_dir) / "test_new"
+                if evaluation_exists(stem):
+                    new_items.setdefault(model, {}).setdefault(column, []).append(load_evaluation(stem))
             if transform.changes_targets:
                 finished = [(spec, replace(e, target_fingerprint=None)) for spec, e in finished]
             by_column.setdefault(column, []).extend(finished)
@@ -546,11 +551,52 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
                          [[g["condition"], g["model"], g["against"],
                            f"{g['users']:,}" + (" *descriptive*" if g["below_min_users"] else ""),
                            f"{g['gap']:+.4f}", f"[{g['ci_low']:+.4f}, {g['ci_high']:+.4f}]"] for g in descriptive])]
+    lines += _new_items_section(protocol, columns, new_items, comparator, len(seeds))
     analysis_lines, analysis_rows, floor_rows = _analysis_section(
         protocol, work_dir, sweep, dataset, columns, averaged, transform.changes_targets, comparator)
     lines += analysis_lines
     gap_rows += descriptive
     return "\n".join(lines), csv_rows, gap_rows, analysis_rows, floor_rows
+
+
+def _new_items_section(protocol: Protocol, columns: list[str], new_items: dict[str, dict[str, list[EvaluationResult]]],
+                       comparator: str, n_seeds: int) -> list[str]:
+    """Each level scored on next items the user never had (DECISIONS §38): descriptive, beside the tested results.
+
+    A level enters only once every seed has, as in the tested tables; the gap is the difference of the seed means.
+    """
+    primary = protocol.primary_metric
+    complete = {model: {column: runs for column, runs in by_column.items() if len(runs) == n_seeds}
+                for model, by_column in new_items.items()}
+    complete = {model: by_column for model, by_column in complete.items() if by_column}
+    if not complete:
+        return []
+    shown = [c for c in columns if any(c in by_column for by_column in complete.values())]
+
+    def cell(model: str, column: str) -> str:
+        runs = complete[model].get(column)
+        return _mean_sd([r.metrics[primary] for r in runs]) if runs else "—"
+
+    users = {c: next((by_column[c][0].n_scored_rows for by_column in complete.values() if c in by_column), None)
+             for c in shown}
+    lines = ["", "### New items only (descriptive)", "",
+             (f"Every run is also scored on the next items its users never had before, test {primary}, seen items "
+              "excluded: what a model adds beyond repeating what the user already had, which replay cannot do "
+              "(it scores 0 here). Mean ± sd over seeds; no test is made on these, and nothing is selected on them."),
+             "", _table(["model"] + shown,
+                        [[model] + [cell(model, c) for c in shown] for model in complete]
+                        + [["*users scored*"] + [f"{users[c]:,}" if users[c] is not None else "—" for c in shown]])]
+    sequential = [m for m in complete if protocol.model(m).family == "sequence"]
+    if comparator in complete and sequential:
+        def gap(model: str, column: str) -> str:
+            ours, theirs = complete[model].get(column), complete[comparator].get(column)
+            if not ours or not theirs:
+                return "—"
+            return f"{np.mean([r.metrics[primary] for r in ours]) - np.mean([r.metrics[primary] for r in theirs]):+.4f}"
+
+        lines += ["", f"Sequential − {comparator} on new items only (difference of the seed means):", "",
+                  _table(["model"] + shown, [[model] + [gap(model, c) for c in shown] for model in sequential])]
+    return lines
 
 
 def _analysis_section(protocol: Protocol, work_dir: Path, sweep: str, dataset: str, columns: list[str],

@@ -579,6 +579,53 @@ def test_failed_and_unfinished_ablation_runs_are_listed_not_dropped(workspace, t
     assert "| sasrec | " in knees and "| gru | " not in knees  # the other models keep their knee
 
 
+def test_every_ablation_run_is_also_scored_on_new_items(workspace):
+    # DECISIONS §38: the next items a user never had, at every level, beside the primary targets
+    from seqrec_eval.results import load_evaluation
+
+    root, _, protocol = workspace
+    work = root / "work"
+    assert protocol.dataset("synth").new_item_diagnostic
+    for sweep in ("history", "repeats", "history_inference"):
+        users = {}
+        for model in ("popularity", "gru", "sasrec"):
+            for name, specs in plan_ablation(protocol, work, sweep, "synth", model).items():
+                for spec in specs:
+                    directory = spec.directory(work)
+                    record = json.loads((directory / "done.json").read_text())
+                    new = load_evaluation(directory / "test_new")
+                    primary = load_evaluation(directory / "test")
+                    assert record["test_new"] == new.metrics and new.metadata["targets"] == "new"
+                    assert new.metadata["exclude_seen"] is True
+                    # on the condition's own test users, those with a new next item
+                    assert set(np.asarray(new.sample_ids)) <= set(np.asarray(primary.sample_ids))
+                    users.setdefault(sweep, set()).add(tuple(sorted(np.asarray(new.sample_ids))))
+        # judged on the whole history, the new targets and so their users are the same at every level and model
+        assert len(users[sweep]) == 1 and len(next(iter(users[sweep]))) > 0, sweep
+    report = (work / "reports" / "ablation-history.md").read_text()
+    section = report.split("### New items only (descriptive)")[1]
+    assert "| gru |" in section and "*users scored*" in section and "Sequential − elsa" in section
+
+
+def test_an_ablation_runs_new_items_are_scored_on_its_own_users(workspace, tmp_path):
+    # the new-items scoring follows the users the condition is scored on, not every test user (DECISIONS §38)
+    from dataclasses import replace as replaced
+
+    from seqrec_eval.ablations import build_condition
+    from seqrec_eval.results import load_evaluation
+
+    protocol, work = _copied(workspace, tmp_path)
+    split = final_split(protocol, load_split(work, "synth"))
+    spec = plan_ablation(protocol, work, "history", "synth", "gru")["2"][0]
+    condition = build_condition(protocol, work, split, "history", 2, None)
+    half = condition.test_rows[: len(condition.test_rows) // 2]
+    (spec.directory(work) / "done.json").unlink()
+    assert execute(spec, replaced(condition, test_rows=half), protocol, work, device="cpu",
+                   log=lambda _: None) == "done"
+    new = load_evaluation(spec.directory(work) / "test_new")
+    assert 0 < len(new.sample_ids) and set(np.asarray(new.sample_ids)) <= set(condition.eval_user_ids("test")[half])
+
+
 def test_an_ablation_run_made_under_an_old_selection_is_left_out_of_the_report(workspace, tmp_path):
     # review N33: the ablation report loaded such runs silently, into the comparisons, the gap and the knee
     from seqrec_eval.ablation_report import build_ablation_report

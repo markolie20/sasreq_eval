@@ -1369,6 +1369,107 @@ scoring per final, and one factorisation per dataset.
 
 ---
 
+## 38. The ablations also score new items only; repeat removal on OTTO too (2026-10-07)
+
+**Decision (Mark).** Asked whether the ablations test non-repeat behaviour at all. They did not: removing
+repeats keeps each item's first occurrence and leaves the targets as they are, so even at 100% removal a next
+item can be one the user had before. And the stage-1 report's new-items diagnostic was only made for the
+finals.
+
+**Change.**
+- Every ablation run on a dataset with `new_item_diagnostic` (Music4All and OTTO among the ablation datasets;
+  Yambda in the serving-time sweep) is also scored on the next items its users never had.
+  - Seen items are excluded, on the condition's own test users, and written as `test_new` beside `test`.
+  - Seen items are judged on the whole history, so in every sweep that keeps the item space the new targets,
+    and the users scored on them, are the same at every level.
+- The ablation report adds "New items only (descriptive)": mean ± sd over seeds per model and level, the users
+  scored, and each sequential model minus ELSA, as a difference of the seed means.
+  - No test is made on these and nothing is selected on them, so the tested family of each sweep is unchanged.
+- `repeat_removal` also runs on OTTO (35% of its events are repeats), so both ablation datasets have it.
+
+**Why.** On the repeat-heavy data, replay is the floor, and much of what the sequential models gain may be repeats
+and recency. The new-items view, where replay scores 0 by construction, shows at every level what a model adds
+beyond what its users already had.
+
+**Effect.**
+- One more scoring per ablation run, seconds to minutes each.
+- Two more refits per model on OTTO for `repeat_removal`, about 2 GPU-hours with BERT4Rec.
+- No fingerprint changes. No ablation had run yet, so nothing is redone.
+
+**Where.** `runner.py` (`_execute`); `ablation_report.py` (`_new_items_section`, `dataset_ablation`); both
+protocols.
+
+**Tests.**
+- `test_every_ablation_run_is_also_scored_on_new_items`: retrained, removal and serving-time sweeps; the same
+  users at every level; the report section.
+- `test_an_ablation_runs_new_items_are_scored_on_its_own_users`: a condition restricted to half its users is
+  scored on those only.
+
+5 deliberate breaks, all caught after the second test was added. 258 tests on CPU and on the GPU.
+
+## 39. Models from other packages, and an extra protocol file for them (2026-10-07)
+
+**Decision (Mark).** A model whose code may not be published, from a private repository, is evaluated like
+every other, and neither its code nor its settings enter this repository.
+
+**Change.**
+- **Plugins.** `models.py` imports every module that an installed package declares in the entry-point group
+  `seqrec_eval.models`. The module registers its models with `register`, as the suite's own models are
+  registered.
+  - A plugin that fails to import is reported on stderr and listed by `plan`. The suite's own models still run,
+    and a run of the plugin's model fails with the reason (`model_spec`).
+- **Extra protocol files.** `--protocol-extra FILE` adds the `[models.*]` sections of FILE to the protocol. It is
+  repeatable, and defaults to the files in `$SEQREC_EVAL_PROTOCOL_EXTRA`, `:`-separated.
+  - Models only: any other section is refused, and so is a model that the protocol or another extra file
+    already defines. Everything that decides how the models are evaluated stays in the protocol.
+  - A model's fingerprint is its own section, so adding one moves no other model's runs. A sweep that names no
+    models runs the added model too.
+  - `plan` lists the extra files, and the stage-1 report names each one with its sha256.
+  - `scripts/dgx-run.sh` passes the variable on to every step and names it in its first line.
+  - The tests unset the variable (`tests/conftest.py`), so they run only the protocols they write.
+- **Provenance.** Beside the library and the suite, a plugin model's runs record its top-level package, and
+  each package its class lists in `provenance_packages`: the installed version, a source hash and the path
+  (`code.plugins`). The stage-1 report lists plugin builds on their own lines, so a plugin's runs do not
+  count as another build of the suite.
+- **Model diagnostics.** If a model has a `run_diagnostics()` method, its result goes into each run's
+  `done.json` (`model_diagnostics`): what the model counts about its own scoring.
+
+**Why.**
+- A git-ignored folder inside this repository is one `git add -f` away from the public history.
+- It would also leave the model's settings in the protocol file, which is public.
+- An installed package plus a separate protocol file keep both outside. The runs still record exactly which
+  code ran.
+
+**Effect.**
+- No fingerprint changes and nothing is redone.
+- Runs of the suite's own models record what they did before.
+- `uv sync` without `--inexact` removes an installed plugin, since the lock does not list it.
+
+**Where.**
+- `models.py`: `PLUGIN_GROUP`, `_load_plugins`, `PLUGIN_ERRORS`, `model_provenance`.
+- `protocol.py`: `load_protocol(extra=)`, `_add_extra_models`, `Protocol.extras`.
+- `cli.py`: `--protocol-extra`, `EXTRA_ENV`, `plan`.
+- `runner.py`: the run record.
+- `report.py`: `plugin_builds`, `_builds_note`, the header.
+- `scripts/dgx-run.sh`, `tests/conftest.py`.
+
+**Tests.** `tests/test_plugins.py`, with a fake plugin installed with real `*.dist-info` metadata. It checks
+that:
+- the plugin registers through its entry point, in this process and in a new one;
+- a failing plugin is named, and the suite still runs;
+- extra files add models without moving any other fingerprint, may add only models, and may not define a model
+  twice;
+- extra files come from the option, or else from the variable;
+- end to end, the plugin's model runs through search, final, diversity and the report, with its code and
+  diagnostics recorded, and the report names the extra file and the plugin build on its own line.
+
+In `test_dgx_run.py`, a test checks that the variable reaches every step and is named.
+
+15 deliberate breaks, all caught; the `dgx-run.sh` one only after its test was added. One more break changed
+nothing (`if given:` for `if given is not None:`; the option never gives an empty list). 268 tests pass.
+
+---
+
 ## Known limitations recorded by the review
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum
@@ -1408,7 +1509,8 @@ scoring per final, and one factorisation per dataset.
 
 ## Open decisions
 
-- SANSA: in or out of the comparison (entry 27). It can be added later without redoing any other run.
+- SANSA: in (Mark, 2026-10-07). It comes from outside this repository as a model plugin, with its section in
+  an extra protocol file (entry 39); its code and settings are private.
 - The retuning spot-check of the ablations after the main runs, if time is left (entries 27 and 36).
 - N8: SASRec's out-of-memory search corner (fixed with H35 in memory; kept here as a check on the DGX).
 

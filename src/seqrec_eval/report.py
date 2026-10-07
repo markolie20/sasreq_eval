@@ -218,34 +218,57 @@ def _split_section(protocol: Protocol, work_dir: Path, dataset: str) -> str:
             + ("" if sampled is None else f"\n\nSearch trials score a fixed sample of {sampled:,} validation rows."))
 
 
-def code_builds(protocol: Protocol, work_dir: Path, dataset: str, models: list[str]) -> dict[str, int]:
-    """The code builds (library and suite) that a dataset's trials and final runs recorded, with run counts."""
-    builds: dict[str, int] = {}
+def _recorded_code(protocol: Protocol, work_dir: Path, dataset: str, models: list[str]):
+    """The ``code`` record of each of a dataset's finished trials and final runs (``None`` where not recorded)."""
     for model in models:
         root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
         records = [spec.directory(work_dir) / "done.json" for spec in plan_trials(protocol, dataset, model)]
         records += [root / f"final-seed{seed}" / "done.json" for seed in final_seeds(protocol, work_dir, dataset)]
         for path in records:
-            if not path.exists():
-                continue
-            code = json.loads(path.read_text()).get("code")
-            key = ("not recorded" if code is None else
-                   f"compresso-recsys {code['library']['version']} (source {code['library']['code_sha256']}), "
-                   f"suite source {code['suite']['code_sha256']}")
-            builds[key] = builds.get(key, 0) + 1
+            if path.exists():
+                yield json.loads(path.read_text()).get("code")
+
+
+def code_builds(protocol: Protocol, work_dir: Path, dataset: str, models: list[str]) -> dict[str, int]:
+    """The code builds (library and suite) that a dataset's trials and final runs recorded, with run counts."""
+    builds: dict[str, int] = {}
+    for code in _recorded_code(protocol, work_dir, dataset, models):
+        key = ("not recorded" if code is None else
+               f"compresso-recsys {code['library']['version']} (source {code['library']['code_sha256']}), "
+               f"suite source {code['suite']['code_sha256']}")
+        builds[key] = builds.get(key, 0) + 1
     return builds
 
 
-def _builds_note(builds: dict[str, int]) -> list[str]:
-    if not builds:
-        return []
+def plugin_builds(protocol: Protocol, work_dir: Path, dataset: str, models: list[str]) -> dict[str, dict[str, int]]:
+    """Per model-plugin package (DECISIONS §39), the builds its runs on a dataset recorded, with run counts."""
+    builds: dict[str, dict[str, int]] = {}
+    for code in _recorded_code(protocol, work_dir, dataset, models):
+        for package, record in ((code or {}).get("plugins") or {}).items():
+            key = f"{package} {record['version']} (source {record['code_sha256']})"
+            builds.setdefault(package, {})[key] = builds.setdefault(package, {}).get(key, 0) + 1
+    return builds
+
+
+def _builds_note(builds: dict[str, int], plugins: dict[str, dict[str, int]] | None = None) -> list[str]:
+    out = []
     if len(builds) == 1:
         (build, count), = builds.items()
-        return ["", f"Code: {build}, for all {count} runs."]
-    listed = "; ".join(f"{build}: {count} runs" for build, count in builds.items())
-    return ["", f"⚠ These results come from {len(builds)} different code builds ({listed}). Runs of one build are "
-                "not comparable with another's unless the difference cannot touch them: rerun the older ones, or "
-                "check (review H05)."]
+        out += ["", f"Code: {build}, for all {count} runs."]
+    elif builds:
+        listed = "; ".join(f"{build}: {count} runs" for build, count in builds.items())
+        out += ["", f"⚠ These results come from {len(builds)} different code builds ({listed}). Runs of one build "
+                    "are not comparable with another's unless the difference cannot touch them: rerun the older "
+                    "ones, or check (review H05)."]
+    for package, found in (plugins or {}).items():
+        if len(found) == 1:
+            (build, count), = found.items()
+            out += ["", f"Model plugin: {build}, for all {count} of its runs."]
+        else:
+            listed = "; ".join(f"{build}: {count} runs" for build, count in found.items())
+            out += ["", f"⚠ Model plugin {package} comes in {len(found)} different builds ({listed}): rerun the "
+                        "older ones, or check that the difference cannot touch them."]
+    return out
 
 
 def _still_improving_runs(work_dir: Path, root: Path, summary, finals) -> list[str]:
@@ -345,7 +368,8 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                       "new-item filter), so they would score 0 for every model."]
     if notes:
         lines += ["", *notes]
-    lines += _builds_note(code_builds(protocol, work_dir, dataset, models))
+    lines += _builds_note(code_builds(protocol, work_dir, dataset, models),
+                          plugin_builds(protocol, work_dir, dataset, models))
 
     if new_rows:
         lines += ["", "Targets not already in the history (diagnostic, `exclude_seen=true`):", "",
@@ -462,7 +486,9 @@ def build_report(protocol: Protocol, work_dir: Path, datasets: list[str], models
     # the full path and the file's hash: a report of a quick local run (work-local/<dataset>/protocol.toml) must
     # not read like one of the real protocol.toml
     digest = hashlib.sha256(protocol.path.read_bytes()).hexdigest()[:12]
-    header = (f"# Stage-1 results\n\nProtocol `{protocol.path.resolve()}` (file sha256 {digest}), version "
+    extras = "".join(f", with the models of `{extra.resolve()}` (file sha256 "
+                     f"{hashlib.sha256(extra.read_bytes()).hexdigest()[:12]})" for extra in protocol.extras)
+    header = (f"# Stage-1 results\n\nProtocol `{protocol.path.resolve()}` (file sha256 {digest}){extras}, version "
               f"{protocol.version}. "
               f"Models are ranked on {protocol.primary_metric}; everything else is a diagnostic (§5.3). "
               "Test values are the mean ± sd over final seeds of the configuration selected on validation"

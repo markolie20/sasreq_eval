@@ -16,6 +16,7 @@ import json
 import math
 import re
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -227,6 +228,8 @@ class Protocol:
     ablations: dict[str, AblationProtocol]
     baselines: dict[str, BaselineProtocol]
     raw: dict[str, Any]
+    #: extra protocol files whose ``[models.*]`` sections were added to this one's (:func:`load_protocol`)
+    extras: tuple[Path, ...] = ()
 
     def dataset(self, name: str) -> DatasetProtocol:
         if name not in self.datasets:
@@ -444,10 +447,37 @@ def _parse_ablation(name: str, table: dict, datasets: dict, models: dict,
     )
 
 
-def load_protocol(path: str | Path) -> Protocol:
+def _add_extra_models(raw: dict[str, Any], extras: tuple[Path, ...]) -> dict[str, Any]:
+    """``raw`` with the ``[models.*]`` sections of the extra protocol files added (DECISIONS §39).
+
+    An extra file holds models and nothing else, and adds a model the protocol does not define: everything that
+    decides how a model is evaluated stays in the protocol itself. A model's fingerprint holds its own section
+    only, so adding one leaves every other model's runs where they are.
+    """
+    if not extras:
+        return raw
+    models = dict(raw.get("models", {}))
+    source = dict.fromkeys(models, "the protocol")
+    for extra in extras:
+        with extra.open("rb") as handle:
+            table = tomllib.load(handle)
+        other = sorted(set(table) - {"models"})
+        if other:
+            raise ProtocolError(f"extra protocol {extra} may only add [models.*] sections; it also has {other}")
+        for name, section in table.get("models", {}).items():
+            if name in models:
+                raise ProtocolError(f"extra protocol {extra} defines [models.{name}], which {source[name]} "
+                                    "already defines")
+            models[name], source[name] = section, str(extra)
+    return {**raw, "models": models}
+
+
+def load_protocol(path: str | Path, extra: Iterable[str | Path] = ()) -> Protocol:
+    """The protocol in ``path``, with the models of any ``extra`` protocol files added (:func:`_add_extra_models`)."""
     path = Path(path)
+    extras = tuple(Path(e) for e in extra)
     with path.open("rb") as handle:
-        raw = tomllib.load(handle)
+        raw = _add_extra_models(tomllib.load(handle), extras)
     _check_keys(raw, "file", "the protocol file")
     top = _require(raw, "protocol", "protocol file")
     _check_keys(top, "protocol", "[protocol]")
@@ -523,4 +553,5 @@ def load_protocol(path: str | Path) -> Protocol:
         ablations=ablations,
         baselines=baselines,
         raw=raw,
+        extras=extras,
     )

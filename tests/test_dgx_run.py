@@ -31,7 +31,8 @@ with open(os.path.join(folder, "lock"), "a") as lock:
             code = int(queue[0])
             open(codes, "w").write(" ".join(queue[1:]))
     with open(os.path.join(folder, "calls.jsonl"), "a") as out:
-        out.write(json.dumps({{"args": rest, "code": code, "pid": os.getpid(), "start": time.time()}}) + "\\n")
+        out.write(json.dumps({{"args": rest, "code": code, "pid": os.getpid(), "start": time.time(),
+                              "extra": os.environ.get("SEQREC_EVAL_PROTOCOL_EXTRA")}}) + "\\n")
 if rest[0] in os.environ.get("FAKE_SLOW", "").split():
     time.sleep(float(os.environ.get("FAKE_SECONDS", "30")))
 with open(os.path.join(folder, "ends.jsonl"), "a") as out:
@@ -147,3 +148,16 @@ def test_stage1_alone_runs_no_sweep(tmp_path):
     assert not _index(calls, "ablate") and not _index(calls, "ablation-report")
     assert [call["args"][1:] for call in calls if call["args"][0] == "analyse"] == [["--sweep", "none"]]
     assert _index(calls, "final") and _index(calls, "latency") and calls[-1]["args"][0] == "status"
+
+
+def test_the_extra_protocol_is_named_and_reaches_every_step(tmp_path):
+    # a model kept out of the repository: its section in an extra protocol file, trained by the CPU process
+    # (DECISIONS §39)
+    done = _run(tmp_path, SWEEPS="none", SEQREC_EVAL_PROTOCOL_EXTRA="/private/protocol.private.toml",
+                CPU_MODELS="popularity ease private_model")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "protocol.toml with the models of /private/protocol.private.toml" in done.stdout
+    calls = _calls(tmp_path)
+    assert {call["extra"] for call in calls} == {"/private/protocol.private.toml"}
+    cpu = [call["args"] for call in calls if call["args"][0] == "search" and "cpu" in call["args"]]
+    assert cpu and all("private_model" in args for args in cpu)

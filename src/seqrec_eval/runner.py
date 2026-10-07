@@ -60,7 +60,7 @@ import numpy as np
 import torch
 
 from .evaluate import evaluate_phase, other_definition, target_key
-from .models import model_spec
+from .models import model_provenance, model_spec
 from .protocol import Protocol
 from .results import (
     evaluation_exists,
@@ -413,7 +413,7 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
     record: dict[str, Any] = {"spec": asdict(spec), "fingerprint": spec.fingerprint,
                               "host": socket.gethostname(), "device": device,
                               "trained_on": split.trained_on, "train_items": len(train_item_ids),
-                              "code": code_provenance()}
+                              "code": {**code_provenance(), **model_provenance(spec.model)}}
     # Under refit the final runs fit the validation catalogue, which is larger: a trial decides on that one
     # too, or a model could be searched in full and then skipped at the final runs.
     catalogue = (len(split.data["val_item_ids"]) if protocol.refit and split.trained_on == "train"
@@ -451,6 +451,14 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
                               exclude_seen=dp.exclude_seen, rows=split.test_rows)
         save_evaluation(test, directory / "test")
         record["test"] = dict(test.metrics)
+        if ablation and dp.new_item_diagnostic:
+            # the next items the user never had, at every level: what a model adds beyond what the user already had
+            # (DECISIONS §38). Seen items are judged on the whole history, so the targets are the same at every
+            # level of a sweep that keeps the item space, and so are the users scored on them.
+            new = evaluate_phase(trainer, split, "test", family=mp.family, protocol=protocol,
+                                 exclude_seen=True, rows=split.test_rows, targets="new")
+            save_evaluation(new, directory / "test_new")
+            record["test_new"] = dict(new.metrics)
     if spec.kind == "final" and not ablation:
         other = other_definition(protocol.targets)
         if split.data.get(target_key("test", other)) is not None:
@@ -475,6 +483,10 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
     history = getattr(trainer, "history", None)
     if history:
         record["history"] = list(history)
+    diagnostics = getattr(trainer, "run_diagnostics", None)
+    if callable(diagnostics):
+        # what a model counts about its own run, over every scoring in it (a plugin's, say: DECISIONS §39)
+        record["model_diagnostics"] = diagnostics()
     if cuda:
         record["peak_gpu_bytes"] = int(torch.cuda.max_memory_allocated(device))
     record["status"] = "done"

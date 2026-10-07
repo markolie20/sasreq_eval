@@ -150,7 +150,8 @@ kill <pid of the script>                                    # stops every proces
 - **Exit codes:** a step whose processes leave work over (exit 3) is repeated, up to `ROUNDS`; a failure stops
   the script with the log to read (`$WORK/logs/<step>-r<round>-<process>.log`) and what to do.
 - Settings and defaults are at the top of the script: `DATASETS`, `SWEEPS`, `LATENCY_THREADS`,
-  `LATENCY_CORES`, `PROTOCOL`.
+  `LATENCY_CORES`, `PROTOCOL`, and `SEQREC_EVAL_PROTOCOL_EXTRA` for models from other packages (list them in
+  `GPU_MODELS` or `CPU_MODELS`).
 
 ### Adding seeds
 
@@ -233,6 +234,28 @@ Two behaviours come with the library and are kept, documented (DECISIONS.md §25
   holds back re-consumption (0.64 of the oracle on a planted chain).
 - Both sequence models search `unk_dropout` in {0, 0.02, 0.05, 0.1} (N7), so the
   embedding of items first seen after training is learned.
+
+### Models from other packages
+
+A model whose code cannot be in this repository comes in as a plugin (DECISIONS.md §39):
+- Its package declares an entry point in the group `seqrec_eval.models`, naming a module that calls
+  `seqrec_eval.models.register` when imported:
+  ```toml
+  [project.entry-points."seqrec_eval.models"]
+  mymodel = "my_package.my_module"
+  ```
+- It is installed into the suite's `.venv`, beside the suite (`uv pip install`). From then on, sync with
+  `uv sync --locked --inexact`: a plain `uv sync` removes every package the lock does not list.
+- Its `[models.*]` section goes in an extra protocol file, which may hold models only. Pass the file with
+  `--protocol-extra FILE`, or set `SEQREC_EVAL_PROTOCOL_EXTRA=FILE` (several files `:`-separated), which
+  `scripts/dgx-run.sh` passes on to every step. Without it, the model is not in the protocol.
+
+Each run of a plugin model records:
+- the plugin's package, and the packages its class names in `provenance_packages`: each one's version, source
+  hash and path;
+- whatever the model's `run_diagnostics()` returns.
+
+`plan` names any plugin that failed to import.
 
 `[baselines.*]` holds the non-learned baselines of §5.2, from `baselines.py`.
 They are evaluation baselines, not models: `analyse` scores them, and every
@@ -518,10 +541,11 @@ for the stage-1 search (and uses its final models) exactly as `final` does.
 sweep of `history_length` at all 10 levels and 3 seeds (it only rescores), and
 the retraining sweeps at seed 0 with 13 levels in all: `history_length`
 `[5, 20, 100, 500]`, `shuffle` `[2, 10, all]`, `density` `[0.25, 0.5]`,
-`repeat_removal` `[0.5, 1.0]` (for the repeat-heavy dataset: it removes nothing
-where users do not repeat) and `catalogue_top` `[0.25, 0.5]`. The stratified
-catalogue sweep is dropped; its code stays. The retraining sweeps run on Music4All
-and OTTO, `repeat_removal` on Music4All alone (DECISIONS §36).
+`repeat_removal` `[0.5, 1.0]` (it removes nothing where users do not repeat) and
+`catalogue_top` `[0.25, 0.5]`. The stratified catalogue sweep is dropped; its code
+stays. The retraining sweeps run on Music4All and OTTO (DECISIONS §36, §38). On
+datasets with `new_item_diagnostic`, every ablation run is also scored on new items
+only (`test_new`), shown as a descriptive section of the sweep's report.
 
 | transform | level | what it does | knee |
 |---|---|---|---|
@@ -733,7 +757,7 @@ work/reports/analysis.md, analysis.csv
 | Missing | How it enters |
 |---|---|
 | Mamba4Rec, ComiRec | implement against the trainer contract, register in `models.py`, add a `[models.*]` section |
-| SANSA (Recombee's implementation) | a matrix-family builder in `models.py` |
+| SANSA (Recombee's implementation) | a model plugin from a private package (Models from other packages) |
 | GRU4Rec proper | `gru` is the library's `SimpleRNN`: GRU4Rec's objective, but full softmax and no BPR-max/TOP1-max loss |
 | Early stopping | not part of the library's trainer contract; `epochs` is a searched hyperparameter instead |
 | Time-based manipulation checks | possible now that timestamps are recovered: span and rate in days, beside *span kept* |
