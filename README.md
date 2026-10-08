@@ -156,7 +156,8 @@ kill <pid of the script>                                    # stops every proces
   MODELS_ONLY=1 GPUS="cpu cpu cpu cpu" GPU_MODELS=slowmodel CPU_MODELS="" scripts/dgx-run.sh > slow.log 2>&1 &
   ```
   That runs only its search, final, diversity and ablations, with logs in `$WORK/logs-models`. The main run does
-  the analysis, latency and the reports. Each run's first line gives its pid, to stop one with `kill <pid>`.
+  the analysis, latency and the reports. Each run's first line gives its pid, to stop one with `kill <pid>`
+  (in a container, `docker exec <container> kill <pid>`: it is the container's pid).
 - Settings and defaults are at the top of the script: `DATASETS`, `SWEEPS`, `LATENCY_THREADS`,
   `LATENCY_CORES`, `PROTOCOL`, and `SEQREC_EVAL_PROTOCOL_EXTRA` for models from other packages (list them in
   `GPU_MODELS` or `CPU_MODELS`).

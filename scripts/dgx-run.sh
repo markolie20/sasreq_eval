@@ -16,8 +16,9 @@
 # Exit codes, per step: 0 done; 3 work left over (another process held a run) repeats the step, up to ROUNDS
 # times; anything else stops the script: 1 a run failed or was refused (see `seqrec-eval status`: rerun with
 # --retry-failed, or accept unrunnable trials with `final --accept-failed`), 130 stopped.
-# Stop it with `kill <pid of this script>` (the first line of its output gives the pid): every process it started
-# stops cleanly, and nothing is counted as a failed attempt.
+# Stop it with `kill <pid of this script>` (the first line of its output gives the pid, as seen where it runs: in a
+# container, `docker exec <container> kill <pid>`): every process it started stops cleanly, and nothing is counted
+# as a failed attempt.
 #
 # MODELS_ONLY=1 runs only the steps that train and score the models named: search, final, their diversity, and
 # each sweep's ablate, then their status. No prepare, analysis, latency or report: the main run does those. It is

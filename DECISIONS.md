@@ -1528,6 +1528,7 @@ With it:
   CPU processes. The run locks keep them apart, here and from the main run.
 - **Logs:** they default to `$WORK/logs-models`, since the log names would otherwise collide with the main run's.
 - **The pid:** the first line of every run now gives the script's pid, so one of two runs can be stopped on its own.
+  In a container it is the container's pid: `docker exec <container> kill <pid>`.
 
 **Why.** A model's finals depend on its own search only. Waiting for every process at each step was a convenience
 of the script, not part of the method.
