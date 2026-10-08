@@ -22,7 +22,7 @@ import numpy as np
 from compresso_recsys.evaluation import EvaluationResult
 from compresso_recsys.stats import compare_models
 
-from .analysis import CONTROLS, floor_of, full_results
+from .analysis import CONTROLS, cold_note, floor_of, full_results
 from .protocol import Protocol
 from .report import _table
 
@@ -95,7 +95,7 @@ def dataset_analysis(protocol: Protocol, work_dir: Path, dataset: str) -> tuple[
     if found["profile"] is None:
         return "\n".join(lines + ["_Not analysed yet: run `seqrec-eval analyse`._"]), rows
 
-    lines += ["### Data profile", "", profile_table(found["profile"]), ""]
+    lines += ["### Data profile", "", profile_table(found["profile"]), "", cold_note(protocol, work_dir, dataset), ""]
 
     baselines = found["baselines"]
     floor = floor_of(baselines, primary, expected=protocol.baselines)

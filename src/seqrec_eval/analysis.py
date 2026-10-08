@@ -32,6 +32,7 @@ Everything is stored under fingerprints, so a rerun computes only what is
 missing, and a changed baseline section starts its own search:
 
     analysis/<dataset>/<dfp[:12]>/profile-<evaluation key[:12]>.json
+    analysis/<dataset>/<dfp[:12]>/cold-histories-<evaluation key[:12]>.json
     analysis/<dataset>/<dfp[:12]>/baselines/<name>/<bfp[:12]>/trial-NNN.json, selected.json, test.{json,npz}
     analysis/<dataset>/<dfp[:12]>/controls/<control>/test.{json,npz}
     ablations/<sweep>/<dataset>/<cfp[:12]>/analysis/<name>/<fp[:12]>/<condition>/test.{json,npz}
@@ -72,7 +73,7 @@ from .baselines import (
     TimeDecayedPopularity,
     TimeDecayedPopularityConfig,
 )
-from .evaluate import evaluate_phase, other_definition, target_key
+from .evaluate import cold_histories, evaluate_phase, other_definition, scored_users, target_key
 from .protocol import BaselineProtocol, Protocol, _digest
 from .results import (
     evaluation_exists,
@@ -248,6 +249,47 @@ def profile_path(protocol: Protocol, work_dir: Path, dataset: str) -> Path:
     return analysis_root(protocol, work_dir, dataset) / f"profile-{protocol.evaluation_key(dataset)[:12]}.json"
 
 
+#: the cold-history count's format; a change counts again
+COLD_VERSION = 1
+
+
+def cold_path(protocol: Protocol, work_dir: Path, dataset: str) -> Path:
+    return analysis_root(protocol, work_dir, dataset) / f"cold-histories-{protocol.evaluation_key(dataset)[:12]}.json"
+
+
+def count_cold_histories(protocol: Protocol, split: Split, tested: Split) -> dict[str, Any]:
+    """Of the users the models are scored on, how many have a history with no item of the training catalogue
+    (:func:`~seqrec_eval.evaluate.cold_histories`): on validation as the search trials score it (``split``, its
+    sample of rows), on test as the final runs do (``tested``, refitted under refit). DECISIONS §40."""
+    exclude = protocol.dataset(split.dataset).exclude_seen
+    phases = {}
+    for phase, data, rows in (("val", split, split.val_rows), ("test", tested, tested.test_rows)):
+        scored = scored_users(data, phase, protocol, exclude_seen=exclude, rows=rows)
+        lengths = np.diff(data.data[f"{phase}_source_matrix"].tocsr().indptr)[scored]
+        phases[phase] = {"trained_on": data.trained_on, "catalogue": len(data.data["train_item_ids"]),
+                         "scored_users": int(scored.size), "all_cold": int(cold_histories(data, phase)[scored].sum()),
+                         "empty": int((lengths == 0).sum())}
+    return {"version": COLD_VERSION, "dataset": split.dataset, "phases": phases}
+
+
+def cold_note(protocol: Protocol, work_dir: Path, dataset: str) -> str:
+    """The cold-history count of ``dataset`` as a sentence for the reports."""
+    path = cold_path(protocol, work_dir, dataset)
+    record = read_json(path) if path.exists() else None
+    if record is None or record.get("version") != COLD_VERSION:
+        return "_All-cold histories not counted yet: run `seqrec-eval analyse --sweep none`._"
+    parts = []
+    for phase in ("test", "val"):
+        found = record["phases"][phase]
+        share = found["all_cold"] / found["scored_users"] if found["scored_users"] else 0.0
+        empty = f", {found['empty']:,} of them with no history at all" if found["empty"] else ""
+        parts.append(f"{found['all_cold']:,} of the {found['scored_users']:,} users scored on {phase} "
+                     f"({share:.2%}){empty}")
+    return ("**All-cold histories** (DECISIONS §40): " + "; ".join(parts) + ". None of their items is in the "
+            "training catalogue, so the matrix models read an empty history and rank them by tie order, while "
+            "the sequence models read the items as unknown.")
+
+
 def analyse_full(protocol: Protocol, work_dir: Path, split: Split, log=print) -> None:
     """Profile, baselines (searched here) and controls on the full data of one dataset.
 
@@ -261,6 +303,10 @@ def analyse_full(protocol: Protocol, work_dir: Path, split: Split, log=print) ->
     if not path.exists():
         write_json(path, {"dataset": split.dataset, "trained_on": tested.trained_on,
                           "characteristics": characteristics(tested, None, target_key("test", protocol.targets))})
+    cold = cold_path(protocol, work_dir, split.dataset)
+    if not cold.exists() or read_json(cold).get("version") != COLD_VERSION:
+        write_json(cold, count_cold_histories(protocol, split, tested))
+        log(f"[{split.dataset}] {cold_note(protocol, work_dir, split.dataset)}")
     other = other_definition(protocol.targets)
     diagnose = tested.data.get(target_key("test", other)) is not None
     for name in protocol.baselines:

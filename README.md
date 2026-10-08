@@ -149,6 +149,14 @@ kill <pid of the script>                                    # stops every proces
   CPU process takes EASE and popularity (`CPU_MODELS`). The run locks keep them apart.
 - **Exit codes:** a step whose processes leave work over (exit 3) is repeated, up to `ROUNDS`; a failure stops
   the script with the log to read (`$WORK/logs/<step>-r<round>-<process>.log`) and what to do.
+- **A slow model beside it (DECISIONS.md §41):** each step waits for all its processes, so a model much slower
+  than the rest holds everything up. Leave it out of the main run and start it separately, in parallel processes
+  of its own:
+  ```bash
+  MODELS_ONLY=1 GPUS="cpu cpu cpu cpu" GPU_MODELS=slowmodel CPU_MODELS="" scripts/dgx-run.sh > slow.log 2>&1 &
+  ```
+  That runs only its search, final, diversity and ablations, with logs in `$WORK/logs-models`. The main run does
+  the analysis, latency and the reports. Each run's first line gives its pid, to stop one with `kill <pid>`.
 - Settings and defaults are at the top of the script: `DATASETS`, `SWEEPS`, `LATENCY_THREADS`,
   `LATENCY_CORES`, `PROTOCOL`, and `SEQREC_EVAL_PROTOCOL_EXTRA` for models from other packages (list them in
   `GPU_MODELS` or `CPU_MODELS`).
@@ -199,7 +207,10 @@ round has run:
      shuffled training histories (order removed) and reversed ones (direction
      removed), and split by whether a test history's last two events tie in
      time. Where they do, which item is "last", the one Markov predicts from,
-     was decided by the source file.
+     was decided by the source file;
+   - **all-cold histories** (full data only): of the users scored on validation and on test, how many have
+     no item of the training catalogue in their history. A matrix model reads such a history as empty and ranks
+     the user by tie order. Both reports give the count.
 3. **`search` / `final`**: the learned models.
 4. **`ablate`**: the learned models at every ablation level.
 
@@ -747,7 +758,7 @@ work/ablations/<sweep>/<dataset>/<cfp>/test_rows.npy, test_rows.json (subsamples
 work/ablations/<sweep>/<dataset>/<cfp>/runs/<model>/<fp>/<level|full>/final-seed1/   done.json, test.{json,npz}
 work/reports/ablation-<sweep>.md, ablation-<sweep>-metrics.csv, ablation-<sweep>-gap.csv, ablation-<sweep>-gap.png
 work/reports/repeat-strata.md, repeat-strata.csv
-work/analysis/<dataset>/<dfp>/profile-<evaluation key>.json, baselines/<name>/<bfp>/{trial-*,selected}.json + test, controls/
+work/analysis/<dataset>/<dfp>/profile-<evaluation key>.json, cold-histories-<evaluation key>.json, baselines/<name>/<bfp>/{trial-*,selected}.json + test, controls/
 work/ablations/<sweep>/<dataset>/<cfp>/analysis/<scorer>/<fp>/<condition>/test.{json,npz}
 work/reports/analysis.md, analysis.csv
 ```

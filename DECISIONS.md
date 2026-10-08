@@ -75,7 +75,7 @@ trial on the DGX would have failed.
 **Side effects.**
 - A test history made only of items first seen after training reaches a matrix model empty, and is ranked by
   tie order, not by popularity. Sequence models read those items as `unk` instead.
-- How many users this affects has not been counted yet. It is a DGX check.
+- How many users this affects has not been counted yet. It is a DGX check. (Counted since entry 40.)
 - The smoke test's synthetic data now contains cold items, so this can no longer pass unnoticed.
 
 **Where.** `evaluate.py` (`phase_inputs`), `latency.py`; `tests/test_smoke.py`. Findings: `H53.md` §A.
@@ -1468,6 +1468,88 @@ In `test_dgx_run.py`, a test checks that the variable reaches every step and is 
 15 deliberate breaks, all caught; the `dgx-run.sh` one only after its test was added. One more break changed
 nothing (`if given:` for `if given is not None:`; the option never gives an empty list). 268 tests pass.
 
+## 40. All-cold histories are counted (2026-10-07, entry 3)
+
+**Change.** `analyse` counts, per dataset, the users whose history holds no item of the training catalogue
+(`all_cold`), and among them those with no history at all (`empty`).
+- **Which users:** exactly those every model's metrics are computed over.
+  - On validation, as the search trials score them: the search split, and its sample of rows.
+  - On test, as the finals score them: the refitted split.
+  - The row selection is shared with `evaluate_phase` (`_select_rows`), so the two cannot differ.
+- **Where it is written:** `analysis/<dataset>/<dfp>/cold-histories-<evaluation key>.json`, once per dataset.
+- **Where it is shown:** a line in the stage-1 report and in the analysis report. Where it is missing, both
+  reports say "not counted yet".
+
+**Why.** Entry 3 left this open. A matrix model reads its input projected onto its training catalogue, so it
+reads such a history as empty and ranks the user by tie order, while a sequence model reads the items as unknown.
+This slightly favours the sequential side. The research design (§6.4) says the share is counted on the stage-1
+data before the results are read.
+
+**Effect.**
+- No fingerprint changes and nothing is redone.
+- An existing work dir gets the count from `analyse --sweep none`, which computes only what is missing. The next
+  `report` shows it.
+- Scoring is unchanged: `evaluate_phase` only moved its row selection into a function.
+
+**Where.** `evaluate.py` (`_select_rows`, `scored_users`, `cold_histories`); `analysis.py`
+(`count_cold_histories`, `cold_note`, `analyse_full`); `report.py`; `analysis_report.py`.
+
+**Tests.**
+- `test_all_cold_histories_are_counted_over_the_users_scored`, on validation rows rewritten to a cold history and
+  an empty one. It checks that:
+  - the counted users are those `evaluate_phase` scores, with and without excluding seen items;
+  - a history counts as cold exactly where the matrix model's input is empty;
+  - test is counted on the refitted split.
+- `test_the_reports_give_the_cold_history_count`: both reports, the "not counted yet" note, and `analyse`
+  filling in only the count.
+
+11 deliberate breaks, all caught. 270 tests pass.
+
+## 41. A slow model runs beside the main run, in processes of its own (2026-10-08)
+
+**What happened.** In run4, SANSA trained on the CPU process beside EASE and popularity. Each step of
+`scripts/dgx-run.sh` waits for all its processes before the next starts, and SANSA's search was far slower than the
+GPU models':
+- one trial (the densest configuration, with the most inverse epochs) ran for more than 11 hours on Amazon, on
+  one core;
+- the same configurations come back on every dataset, since a trial's configuration does not depend on the
+  dataset.
+
+The GPU finished the search at 05:00 on 2026-10-08 and then stood idle, while the finals waited for SANSA.
+
+**Decision (Mark).** SANSA runs separately, in parallel processes, with its search space unchanged.
+
+**Change.** `MODELS_ONLY=1` runs only the steps that train and score the models named, then their status:
+- search, final, their diversity, and each sweep's `ablate`;
+- no prepare, analysis, latency or report, which the main run does.
+
+With it:
+- **The processes:** `GPUS` names one torch device per process, `cpu` included, so `GPUS="cpu cpu cpu cpu"` gives 4
+  CPU processes. The run locks keep them apart, here and from the main run.
+- **Logs:** they default to `$WORK/logs-models`, since the log names would otherwise collide with the main run's.
+- **The pid:** the first line of every run now gives the script's pid, so one of two runs can be stopped on its own.
+
+**Why.** A model's finals depend on its own search only. Waiting for every process at each step was a convenience
+of the script, not part of the method.
+
+**Effect.**
+- No result changes.
+- **The main run:** it leaves SANSA out (no extra protocol), so it moves straight on to the finals.
+- **SANSA's run:** it searches, finalises and ablates SANSA in parallel, as long as SANSA needs; its slowest
+  trial still bounds how long that takes.
+- **Latency:** the main run's latency step will run while SANSA's processes load the CPU. Latency is measured again
+  on a quiet machine once every model is in.
+- **Reports:** they include SANSA only when generated with the extra protocol.
+
+**Where.** `scripts/dgx-run.sh`; README (*The whole suite on the DGX*).
+
+**Tests.**
+- `test_models_only_runs_the_named_models_steps_and_nothing_else`: the steps, their order, the processes, the
+  model selection and the separate logs.
+- The header test checks the pid line.
+
+7 deliberate breaks, all caught.
+
 ---
 
 ## Known limitations recorded by the review
@@ -1483,7 +1565,8 @@ nothing (`if given:` for `if given is not None:`; the option never gives an empt
   events, are left out rather than recorded as the same kind of event as a click. The research design
   (`producten/tussenproducten/research_design.odt`, §5.4) says so since 2026-10-05; it listed three
   interaction types before.
-- **Matrix models rank an all-cold history by tie order** (entry 3); not yet counted.
+- **Matrix models rank an all-cold history by tie order** (entry 3): the users concerned are counted per
+  dataset in both reports (entry 40).
 - **Refitted models use settings chosen on less data** (entry 4).
 - **BERT4Rec keeps its published position numbering** (entries 4 and 36, N1): a user whose history is exactly the
   longest training sequence meets an untrained mask position, where no user fills the window (a handful on

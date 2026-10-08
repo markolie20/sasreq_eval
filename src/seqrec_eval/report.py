@@ -38,7 +38,7 @@ from typing import Any
 import numpy as np
 from compresso_recsys.evaluation import EvaluationResult
 
-from .analysis import floor_of, full_results
+from .analysis import cold_note, floor_of, full_results
 from .evaluate import other_definition
 from .protocol import Protocol
 from .results import read_json
@@ -290,7 +290,8 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
     k = protocol.primary_metric.split("@")[1]
     shown = [protocol.primary_metric] + [f"{m}@{k}" for m in ("recall", "calibrated_recall", "hit_rate")
                                          if m in protocol.metrics and f"{m}@{k}" != protocol.primary_metric]
-    lines = [f"## {dataset}", "", _split_section(protocol, work_dir, dataset), ""]
+    lines = [f"## {dataset}", "", _split_section(protocol, work_dir, dataset), "",
+             cold_note(protocol, work_dir, dataset), ""]
     seeds = final_seeds(protocol, work_dir, dataset)
     if len(seeds) > len(protocol.seeds):
         lines += [f"Seeds {list(seeds)}: the protocol's, and {list(seeds[len(protocol.seeds):])} added later "

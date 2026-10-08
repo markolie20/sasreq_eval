@@ -321,6 +321,51 @@ def _take(source, rows: np.ndarray):
     return source.select_rows(rows) if hasattr(source, "select_rows") else source[rows]
 
 
+def _select_rows(split: Split, phase: str, protocol: Protocol, definition: str, target_matrix: csr_matrix, *,
+                 exclude_seen: bool, rows: np.ndarray | None) -> tuple[np.ndarray | None, int, int]:
+    """The rows :func:`evaluate_phase` scores, of ``rows`` (``None``: every row), and how many of those it left out
+    because no model can recommend their next item, and because they have too few unseen items."""
+    asked = target_matrix.shape[0] if rows is None else len(rows)  # every row, or the given sample
+    scorable = scored_rows(split, phase, definition, exclude_seen=exclude_seen, targets=target_matrix)
+    if scorable is not None:
+        rows = scorable if rows is None else rows[np.isin(rows, scorable)]
+    unrecommendable = 0 if scorable is None else asked - len(rows)
+    too_few_unseen = 0
+    if exclude_seen:
+        # a user who has seen all but fewer than k items of the catalogue cannot be given k unseen ones: left
+        # out and counted, rather than stopping the evaluation (review N49)
+        fills = fills_list(split.data, phase, max(protocol.cutoffs))
+        if not fills.all():
+            before = fills.size if rows is None else len(rows)
+            rows = np.flatnonzero(fills).astype(np.int64) if rows is None else rows[fills[rows]]
+            too_few_unseen = before - len(rows)
+    return rows, unrecommendable, too_few_unseen
+
+
+def scored_users(split: Split, phase: str, protocol: Protocol, *, exclude_seen: bool,
+                 rows: np.ndarray | None = None) -> np.ndarray:
+    """The rows of ``phase`` that :func:`evaluate_phase` scores on the protocol's targets, given the same
+    ``rows`` and ``exclude_seen``: the users every model's metrics are computed over."""
+    targets = phase_targets(split, phase, protocol.targets)
+    selected, _, _ = _select_rows(split, phase, protocol, protocol.targets, targets, exclude_seen=exclude_seen,
+                                  rows=rows)
+    return np.arange(targets.shape[0], dtype=np.int64) if selected is None else selected
+
+
+def cold_histories(split: Split, phase: str) -> np.ndarray:
+    """Per row of ``phase``: does the history hold no item of the training catalogue?
+
+    A matrix model reads its input projected onto that catalogue (:func:`phase_inputs`), so it reads such a
+    history as empty and ranks the user by tie order; a sequence model reads the items as unknown (DECISIONS
+    §3, §40). True also for a row with no history at all.
+    """
+    source = split.data[f"{phase}_source_matrix"].tocsr()
+    limit = len(split.data["train_item_ids"])  # the training catalogue is the first columns of the phase's
+    rows = np.repeat(np.arange(source.shape[0], dtype=np.int64), np.diff(source.indptr))
+    known = np.bincount(rows, weights=(source.indices < limit) & (source.data != 0), minlength=source.shape[0])
+    return known == 0
+
+
 def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protocol: Protocol,
                    exclude_seen: bool, rows: np.ndarray | None = None,
                    targets: str = "primary", lists: list | None = None) -> EvaluationResult:
@@ -338,23 +383,11 @@ def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protoco
                          "so its validation score would be leaked; score it on test")
     definition = protocol.targets if targets in ("primary", "new") else targets
     target_matrix = phase_targets(split, phase, definition)
-    asked = target_matrix.shape[0] if rows is None else len(rows)  # every row, or the given sample
     if targets == "new":
         # against the whole history: a condition's input may be truncated
         target_matrix = new_item_targets(target_matrix, seen_history(split.data, phase))
-    scorable = scored_rows(split, phase, definition, exclude_seen=exclude_seen, targets=target_matrix)
-    if scorable is not None:
-        rows = scorable if rows is None else rows[np.isin(rows, scorable)]
-    unrecommendable = 0 if scorable is None else asked - len(rows)
-    too_few_unseen = 0
-    if exclude_seen:
-        # a user who has seen all but fewer than k items of the catalogue cannot be given k unseen ones: left
-        # out and counted, rather than stopping the evaluation (review N49)
-        fills = fills_list(split.data, phase, max(protocol.cutoffs))
-        if not fills.all():
-            before = fills.size if rows is None else len(rows)
-            rows = np.flatnonzero(fills).astype(np.int64) if rows is None else rows[fills[rows]]
-            too_few_unseen = before - len(rows)
+    rows, unrecommendable, too_few_unseen = _select_rows(split, phase, protocol, definition, target_matrix,
+                                                         exclude_seen=exclude_seen, rows=rows)
     adapter, source = phase_inputs(model, split, phase, family)
     sample_ids = split.eval_user_ids(phase)
     # Seen items are excluded after the model ranks, against the whole history, in every evaluation: inside

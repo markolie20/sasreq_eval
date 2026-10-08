@@ -965,3 +965,69 @@ def test_every_batch_of_a_phase_asks_the_model_for_the_same_length(workspace):
             at = [index[u] for u in np.asarray(result.sample_ids).astype(str)]
             assert np.array_equal(result.per_user[metric], full.per_user[metric][at])
 
+
+
+def test_all_cold_histories_are_counted_over_the_users_scored(workspace):
+    # DECISIONS §40: users whose history holds no training-catalogue item reach a matrix model empty
+    from dataclasses import replace
+
+    from scipy.sparse import csr_matrix
+
+    from seqrec_eval.analysis import count_cold_histories
+    from seqrec_eval.evaluate import cold_histories, phase_inputs, scored_users
+
+    root, _ = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    split = load_split(root / "work", "synth")
+    n_train = len(split.data["train_item_ids"])
+    source = split.data["val_source_matrix"].tolil()
+    assert source.shape[1] > n_train  # the validation catalogue holds items training lacks
+    scored = scored_users(split, "val", protocol, exclude_seen=False, rows=split.val_rows)
+    cold_row, empty_row = int(scored[0]), int(scored[1])
+    source.rows[cold_row], source.data[cold_row] = [n_train, n_train + 1], [1.0, 1.0]  # only items training lacks
+    source.rows[empty_row], source.data[empty_row] = [], []
+    changed = replace(split, data={**split.data, "val_source_matrix": csr_matrix(source)})
+
+    record = count_cold_histories(protocol, changed, final_split(protocol, changed))
+    model = model_spec("ease").build({"l2": 10.0}, n_items=n_train, device="cpu", seed=0)
+    model.fit(changed.data["x_train"], item_ids=changed.data["train_item_ids"])
+    for exclude_seen in (False, True):
+        users = scored_users(changed, "val", protocol, exclude_seen=exclude_seen, rows=changed.val_rows)
+        result = evaluate_phase(model, changed, "val", family="matrix", protocol=protocol,
+                                exclude_seen=exclude_seen, rows=changed.val_rows)
+        assert users.size == result.n_scored_rows  # the users the metrics are computed over
+    # what the matrix model reads: its input projected onto the training catalogue, empty for exactly those users
+    _, read = phase_inputs(model, changed, "val", "matrix")
+    reads_nothing = np.diff(read.indptr) == 0
+    assert np.array_equal(cold_histories(changed, "val"), reads_nothing)
+    users = scored_users(changed, "val", protocol, exclude_seen=False, rows=changed.val_rows)
+    assert record["phases"]["val"] == {"trained_on": "train", "catalogue": n_train, "scored_users": int(users.size),
+                                       "all_cold": int(reads_nothing[users].sum()), "empty": 1}
+    assert reads_nothing[[cold_row, empty_row]].all() and reads_nothing[users].sum() >= 2
+    # test: as the refitted finals are scored, every user (the synthetic data has no all-cold test history)
+    tested = final_split(protocol, split)
+    assert record["phases"]["test"]["trained_on"] == "train+val"
+    assert record["phases"]["test"]["scored_users"] == scored_users(tested, "test", protocol, exclude_seen=False).size
+
+
+def test_the_reports_give_the_cold_history_count(workspace, tmp_path):
+    import shutil
+
+    from seqrec_eval.analysis import cold_path
+
+    root, common = workspace
+    protocol = load_protocol(root / "protocol.toml")
+    record = json.loads(cold_path(protocol, root / "work", "synth").read_text())  # written by `analyse`
+    test = record["phases"]["test"]
+    line = f"**All-cold histories** (DECISIONS §40): {test['all_cold']:,} of the {test['scored_users']:,} users"
+    assert line in (root / "work" / "reports" / "stage1.md").read_text()
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    cold_path(protocol, work, "synth").unlink()
+    local = ["--protocol", str(root / "protocol.toml"), "--work-dir", str(work)]
+    assert cli.main(local + ["report"]) == 0
+    assert "All-cold histories not counted yet" in (work / "reports" / "stage1.md").read_text()
+    assert cli.main(local + ["analyse", "--sweep", "none"]) == 0  # counts what is missing, redoes nothing else
+    assert cli.main(local + ["analysis-report"]) == 0
+    assert line in (work / "reports" / "analysis.md").read_text()
+    assert json.loads(cold_path(protocol, work, "synth").read_text()) == record

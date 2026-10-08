@@ -161,3 +161,27 @@ def test_the_extra_protocol_is_named_and_reaches_every_step(tmp_path):
     assert {call["extra"] for call in calls} == {"/private/protocol.private.toml"}
     cpu = [call["args"] for call in calls if call["args"][0] == "search" and "cpu" in call["args"]]
     assert cpu and all("private_model" in args for args in cpu)
+
+
+def test_models_only_runs_the_named_models_steps_and_nothing_else(tmp_path):
+    # a slow model beside the main run, in processes of its own (DECISIONS §41): SANSA held the main run's GPU idle
+    done = _run(tmp_path, MODELS_ONLY="1", GPUS="cpu cpu cpu", GPU_MODELS="slowmodel", CPU_MODELS="")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "(pid " in done.stdout and "models only: slowmodel" in done.stdout
+    calls = _calls(tmp_path)
+    assert [c["args"][0] for c in calls if c["args"][0] not in ("search", "final", "ablate")] == ["diversity", "status"]
+    for step, extra in (("search", ()), ("final", ()), ("ablate", ("history_length_inference",)),
+                        ("ablate", ("shuffle",))):
+        group = [calls[i]["args"] for i in _index(calls, step, *extra)]
+        assert sorted(args[args.index("--device") + 1] for args in group) == ["cpu", "cpu", "cpu"], (step, extra)
+        assert all(args[args.index("--model") + 1:args.index("--device")] == ["slowmodel"] for args in group)
+    last = lambda command, *e: max(_index(calls, command, *e))  # noqa: E731
+    first = lambda command, *e: min(_index(calls, command, *e))  # noqa: E731
+    assert last("search") < first("final") < last("final") < first("diversity") < first("ablate")
+    assert last("ablate", "history_length_inference") < first("ablate", "shuffle") < last("ablate") < first("status")
+    for command in ("diversity", "status"):
+        (args,) = [c["args"] for c in calls if c["args"][0] == command]
+        assert args[args.index("--model") + 1:][:1] == ["slowmodel"]
+    # its logs apart from the main run's, which use the same names
+    assert (tmp_path / "w" / "logs-models" / "search-r1-gpu2.log").exists()
+    assert not (tmp_path / "w" / "logs").exists()
