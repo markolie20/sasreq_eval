@@ -57,6 +57,20 @@ targets = "next"
 # every `prepare` (seqrec_eval/refit.py). Selected settings are applied
 # unchanged to the larger training set.
 refit = true
+# Decided (2026-10-12, Mark; DECISIONS §42): a selected configuration still
+# improving at its last epoch (training loss down more than 1% over its last
+# tenth of epochs) is trained again at these multiples of its epochs, on the
+# training window and scored on validation like any trial; the best of them on
+# validation is the selection, a tie keeping the shorter run. The same rule for
+# every model; models without `epochs` (EASE, popularity) are never extended.
+# Not in any fingerprint: the search's trials stay, and finals made at the old
+# epochs are moved aside and redone.
+epoch_extension = [2, 4]
+# Decided (2026-10-12, Mark; DECISIONS §43): only a selection whose training
+# loss still fell more than 5% over its last tenth of epochs is extended, not
+# every one the report flags (1%). A budget decision, made after the DGX was
+# lost and after the flags were seen: it extends SASRec and GRU on Yambda.
+epoch_extension_min_fall = 0.05
 eval_batch_size = 128           # speed only; not part of any fingerprint (local: less memory)
 
 [latency]

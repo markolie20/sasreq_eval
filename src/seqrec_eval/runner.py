@@ -20,6 +20,10 @@ an unattended weekend needs:
   skipped afterwards until ``--retry-failed``, so a configuration that runs out
   of memory does not retry itself all weekend.
 
+A selected configuration still improving at its last epoch is trained again at multiples of its epochs
+(``[protocol] epoch_extension``, DECISIONS §42): ``trial-007-x2``, ``trial-007-x4`` beside ``trial-007``, scored on
+validation like any trial, and the best of them on validation is the selection.
+
 Seeds can be added to a dataset after its runs are made. Only the first seed
 enters the fingerprint (it seeds every trial), so ``final --add-seeds 3 4``
 adds ``final-seed3`` and ``final-seed4`` beside the finals already there and
@@ -47,12 +51,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import random
 import socket
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -85,10 +90,21 @@ class RunSpec:
     source_trial: int | None = None
     #: Set on an ablation run: its sweep, level and directory under the work dir.
     condition: dict[str, Any] | None = None
+    #: The multiple of the searched configuration's epochs it trains (DECISIONS §42): 1 for a search trial, and for
+    #: a final run of a configuration selected without extension.
+    epochs_factor: int = 1
 
     @property
     def name(self) -> str:
-        return f"trial-{self.index:03d}" if self.kind == "trial" else f"final-seed{self.seed}"
+        if self.kind != "trial":
+            return f"final-seed{self.seed}"
+        return f"trial-{self.index:03d}" + (f"-x{self.epochs_factor}" if self.epochs_factor != 1 else "")
+
+    @property
+    def selection(self) -> str:
+        """How reports name the configuration: ``#7``, or ``#7 ×2`` when trained at twice its epochs."""
+        return f"#{self.source_trial if self.kind != 'trial' else self.index}" + (
+            f" ×{self.epochs_factor}" if self.epochs_factor != 1 else "")
 
     @property
     def label(self) -> str:
@@ -170,6 +186,7 @@ def add_final_seeds(protocol: Protocol, work_dir: Path, dataset: str, seeds: lis
 # ---------------------------------------------------------------------------
 
 def plan_trials(protocol: Protocol, dataset: str, model: str) -> list[RunSpec]:
+    """The search's trials, ``trial-000`` onwards; without the epoch extensions (:func:`plan_search`)."""
     mp = protocol.model(model)
     fingerprint = protocol.run_fingerprint(dataset, model)
     return [
@@ -177,6 +194,61 @@ def plan_trials(protocol: Protocol, dataset: str, model: str) -> list[RunSpec]:
                 trial_params(protocol, mp, trial), fingerprint)
         for trial in range(mp.trials)
     ]
+
+
+#: The parameter an epoch extension multiplies; a model without it is never extended.
+EPOCHS = "epochs"
+#: a run whose training loss fell by more than this share over the last tenth of its epochs was stopped while still
+#: improving: the epoch grid (SASRec's capped at 100, DECISIONS §32) may hold the model back
+STILL_IMPROVING = 0.01
+
+
+def still_improving(history: list[dict[str, Any]] | None,
+                    threshold: float = STILL_IMPROVING) -> tuple[float, int, int] | None:
+    """``(fall, window, epochs)`` if the training loss fell by more than ``threshold`` (:data:`STILL_IMPROVING`)
+    over the last ``window`` epochs (a tenth of them, at least one), else ``None``; also ``None`` without a loss
+    per epoch (EASE, popularity). A model trained in phases is judged on its last phase."""
+    if not history:
+        return None
+    phase = history[-1].get("phase")
+    losses = [float(h["loss"]) for h in history if h.get("phase") == phase
+              and isinstance(h.get("loss"), (int, float)) and math.isfinite(h["loss"])]
+    if len(losses) < 2:
+        return None
+    window = max(1, round(0.1 * len(losses)))
+    before, last = losses[-window - 1], losses[-1]
+    fall = (before - last) / abs(before) if before else 0.0
+    return (fall, window, len(losses)) if fall > threshold else None
+
+
+def plan_extensions(protocol: Protocol, work_dir: Path, dataset: str, model: str,
+                    base: TrialSummary | None = None) -> list[RunSpec]:
+    """The epoch extensions of the search's selection (DECISIONS §42): its configuration at each multiple of its
+    epochs in ``[protocol] epoch_extension``, as trials (training window, validation only).
+
+    Planned only once the search is complete with nothing failed and open, and only if the selected trial was
+    still improving at its last epoch (:func:`still_improving`, by more than ``[protocol]
+    epoch_extension_min_fall``, DECISIONS §43): a rule fixed in advance, the same for every model, and decided on the
+    training loss of a validation-selected trial, never on test.
+    """
+    if not protocol.epoch_extension:
+        return []
+    base = base if base is not None else _base_summary(protocol, work_dir, dataset, model)
+    best = base.best
+    if (best is None or base.unaccepted or base.done + base.skipped + base.failed < base.planned
+            or EPOCHS not in best.params):
+        return []
+    done = best.directory(work_dir) / "done.json"
+    threshold = STILL_IMPROVING if protocol.epoch_extension_min_fall is None else protocol.epoch_extension_min_fall
+    if not still_improving(read_json(done).get("history"), threshold):
+        return []
+    return [replace(best, params={**best.params, EPOCHS: best.params[EPOCHS] * factor}, epochs_factor=factor)
+            for factor in protocol.epoch_extension]
+
+
+def plan_search(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> list[RunSpec]:
+    """Every run of the search: its trials, then the epoch extensions of its selection once they apply."""
+    return plan_trials(protocol, dataset, model) + plan_extensions(protocol, work_dir, dataset, model)
 
 
 @dataclass
@@ -192,6 +264,12 @@ class TrialSummary:
     failures: list[dict[str, Any]] = field(default_factory=list)
     #: the failures accepted with ``final --accept-failed``, as recorded, or ``None``
     accepted: dict[str, Any] | None = None
+    #: the epoch extensions planned (DECISIONS §42), and the selection before them with its validation value
+    extensions: list[RunSpec] = field(default_factory=list)
+    base_best: RunSpec | None = None
+    base_value: float | None = None
+    #: the validation value of each finished extension, by its multiple of the epochs
+    extension_values: dict[int, float] = field(default_factory=dict)
 
     @property
     def unaccepted(self) -> list[dict[str, Any]]:
@@ -208,23 +286,18 @@ def incomplete_selection_path(protocol: Protocol, work_dir: Path, dataset: str, 
     return run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model)) / "incomplete_selection.json"
 
 
-def summarize_trials(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> TrialSummary:
-    """Finished trials, and the best by validation primary metric (ties: lowest trial).
-
-    A trial that raised, or whose validation score is not a finite number, is
-    failed: it is listed, never selected, and blocks selection until it is
-    rerun or accepted (:func:`plan_finals`).
-    """
-    trials = plan_trials(protocol, dataset, model)
-    summary = TrialSummary(planned=len(trials))
-    accepted = accepted_failures_path(protocol, work_dir, dataset, model)
-    if accepted.exists():
-        summary.accepted = read_json(accepted)
+def _summarize(protocol: Protocol, work_dir: Path, trials: list[RunSpec],
+               summary: TrialSummary | None = None) -> TrialSummary:
+    """``summary`` (a new one if ``None``) with ``trials`` counted in, and its best updated: a later trial must
+    score strictly higher, so a tie keeps the earlier -- the lower trial, the fewer epochs."""
+    summary = summary if summary is not None else TrialSummary(planned=0)
+    summary.planned += len(trials)
     for spec in trials:
         directory = spec.directory(work_dir)
+        name = spec.index if spec.epochs_factor == 1 else f"{spec.index}x{spec.epochs_factor}"
         if (directory / "failed.json").exists() and not (directory / "done.json").exists():
             summary.failed += 1
-            summary.failures.append({"trial": spec.index, "error": read_json(directory / "failed.json")["error"]})
+            summary.failures.append({"trial": name, "error": read_json(directory / "failed.json")["error"]})
             continue
         if not (directory / "done.json").exists():
             continue
@@ -237,13 +310,38 @@ def summarize_trials(protocol: Protocol, work_dir: Path, dataset: str, model: st
         if not np.isfinite(value):
             # a NaN can never be beaten by ">", so it would stay "best" for good (H07)
             summary.failed += 1
-            summary.failures.append({"trial": spec.index, "rerun_repeats_it": True,
+            summary.failures.append({"trial": name, "rerun_repeats_it": True,
                                      "error": f"validation {protocol.primary_metric} is not a finite number ({value})"})
             continue
         summary.done += 1
+        if spec.epochs_factor != 1:
+            summary.extension_values[spec.epochs_factor] = value
         if summary.best_value is None or value > summary.best_value:
             summary.best, summary.best_value = spec, value
     return summary
+
+
+def _base_summary(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> TrialSummary:
+    """The search's trials alone, with the failures accepted for them."""
+    summary = TrialSummary(planned=0)
+    accepted = accepted_failures_path(protocol, work_dir, dataset, model)
+    if accepted.exists():
+        summary.accepted = read_json(accepted)
+    return _summarize(protocol, work_dir, plan_trials(protocol, dataset, model), summary)
+
+
+def summarize_trials(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> TrialSummary:
+    """Finished trials, and the best by validation primary metric (ties: lowest trial), counting the epoch
+    extensions of the selection once they apply (:func:`plan_extensions`).
+
+    A trial that raised, or whose validation score is not a finite number, is
+    failed: it is listed, never selected, and blocks selection until it is
+    rerun or accepted (:func:`plan_finals`).
+    """
+    summary = _base_summary(protocol, work_dir, dataset, model)
+    summary.base_best, summary.base_value = summary.best, summary.best_value
+    summary.extensions = plan_extensions(protocol, work_dir, dataset, model, base=summary)
+    return _summarize(protocol, work_dir, summary.extensions, summary)
 
 
 def plan_finals(protocol: Protocol, work_dir: Path, dataset: str, model: str, *,
@@ -277,7 +375,8 @@ def plan_finals(protocol: Protocol, work_dir: Path, dataset: str, model: str, *,
         )
     if open_failures:
         path = accepted_failures_path(protocol, work_dir, dataset, model)
-        write_json(path, {"trials": sorted(f["trial"] for f in summary.failures), "failures": summary.failures,
+        write_json(path, {"trials": sorted((f["trial"] for f in summary.failures), key=str),
+                          "failures": summary.failures,
                           "accepted_at": time.strftime("%Y-%m-%d %H:%M:%S"), "host": socket.gethostname()})
     finished = summary.done + summary.skipped + summary.failed
     if finished < summary.planned and not allow_incomplete:
@@ -296,7 +395,8 @@ def plan_finals(protocol: Protocol, work_dir: Path, dataset: str, model: str, *,
                    {"finished": finished, "planned": summary.planned, "selected_trial": best.index,
                     "at": time.strftime("%Y-%m-%d %H:%M:%S"), "host": socket.gethostname()})
     return [
-        RunSpec(dataset, model, "final", seed, seed, best.params, best.fingerprint, source_trial=best.index)
+        RunSpec(dataset, model, "final", seed, seed, best.params, best.fingerprint, source_trial=best.index,
+                epochs_factor=best.epochs_factor)
         for seed in final_seeds(protocol, work_dir, dataset)
     ]
 
@@ -521,8 +621,45 @@ def made_with_another_selection(spec: RunSpec, directory: Path) -> str | None:
     made = read_json(directory / "spec.json")
     if made.get("source_trial") == spec.source_trial and made.get("params") == spec.params:
         return None
-    return (f"Made with trial {made.get('source_trial')}'s configuration, but trial {spec.source_trial} is selected "
-            f"now, so its results describe another model. Move {directory} aside to redo it with the selection.")
+
+    def named(trial, factor) -> str:
+        return f"trial {trial}" + (f" ×{factor}" if factor and factor != 1 else "")
+
+    return (f"Made with {named(made.get('source_trial'), made.get('epochs_factor'))}'s configuration, but "
+            f"{named(spec.source_trial, spec.epochs_factor)} is selected now, so its results describe another "
+            f"model. Move {directory} aside to redo it with the selection.")
+
+
+def differs_in_epochs_only(spec: RunSpec, directory: Path) -> bool:
+    """Whether the stage-1 final in ``directory`` was made with ``spec``'s configuration at another number of
+    epochs: the selection moved by an epoch extension (DECISIONS §42), not to another configuration."""
+    if spec.kind != "final" or spec.condition is not None or not (directory / "spec.json").exists():
+        return False
+    made = read_json(directory / "spec.json")
+    params = made.get("params") or {}
+    return (made.get("source_trial") == spec.source_trial and params.get(EPOCHS) != spec.params.get(EPOCHS)
+            and {k: v for k, v in params.items() if k != EPOCHS}
+            == {k: v for k, v in spec.params.items() if k != EPOCHS})
+
+
+def _supersede(spec: RunSpec, directory: Path, log=print) -> bool:
+    """Move a stage-1 final made at another number of epochs aside (``final-seed0.superseded-<time>``), keeping
+    its records but not its model file, so it is redone with the selection; ``False`` if another process holds it.
+    """
+    lock = RunLock(directory)
+    if not lock.acquire():
+        return False
+    try:
+        if not ((directory / "done.json").exists() and differs_in_epochs_only(spec, directory)):
+            return True  # moved aside already, by another process
+        target = directory.with_name(f"{directory.name}.superseded-{time.strftime('%Y%m%d-%H%M%S')}")
+        directory.rename(target)
+        (target / "model.zip").unlink(missing_ok=True)  # disk: the records stay, the superseded model goes
+    finally:
+        lock.release()
+    log(f"[{spec.dataset}/{spec.model}] {spec.label}: made at other epochs than the selection "
+        f"({spec.selection}, DECISIONS §42); moved aside to {target.name}, without its model, and redone")
+    return True
 
 
 def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
@@ -530,6 +667,9 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
     """Run ``spec`` unless it is finished, failed before, or claimed elsewhere."""
     _check_training(spec, split, protocol)
     directory = spec.directory(work_dir)
+    if (directory / "done.json").exists() and differs_in_epochs_only(spec, directory):
+        if not _supersede(spec, directory, log=log):
+            return "running-elsewhere"
     if (directory / "done.json").exists():
         stale = made_with_another_selection(spec, directory)
         if stale:
@@ -619,9 +759,11 @@ def stale_final_seeds(protocol: Protocol, work_dir: Path, dataset: str, model: s
     stale = []
     for seed in final_seeds(protocol, work_dir, dataset):
         directory = root / f"final-seed{seed}"
-        if ((directory / "done.json").exists() and (directory / "spec.json").exists()
-                and read_json(directory / "spec.json").get("source_trial") != best.index):
-            stale.append(seed)
+        if (directory / "done.json").exists() and (directory / "spec.json").exists():
+            made = read_json(directory / "spec.json")
+            # the configuration, epochs included: an epoch extension keeps the trial but changes the epochs
+            if made.get("source_trial") != best.index or made.get("params") != best.params:
+                stale.append(seed)
     return stale
 
 

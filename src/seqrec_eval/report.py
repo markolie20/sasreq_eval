@@ -31,7 +31,6 @@ import csv
 import hashlib
 import io
 import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -42,13 +41,15 @@ from .analysis import cold_note, floor_of, full_results
 from .evaluate import other_definition
 from .protocol import Protocol
 from .results import read_json
-from .runner import (
+from .runner import (  # noqa: F401  (STILL_IMPROVING, still_improving: read from here by the tests)
+    STILL_IMPROVING,
     RunLock,
     final_seeds,
     incomplete_selection_path,
     load_final_evaluations,
+    plan_search,
     stale_final_seeds,
-    plan_trials,
+    still_improving,
     run_root,
     summarize_trials,
 )
@@ -59,28 +60,6 @@ from .splits import PHASES, split_dir
 #: Significance level and interval coverage of every comparison in the reports.
 ALPHA = 0.05
 CONFIDENCE = 1.0 - ALPHA
-#: a run whose training loss fell by more than this share over the last tenth of its epochs was stopped while still
-#: improving: the epoch grid (SASRec's capped at 100, DECISIONS §32) may hold the model back
-STILL_IMPROVING = 0.01
-
-
-def still_improving(history: list[dict[str, Any]] | None) -> tuple[float, int, int] | None:
-    """``(fall, window, epochs)`` if the training loss fell by more than :data:`STILL_IMPROVING` over the last
-    ``window`` epochs (a tenth of them, at least one), else ``None``; also ``None`` without a loss per epoch
-    (EASE, popularity). A model trained in phases is judged on its last phase."""
-    if not history:
-        return None
-    phase = history[-1].get("phase")
-    losses = [float(h["loss"]) for h in history if h.get("phase") == phase
-              and isinstance(h.get("loss"), (int, float)) and math.isfinite(h["loss"])]
-    if len(losses) < 2:
-        return None
-    window = max(1, round(0.1 * len(losses)))
-    before, last = losses[-window - 1], losses[-1]
-    fall = (before - last) / abs(before) if before else 0.0
-    return (fall, window, len(losses)) if fall > STILL_IMPROVING else None
-
-
 def mean_over_seeds(evaluations: list[EvaluationResult]) -> EvaluationResult:
     first = evaluations[0]
     for other in evaluations[1:]:
@@ -169,14 +148,14 @@ def status_table(protocol: Protocol, work_dir: Path, datasets: list[str], models
     for dataset in datasets:
         prepared = (split_dir(work_dir, dataset) / "split_info.json").exists()
         for model in models:
-            trials = plan_trials(protocol, dataset, model)
+            trials = plan_search(protocol, work_dir, dataset, model)
             summary = summarize_trials(protocol, work_dir, dataset, model)
             running = sum(RunLock(spec.directory(work_dir)).held_by_other() for spec in trials)
             root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
             seeds = final_seeds(protocol, work_dir, dataset)
             finals = sum((root / f"final-seed{seed}" / "done.json").exists() for seed in seeds)
             skipped = summary.planned and summary.skipped == summary.planned
-            best = "—" if summary.best is None else f"#{summary.best.index} ({summary.best_value:.4f})"
+            best = "—" if summary.best is None else f"{summary.best.selection} ({summary.best_value:.4f})"
             rows.append([
                 dataset, model, "yes" if prepared else "no",
                 f"{summary.done + summary.skipped}/{summary.planned}", summary.failed, running,
@@ -222,7 +201,7 @@ def _recorded_code(protocol: Protocol, work_dir: Path, dataset: str, models: lis
     """The ``code`` record of each of a dataset's finished trials and final runs (``None`` where not recorded)."""
     for model in models:
         root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
-        records = [spec.directory(work_dir) / "done.json" for spec in plan_trials(protocol, dataset, model)]
+        records = [spec.directory(work_dir) / "done.json" for spec in plan_search(protocol, work_dir, dataset, model)]
         records += [root / f"final-seed{seed}" / "done.json" for seed in final_seeds(protocol, work_dir, dataset)]
         for path in records:
             if path.exists():
@@ -273,7 +252,7 @@ def _builds_note(builds: dict[str, int], plugins: dict[str, dict[str, int]] | No
 
 def _still_improving_runs(work_dir: Path, root: Path, summary, finals) -> list[str]:
     """The selected trial and the finals whose training loss was still falling at the last epoch, described."""
-    runs = [(f"selected trial #{summary.best.index}", summary.best.directory(work_dir))] if summary.best else []
+    runs = [(f"selected trial {summary.best.selection}", summary.best.directory(work_dir))] if summary.best else []
     runs += [(f"final seed {spec.seed}", root / f"final-seed{spec.seed}") for spec, _ in finals]
     out = []
     for label, directory in runs:
@@ -305,7 +284,7 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
         finals = load_final_evaluations(protocol, work_dir, dataset, model)  # without stale finals (review N33)
         stale = stale_final_seeds(protocol, work_dir, dataset, model)
         per_metric = {name: [e.metrics[name] for _, e in finals] for name in shown}
-        best = "—" if summary.best is None else f"#{summary.best.index}"
+        best = "—" if summary.best is None else summary.best.selection
         val = "—" if summary.best_value is None else f"{summary.best_value:.4f}"
         rows.append([model, f"{summary.done}/{summary.planned}", best, val,
                      len(finals) if len(finals) == len(seeds) else f"{len(finals)}/{len(seeds)}"]
@@ -327,13 +306,23 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                          f"of {record['planned']} trials, `final --allow-incomplete`), so with a smaller budget than "
                          "the others" + ("; the search has finished since." if summary.done + summary.skipped
                                          + summary.failed >= summary.planned else "."))
+        if summary.extensions:
+            values = [f"{summary.base_value:.4f} (×1)"] + [
+                f"{summary.extension_values[f.epochs_factor]:.4f} (×{f.epochs_factor})"
+                if f.epochs_factor in summary.extension_values else f"pending (×{f.epochs_factor})"
+                for f in summary.extensions]
+            notes.append(f"- **{model}**: the selected trial {summary.base_best.selection} was still improving at its "
+                         "last epoch, so it was also trained at "
+                         + " and ".join(f"{f.epochs_factor}×" for f in summary.extensions)
+                         + f" its epochs (DECISIONS §42). Validation {protocol.primary_metric}: {', '.join(values)}; "
+                         f"{summary.best.selection} is selected.")
         improving = _still_improving_runs(work_dir, root, summary, finals)
         if improving:
             notes.append(f"- ⚠ **{model}**: still improving when training stopped: {'; '.join(improving)}. The epoch "
                          "cap may hold it back: it could score higher with longer training.")
         if stale:
             notes.append(f"- ⛔ **{model}**: final seed(s) {stale} were made with another trial's configuration than "
-                         f"the one selected now (#{summary.best.index}), so they describe another model. They are "
+                         f"the one selected now ({summary.best.selection}), so they describe another model. They are "
                          "left out of its values and every comparison; `final` refuses them until they are moved "
                          "aside and redone.")
         failed = [seed for seed in seeds if (root / f"final-seed{seed}" / "failed.json").exists()]

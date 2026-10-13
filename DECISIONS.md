@@ -1551,6 +1551,118 @@ of the script, not part of the method.
 
 7 deliberate breaks, all caught.
 
+## 42. Epoch extensions for selections still improving (2026-10-12)
+
+**What the first finals showed.** 13 selected configurations were still improving at their last epoch (the §34
+flag):
+- ELSA on ML-20M; GRU, SASRec and BERT4Rec on Amazon; SASRec and BERT4Rec on Music4All;
+- ELSA, GRU, SASRec and BERT4Rec on Yambda; GRU and BERT4Rec on OTTO.
+
+Most fell 1–3% over their last epoch. SASRec on Yambda fell 18% over its last 5 of 50 epochs, and GRU 5% over
+its last. An epoch is one pass over the training users, and Yambda has only 4,056 of them, so 50 epochs is about
+1,600 optimizer steps.
+
+**Decision (Mark).** Every flagged selection gets more epochs: its own configuration retrained at 2× and 4× its
+epochs, the best of 1×, 2× and 4× on validation kept. The other option, rerunning each flagged search with a longer
+epoch list, cost several times as much.
+
+**Change.**
+- **The setting:** `[protocol] epoch_extension = [2, 4]`.
+- **When an extension runs:** once a model's search is complete, with nothing failed and open, and its selected
+  trial's training loss was still falling (§34's rule). `search` then trains that configuration at each multiple of
+  its epochs, as trials: `trial-007-x2`, `trial-007-x4`, on the training window, validation only.
+- **Selection:** the best of the selected trial and its extensions on validation. A tie keeps the shorter run.
+  `final` waits for the extensions, as it waits for the search.
+- **Which models:** only those with an `epochs` parameter, so EASE, popularity and SANSA are never extended.
+- **Finals already made:** a final whose configuration differs from the selection only in its epochs is moved
+  aside (`final-seed0.superseded-<time>`) and redone. Its records stay; its model file is deleted to save disk. A
+  final made with another trial is still refused, as before (A3).
+- **Records:**
+  - every run records `epochs_factor`;
+  - the report names the selection `#7 ×2`, with a note giving each extension's validation score;
+  - `status` counts the extensions among the trials;
+  - stale finals are judged on the whole configuration, epochs included, not only the trial.
+- **The flag rule** (`still_improving`) moved from `report.py` to `runner.py`, unchanged; `report.py` still
+  exports it.
+
+**Why.**
+- The flag showed under-training, so it is better acted on than only reported.
+- Validation decides, not the training loss, because a falling training loss can also mean overfitting.
+- The rule is fixed in advance and the same for every model. A flagged model gets up to two more validation trials,
+  a slightly larger selection than the others' 10; it is kept this small for that reason.
+
+**Effect.**
+- The setting is in no fingerprint: every fingerprint was checked identical before and after. The 10 trials of
+  every search stay, and only the extensions and the finals of a changed selection run.
+- **When:** before the sweeps, which reuse the selected configuration. The GPU models' sweeps had not started yet,
+  so nothing there is redone. SANSA has no `epochs`, so its finished sweeps are untouched.
+- **Cost:** about 40–80 GPU-hours with the redone finals; most pairs are cheap, BERT4Rec on Music4All and Yambda
+  is the expensive part. If a longer configuration wins on Music4All or OTTO, its ablation refits cost
+  proportionally more.
+
+**Where.**
+- `runner.py`: `plan_extensions`, `plan_search`, `_summarize`, `differs_in_epochs_only`, `_supersede`,
+  `RunSpec.epochs_factor`, `RunSpec.selection`, `stale_final_seeds`.
+- `protocol.py`; `cli.py` (`search`); `report.py` (report, status).
+- Both protocols; README (the guarantees).
+
+**Tests.** `tests/test_extension.py`:
+- the setting is checked and moves no fingerprint;
+- extensions wait for a complete search with nothing open, and need a selection still improving and an `epochs`
+  parameter;
+- a tie keeps the shorter run, and the finals wait for the extensions;
+- a failed extension blocks selection until accepted, beside a failed trial;
+- end to end: the search trains the extensions on the training window only, finals made at the old epochs are
+  moved aside without their model and redone, another model's finals are untouched, and the report names the
+  selection;
+- a final made with another trial is still refused, even one that differs from the selection only in epochs.
+
+16 deliberate breaks. Two survived at first, and both tests were strengthened; all are caught now. 280 tests pass.
+
+## 43. Only clearly unconverged selections are extended; the suite moves to an RTX 2060 (2026-10-12)
+
+**What happened.** The DGX is no longer available. The rest of the suite runs on Mark's own PC: one RTX 2060
+(6 GB, roughly 0.4 of a V100 for this work, an estimate) and 64 GB of RAM. What was left came to 260–410
+V100-hours; a week on the 2060 is about 65.
+
+**Decision (Mark).** The suite is cut to fit one week (the plan of 2026-10-12):
+- **Stage 1 is finished:** diversity, the history-length inference sweep, the remaining finals, latency on the
+  PC's CPU.
+- **Epoch extensions:** only for a selection whose training loss still fell more than 5% over its last tenth of
+  epochs.
+- **Retraining ablations:** on Music4All and OTTO, three sweeps (`history_length`, `shuffle`, `repeat_removal`),
+  for ELSA, GRU and SASRec, and for BERT4Rec on OTTO only. Popularity and EASE run them as before.
+- **SASRec v2:** a full stage 1 on Music4All, Yambda and OTTO.
+- **LRURec:** latency only.
+
+**Change (this entry).** `[protocol] epoch_extension_min_fall = 0.05`: the training-loss fall over the last tenth
+of epochs above which a selection is extended. Without it, the report's 1% flag decides, as in §42.
+
+**Why 5%.** The 13 selections the report flags fall into two groups:
+- **Clearly unconverged:** SASRec on Yambda fell 17.6% over its last tenth of epochs, GRU on Yambda 5.8%.
+- **Mild:** the other 11 fell 1–3% over their last epoch, mostly in runs whose few epochs validation preferred.
+
+At 5% exactly the first group is extended: checked on the DGX records. The threshold was chosen after seeing the
+flags, for the budget; it is recorded as that, not as a rule fixed in advance.
+
+**Effect.**
+- 4 extension trials (2× and 4×) instead of 26, about 3 V100-hours.
+- No fingerprint changes.
+- The other 11 flags stay in the report as they are.
+
+**Where.** `protocol.py`; `runner.py` (`still_improving` takes a threshold; `plan_extensions`); both protocols.
+
+**Tests.** `test_only_a_selection_falling_more_than_the_threshold_is_extended`: a 3% fall is extended at the
+default and not at 5%, a 50% fall at both; no fingerprint moves; bad values are refused. 4 deliberate breaks, all
+caught. 281 tests pass.
+
+**Limitations to record:**
+- **Cut entirely:** the GPU models' `density` and `catalogue_top` sweeps (SANSA's exist, and are reported as
+  SANSA's only), and BERT4Rec's Music4All ablations.
+- **Kept smaller:** SASRec v2 on three datasets and without ablations; LRURec untrained beyond latency.
+- **Mixed hardware:** runs on two GPUs (V100 and RTX 2060), which every run's host records; latency is measured
+  on the PC's CPU.
+
 ---
 
 ## Known limitations recorded by the review
@@ -1585,7 +1697,7 @@ of the script, not part of the method.
   main runs (final review E).
 - **Users whose next item they already had are not scored where seen items are excluded** (entry 26, C4).
 - **The budget (entry 32):** 10 search trials per model; SASRec trained for at most 100 epochs (the report
-  flags a selected run still improving, entry 34); retraining ablations at one seed, with tests over users
+  flags a selected run still improving, entry 34, and such a selection is trained at 2× and 4× its epochs, entry 42); retraining ablations at one seed, with tests over users
   only, at 13 levels where there were 28, and on the datasets chosen after the timing.
 - **At the smallest catalogues, the heaviest users are not scored where seen items are excluded**
   (entry 30, N49): they have seen all but fewer than k of the catalogue. Their number is in each run's

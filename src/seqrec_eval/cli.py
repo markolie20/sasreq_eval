@@ -70,7 +70,7 @@ from .models import PLUGIN_ERRORS, model_spec
 from .protocol import load_protocol
 from .report import build_report, status_table
 from .results import read_json
-from .runner import add_final_seeds, execute, final_seeds, plan_finals, plan_trials
+from .runner import add_final_seeds, execute, final_seeds, plan_extensions, plan_finals, plan_trials
 from .splits import final_split, load_split, prepare_split, split_dir
 from .strata import build_strata_report
 
@@ -332,6 +332,13 @@ def _main(argv: list[str] | None) -> int:
                     status = execute(spec, split, protocol, work_dir, device=args.device,
                                      retry_failed=args.retry_failed, log=_log)
                     counts[status] = counts.get(status, 0) + 1
+                if args.command == "search":
+                    # the selection's epoch extensions, once its trials are all done (DECISIONS §42): planned only
+                    # now, so a search that finishes its trials here extends their selection in the same run
+                    for spec in plan_extensions(protocol, work_dir, dataset, model):
+                        status = execute(spec, split, protocol, work_dir, device=args.device,
+                                         retry_failed=args.retry_failed, log=_log)
+                        counts[status] = counts.get(status, 0) + 1
             del split
         _log("finished: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
         return _exit_code(counts)

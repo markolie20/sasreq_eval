@@ -458,6 +458,16 @@ Windows and time decay use only differences, so that is harmless.
   epoch grids cap training (SASRec at 100 epochs, DECISIONS §32), so the stage-1
   report flags ⚠ a selected trial or final whose training loss still fell by more
   than 1% over its last tenth of epochs: the cap may hold that model back.
+- **Epoch extensions (DECISIONS §42).** Once a search is complete, a selected trial
+  that was still improving is trained again at the multiples of its epochs in
+  `[protocol] epoch_extension` (2× and 4×), if its loss still fell more than
+  `epoch_extension_min_fall` (5%, DECISIONS §43): `trial-007-x2`, `trial-007-x4`, on the
+  training window and scored on validation like any trial. The best on validation
+  is the selection (a tie keeps the shorter run); `final` waits for them. It is
+  one rule for every model, decided on validation, never on test. Finals made at
+  the old epochs are moved aside (`final-seed0.superseded-<time>`, records kept,
+  model file deleted for disk) and redone; a final made with another trial is still
+  refused. The report names each extension and its validation score.
 - **Frozen means checked.** Each run is stored under a fingerprint of the
   protocol sections that determine its result. Editing a section starts fresh
   runs for exactly the (dataset, model) pairs it affects, and the report only

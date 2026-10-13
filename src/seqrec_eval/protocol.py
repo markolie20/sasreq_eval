@@ -70,7 +70,8 @@ class ProtocolError(ValueError):
 _ALLOWED_KEYS = {
     "file": {"protocol", "latency", "datasets", "models", "ablations", "baselines", "repeat_strata"},
     "protocol": {"version", "cutoffs", "metrics", "primary_metric", "seeds", "trials_per_model", "search_seed",
-                 "max_val_users", "targets", "refit", "eval_batch_size"},
+                 "max_val_users", "targets", "refit", "eval_batch_size", "epoch_extension",
+                 "epoch_extension_min_fall"},
     "latency": {"history_bins", "requests_per_bin", "warmup_requests"},
     "datasets": {"builder", "temporal_period_hours", "train_users", "min_user_support", "item_min_support",
                  "min_value_to_keep", "set_all_values_to", "exclude_seen", "new_item_diagnostic",
@@ -230,6 +231,13 @@ class Protocol:
     raw: dict[str, Any]
     #: extra protocol files whose ``[models.*]`` sections were added to this one's (:func:`load_protocol`)
     extras: tuple[Path, ...] = ()
+    #: epoch multiples tried on a selected configuration still improving at its last epoch (DECISIONS §42); not in
+    #: any fingerprint, so the search's trials stay where they are, and a final made under another selection is
+    #: caught when it runs (:func:`~seqrec_eval.runner.made_with_another_selection`)
+    epoch_extension: tuple[int, ...] = ()
+    #: how much a selected trial's training loss must still have fallen over its last tenth of epochs to be extended
+    #: (DECISIONS §43); ``None`` is the report's own flag, 1% (:data:`~seqrec_eval.runner.STILL_IMPROVING`)
+    epoch_extension_min_fall: float | None = None
 
     def dataset(self, name: str) -> DatasetProtocol:
         if name not in self.datasets:
@@ -510,6 +518,16 @@ def load_protocol(path: str | Path, extra: Iterable[str | Path] = ()) -> Protoco
         # numpy's global seed must be non-negative: a negative one would fail at the first run, not here
         raise ProtocolError("[protocol].seeds must be a non-empty list of distinct non-negative integers")
     trials_per_model = int(_require(top, "trials_per_model", "[protocol]"))
+    extension = top.get("epoch_extension", [])
+    if (not isinstance(extension, list) or len(set(extension)) != len(extension)
+            or not all(isinstance(f, int) and not isinstance(f, bool) and f >= 2 for f in extension)):
+        raise ProtocolError(f"[protocol].epoch_extension must be a list of distinct integers of at least 2 (the "
+                            f"multiples of a selected configuration's epochs to try), got {extension!r}")
+    min_fall = top.get("epoch_extension_min_fall")
+    if min_fall is not None and (isinstance(min_fall, bool) or not isinstance(min_fall, (int, float))
+                                 or not 0 < min_fall < 1):
+        raise ProtocolError(f"[protocol].epoch_extension_min_fall must be a share between 0 and 1 (0.05 is a 5% fall "
+                            f"of the training loss), got {min_fall!r}")
     max_val_users = top.get("max_val_users")
     # Required, with no default: a missing key once silently ran another protocol (review H11).
     for key, meaning in (("targets", '"next" (the next item) or "window" (everything in the window)'),
@@ -554,4 +572,6 @@ def load_protocol(path: str | Path, extra: Iterable[str | Path] = ()) -> Protoco
         baselines=baselines,
         raw=raw,
         extras=extras,
+        epoch_extension=tuple(sorted(extension)),
+        epoch_extension_min_fall=None if min_fall is None else float(min_fall),
     )
