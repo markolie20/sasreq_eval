@@ -260,6 +260,9 @@ def _main(argv: list[str] | None) -> int:
             for model in models:
                 mp = protocol.model(model)
                 registered = "registered" if _registered(model) else "NOT REGISTERED"
+                if not mp.runs_on(dataset):
+                    print(f"  {model:<16} {mp.family:<8} not run here ([models.{model}] datasets)  [{registered}]")
+                    continue
                 runs = mp.trials + len(seeds)
                 total += runs
                 print(f"  {model:<16} {mp.family:<8} {mp.trials:>3} trials + {len(seeds)} finals"
@@ -317,6 +320,9 @@ def _main(argv: list[str] | None) -> int:
             if args.command == "final":
                 split = final_split(protocol, split)  # refitted on train+validation when the protocol says so
             for model in models:
+                if not protocol.model(model).runs_on(dataset):
+                    _log(f"[{dataset}/{model}] {protocol.model(model).not_run_reason(dataset)}")
+                    continue
                 if args.command == "search":
                     specs = plan_trials(protocol, dataset, model)
                 else:
@@ -461,6 +467,8 @@ def _main(argv: list[str] | None) -> int:
         for dataset in datasets:
             split = final_split(protocol, load_split(work_dir, dataset, protocol))
             for model in models:
+                if not protocol.model(model).runs_on(dataset):
+                    continue
                 measure_diversity(protocol, work_dir, split, model, device=args.device, force=args.force, log=_log)
             del split
         return 0
@@ -470,6 +478,8 @@ def _main(argv: list[str] | None) -> int:
         for dataset in datasets:
             split = final_split(protocol, load_split(work_dir, dataset, protocol))
             for model in models:
+                if not protocol.model(model).runs_on(dataset):
+                    continue
                 try:
                     result = benchmark(protocol, work_dir, split, model, threads=args.threads, cores=cores)
                 except FileNotFoundError as error:

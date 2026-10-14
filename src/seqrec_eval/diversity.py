@@ -146,6 +146,8 @@ def diversity_table(protocol: Protocol, work_dir: Path, datasets: list[str], mod
     lines = [f"| dataset | model | seeds | coverage@{k} | intra-list diversity@{k} |", "|---|---|---|---|---|"]
     for dataset in datasets:
         for model in models:
+            if not protocol.model(model).runs_on(dataset):
+                continue
             root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
             stale = stale_final_seeds(protocol, work_dir, dataset, model)
             records = [read_json(diversity_path(root / f"final-seed{seed}"))

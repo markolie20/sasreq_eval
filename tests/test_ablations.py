@@ -721,6 +721,37 @@ def test_every_sweep_has_a_report(workspace):
     assert len(rows) - 1 == 2 * 2  # two history bins × two repeat bins
 
 
+def test_a_model_kept_out_of_the_sweeps_runs_in_none_and_is_reported_in_none(workspace, tmp_path):
+    # SASRec v2 has stage-1 runs and no ablation runs (DECISIONS §45): every sweep, ablate and report leave it out,
+    # and every other model's sweeps, conditions and runs stay where they are
+    import shutil
+
+    from test_smoke import SASREC_CE
+
+    root, _, before = workspace
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    path = tmp_path / "protocol.toml"
+    path.write_text(PROTOCOL + SASREC_CE)
+    protocol = load_protocol(path)
+    for sweep, ablation in before.ablations.items():
+        assert protocol.ablation(sweep).models == ablation.models and "sasrec_ce" not in ablation.models
+        for dataset in ablation.datasets:
+            assert condition_fingerprint(protocol, sweep, dataset) == condition_fingerprint(before, sweep, dataset)
+            for model in ablation.models:
+                assert ablation_fingerprint(protocol, sweep, dataset, model) == \
+                    ablation_fingerprint(before, sweep, dataset, model)
+    common = ["--protocol", str(path), "--work-dir", str(work)]
+    assert cli.main(common + ["search", "--model", "sasrec_ce", "--device", DEVICE]) == 0
+    assert cli.main(common + ["final", "--model", "sasrec_ce", "--device", DEVICE]) == 0
+    files = sorted(p for p in (work / "ablations").rglob("*") if p.is_file())
+    assert cli.main(common + ["ablate", "--device", DEVICE]) == 0  # every model, every sweep: nothing new to run
+    assert sorted(p for p in (work / "ablations").rglob("*") if p.is_file()) == files
+    assert cli.main(common + ["ablation-report"]) == 0
+    for sweep in protocol.ablations:
+        assert "sasrec_ce" not in (work / "reports" / f"ablation-{sweep}.md").read_text(), sweep
+
+
 def test_an_omitted_scope_is_the_default_scope(workspace, tmp_path):
     _, _, protocol = workspace
     path = tmp_path / "protocol.toml"

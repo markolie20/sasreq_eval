@@ -186,8 +186,11 @@ def add_final_seeds(protocol: Protocol, work_dir: Path, dataset: str, seeds: lis
 # ---------------------------------------------------------------------------
 
 def plan_trials(protocol: Protocol, dataset: str, model: str) -> list[RunSpec]:
-    """The search's trials, ``trial-000`` onwards; without the epoch extensions (:func:`plan_search`)."""
+    """The search's trials, ``trial-000`` onwards; without the epoch extensions (:func:`plan_search`). None on a
+    dataset the model does not run on (its ``datasets``, DECISIONS §45)."""
     mp = protocol.model(model)
+    if not mp.runs_on(dataset):
+        return []
     fingerprint = protocol.run_fingerprint(dataset, model)
     return [
         RunSpec(dataset, model, "trial", trial, protocol.seeds[0],
@@ -322,7 +325,15 @@ def _summarize(protocol: Protocol, work_dir: Path, trials: list[RunSpec],
 
 
 def _base_summary(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> TrialSummary:
-    """The search's trials alone, with the failures accepted for them."""
+    """The search's trials alone, with the failures accepted for them.
+
+    On a dataset the model does not run on, every trial counts as skipped, without a run: the report, ``status``
+    and the final runs then treat it as they treat a model ``max_items`` keeps off a catalogue (DECISIONS §45).
+    Nothing is written, so widening the model's ``datasets`` later finds no record in the way.
+    """
+    mp = protocol.model(model)
+    if not mp.runs_on(dataset):
+        return TrialSummary(planned=mp.trials, skipped=mp.trials, skip_reason=mp.not_run_reason(dataset))
     summary = TrialSummary(planned=0)
     accepted = accepted_failures_path(protocol, work_dir, dataset, model)
     if accepted.exists():
@@ -666,6 +677,11 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
             device: str, retry_failed: bool = False, log=print) -> str:
     """Run ``spec`` unless it is finished, failed before, or claimed elsewhere."""
     _check_training(spec, split, protocol)
+    mp = protocol.model(spec.model)
+    if not mp.runs_on(spec.dataset):
+        # never planned (plan_trials, plan_finals return none): refused before anything is written, so no record of
+        # it can outlive the model's datasets (DECISIONS §45)
+        raise ValueError(f"{spec.name} of {spec.dataset}/{spec.model}: {mp.not_run_reason(spec.dataset)}")
     directory = spec.directory(work_dir)
     if (directory / "done.json").exists() and differs_in_epochs_only(spec, directory):
         if not _supersede(spec, directory, log=log):

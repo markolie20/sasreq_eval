@@ -54,6 +54,11 @@ SCORING_VERSION = 4
 #: Keys of a ``[datasets.*]`` section that change how a split is scored but not the split itself.
 _SCORING_ONLY_KEYS = ("exclude_seen", "new_item_diagnostic")
 
+#: Keys of a ``[models.*]`` section that choose where a model runs, not what a run of it computes (DECISIONS §45).
+#: Like ``eval_batch_size``, they enter no fingerprint: a model's ``datasets`` widened later starts its runs on the
+#: new datasets and leaves the finished ones where they are, and taking a model out of the sweeps moves nothing.
+_PLACEMENT_KEYS = ("datasets", "in_ablations")
+
 #: Bumped when the baselines' code changes what they recommend; it enters every baseline fingerprint, so results
 #: of the older code are not reused. 2 (2026-09-30): equal scores are ranked in one fixed order (more popular
 #: first, then the lower index), not as the top-k happened to break them.
@@ -76,7 +81,7 @@ _ALLOWED_KEYS = {
     "datasets": {"builder", "temporal_period_hours", "train_users", "min_user_support", "item_min_support",
                  "min_value_to_keep", "set_all_values_to", "exclude_seen", "new_item_diagnostic",
                  "amazon_category", "options"},
-    "models": {"family", "trials", "fixed", "space", "max_items"},
+    "models": {"family", "trials", "fixed", "space", "max_items", *_PLACEMENT_KEYS},
     "ablations": {"transform", "levels", "options", "scope", "datasets", "models", "seeds", "expected_to_move",
                   "manipulation_tolerance", "knee_margin", "min_level_users"},
     "baselines": {"kind", "trials", "fixed", "space"},
@@ -166,6 +171,16 @@ class ModelProtocol:
     space: dict[str, dict[str, Any]]
     max_items: int | None
     raw: dict[str, Any]
+    #: the datasets the model runs on, or ``None`` for every one; elsewhere it is reported as skipped (§45)
+    datasets: tuple[str, ...] | None = None
+    #: whether the sweeps that name no models run it (§45); a sweep may not name it while this is false
+    in_ablations: bool = True
+
+    def runs_on(self, dataset: str) -> bool:
+        return self.datasets is None or dataset in self.datasets
+
+    def not_run_reason(self, dataset: str) -> str:
+        return f"not run on {dataset}: [models.{self.name}] datasets = {list(self.datasets or [])}"
 
 
 @dataclass(frozen=True)
@@ -296,11 +311,12 @@ class Protocol:
         return _digest({"dataset": build, "max_val_users": self.max_val_users, "search_seed": self.search_seed})
 
     def run_fingerprint(self, dataset: str, model: str) -> str:
-        """Identity of every run of ``model`` on ``dataset`` under this file."""
+        """Identity of every run of ``model`` on ``dataset`` under this file: its section without the keys that only
+        place it (:data:`_PLACEMENT_KEYS`)."""
         return _digest({
             "protocol": self._result_settings(),
             "dataset": self.dataset(dataset).raw,
-            "model": self.model(model).raw,
+            "model": {key: value for key, value in self.model(model).raw.items() if key not in _PLACEMENT_KEYS},
         })
 
 
@@ -387,9 +403,17 @@ def _parse_model(name: str, table: dict, default_trials: int) -> ModelProtocol:
     if trials < 1:
         raise ProtocolError(f"{where}.trials must be >= 1")
     max_items = table.get("max_items")
+    datasets = table.get("datasets")
+    if datasets is not None and (not isinstance(datasets, list) or not datasets
+                                 or not all(isinstance(d, str) for d in datasets) or len(set(datasets)) != len(datasets)):
+        raise ProtocolError(f"{where}.datasets must be a non-empty list of distinct dataset names, got {datasets!r}")
+    in_ablations = table.get("in_ablations", True)
+    if not isinstance(in_ablations, bool):
+        raise ProtocolError(f"{where}.in_ablations must be true or false, got {in_ablations!r}")
     return ModelProtocol(
         name=name, family=family, trials=trials, fixed=fixed, space=space,
         max_items=None if max_items is None else int(max_items), raw=table,
+        datasets=None if datasets is None else tuple(datasets), in_ablations=in_ablations,
     )
 
 
@@ -432,12 +456,17 @@ def _parse_ablation(name: str, table: dict, datasets: dict, models: dict,
     if not isinstance(options, dict):
         raise ProtocolError(f"{where}.options must be a table")
     chosen = {}
+    # a sweep that names no models runs every model that takes part in the sweeps (§45)
+    default = {"datasets": list(datasets), "models": [name for name, m in models.items() if m.in_ablations]}
     for key, available in (("datasets", datasets), ("models", models)):
-        names = table.get(key, list(available))
+        names = table.get(key, default[key])
         unknown = [n for n in names if n not in available]
         if unknown:
             raise ProtocolError(f"{where}.{key} names {unknown}, which the protocol does not define")
         chosen[key] = tuple(names)
+    excluded = [name for name in chosen["models"] if not models[name].in_ablations]
+    if excluded:
+        raise ProtocolError(f"{where}.models names {excluded}, whose [models.*] in_ablations is false")
     seeds = table.get("seeds", list(protocol_seeds))
     if (not isinstance(seeds, list) or not seeds
             or not all(isinstance(s, int) and not isinstance(s, bool) and s >= 0 for s in seeds)
@@ -547,6 +576,10 @@ def load_protocol(path: str | Path, extra: Iterable[str | Path] = ()) -> Protoco
         raise ProtocolError("the protocol defines no [datasets.*]")
     if not models:
         raise ProtocolError("the protocol defines no [models.*]")
+    for name, model in models.items():
+        unknown = [d for d in model.datasets or () if d not in datasets]
+        if unknown:
+            raise ProtocolError(f"[models.{name}].datasets names {unknown}, which the protocol does not define")
     ablations = {name: _parse_ablation(name, table, datasets, models, seeds)
                  for name, table in raw.get("ablations", {}).items()}
     baselines = {name: _parse_baseline(name, table, trials_per_model)

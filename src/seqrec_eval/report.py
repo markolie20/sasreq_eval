@@ -200,6 +200,8 @@ def _split_section(protocol: Protocol, work_dir: Path, dataset: str) -> str:
 def _recorded_code(protocol: Protocol, work_dir: Path, dataset: str, models: list[str]):
     """The ``code`` record of each of a dataset's finished trials and final runs (``None`` where not recorded)."""
     for model in models:
+        if not protocol.model(model).runs_on(dataset):
+            continue  # not this dataset's runs any more (its datasets, DECISIONS §45)
         root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
         records = [spec.directory(work_dir) / "done.json" for spec in plan_search(protocol, work_dir, dataset, model)]
         records += [root / f"final-seed{seed}" / "done.json" for seed in final_seeds(protocol, work_dir, dataset)]
@@ -399,6 +401,8 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
     other = other_definition(protocol.targets)
     diagnostic_rows = []
     for model in models:
+        if not protocol.model(model).runs_on(dataset):
+            continue
         finals = load_final_evaluations(protocol, work_dir, dataset, model, stem=f"test_{other}")
         if finals:
             primary_finals = load_final_evaluations(protocol, work_dir, dataset, model)

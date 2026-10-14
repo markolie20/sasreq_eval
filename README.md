@@ -34,9 +34,18 @@ branch `local-temporal-train-all-users`, at version `0.3.7+trainusers`. It adds:
   before test need;
 - **bounded training memory** (`loss_chunk_elements` in the GRU, SASRec and ELSA trainers: the same loss,
   computed in chunks), so the search spaces' largest settings fit a 32 GB V100 (§19);
-- the branch's BERT4Rec work.
+- the branch's BERT4Rec work;
+- **an overlay from another branch** (§44): SASRec v2 (`sasrec_ce`) and LRURec, with their tests, from
+  `32-bert4rec-model-implementation`, which lacks the rest of the above and so is not vendored whole.
+  `scripts/vendor-models.sh [CHECKOUT]` adds them, after checking that every library module they import is
+  byte-identical here (`models/base.py` excepted, and covered by their tests); running it twice adds nothing twice.
+  **A full `scripts/vendor-cr.sh` refresh drops the overlay: run `scripts/vendor-models.sh` after it** (vendor-cr.sh
+  warns while VENDORED.md records one).
 
-`uv sync` installs it as a fixed build from that folder, never from PyPI.
+`uv sync` installs it as a fixed build from that folder, never from PyPI. Where a model plugin is installed, use
+`uv sync --locked --inexact` (below); and where uv says it "would replace project environment" (the interpreter it
+was built with has changed), which would remove a plugin even then, reinstall the library alone with
+`uv pip install --no-deps --reinstall ./vendor/compresso-recsys`.
 - `vendor/compresso-recsys/VENDORED.md` says where it was copied from (branch, commit, upstream) and lists every
   file that differs from upstream; `CHANGES.patch` holds the full difference.
 - Changed library files start with a one-line notice, as the license asks.
@@ -229,11 +238,24 @@ library's `SimpleRNN` with a GRU cell and a full softmax: GRU4Rec's architecture
 and objective family, not GRU4Rec's sampled BPR-max/TOP1-max losses, so it is
 reported as "GRU (full softmax)", not as GRU4Rec.
 
+Where a model runs is part of its section too (DECISIONS.md §45): `datasets = [...]` keeps it to those datasets,
+and everywhere else it is reported as skipped, with no runs and no record; `in_ablations = false` leaves it out of
+every sweep that names no models (a sweep may not name it). Neither key enters a fingerprint, so widening a model's
+datasets later starts runs on the new ones and leaves the finished ones where they are.
+
 `bert4rec` is the library's BERT4Rec, as published (DECISIONS.md §36): one epoch is 11 passes over the
 training windows (10 re-maskings and the last-item samples), so its `epochs` of 1–10 match SASRec's 10–100 passes,
 and its learning rate is searched around 1e-3, since the published 1e-4 under-trains here. Its positions count
 from the oldest item, as published; since the refit that leaves an untrained mask position only for users whose
 history is exactly the longest training sequence, where no user fills the window.
+
+`sasrec_ce` is SASRec v2, the library's `SASRecCE` (DECISIONS.md §44): SASRec's network trained with cross entropy
+over the whole catalogue instead of sampled negatives, with input masking and co-occurrence augmentation. Its search
+is SASRec's ranges without `n_negatives`, plus `mask_probability` in {0, 0.1, 0.2, 0.3} and co-occurrence
+replacement and insertion in {0, 0.1} each. The user's own history stays among its negatives
+(`allow_history_negatives = true`, fixed by the planted chain, §46). It runs a full stage 1 on Music4All, Yambda and
+OTTO and is in no sweep (§43). Its loss and its prediction are computed in chunks, so its largest setting fits a
+6 GB card (§47).
 
 Two behaviours come with the library and are kept, documented (DECISIONS.md §25):
 - **Matrix inputs (N5).** cr's builder trains ELSA and EASE on the larger of the
@@ -243,8 +265,9 @@ Two behaviours come with the library and are kept, documented (DECISIONS.md §25
   library's design, not a choice of this suite.
 - **SASRec's negatives (N2).** Sampled from outside the whole history, as
   published. On repeat-heavy data that never pushes a seen item down, which
-  holds back re-consumption (0.64 of the oracle on a planted chain).
-- Both sequence models search `unk_dropout` in {0, 0.02, 0.05, 0.1} (N7), so the
+  holds back re-consumption (0.64 of the oracle on a planted chain). SASRec v2, keeping the history among its
+  negatives, reaches 1.00 there (§46).
+- Every sequence model searches `unk_dropout` in {0, 0.02, 0.05, 0.1} (N7), so the
   embedding of items first seen after training is learned.
 
 ### Models from other packages

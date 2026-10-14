@@ -278,6 +278,42 @@ n_negatives = { choice = [1, 16, 64, 256] }  # 1 is published and the smallest
 unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }
 max_history_length = { choice = [25, 50, 100, 200, 400] }
 
+[models.sasrec_ce]
+# Decided 2026-10-13 (Mark; DECISIONS §43, §44): SASRec v2, the library's SASRecCE -- SASRec's network trained with
+# cross entropy over the whole catalogue, with input masking and optional co-occurrence augmentation, vendored by
+# scripts/vendor-models.sh. A full stage 1 on Music4All, Yambda and OTTO, and no ablations. Neither key below enters
+# a fingerprint (§45): widening `datasets` later leaves the runs already made where they are.
+family = "sequence"
+datasets = ["music4all", "yambda", "otto"]
+in_ablations = false
+[models.sasrec_ce.fixed]
+# Decided 2026-10-13 (the planted chain, DECISIONS §46): the user's own history stays among the softmax's negatives.
+# Kept out, a history item is never pushed down, and it outranks the planted next item whenever seen items are
+# ranked, as they are on all three of this model's datasets: 0.61 to 0.70 of the oracle kept out, with and without
+# masking, against 1.00 kept in (SASRec, whose sampler keeps the history out, 0.64).
+allow_history_negatives = true
+# Co-occurring partners drawn by count / sqrt(popularity): cosine's weighting, between raw counts (popular partners
+# first) and lift (popularity cancelled).
+cooccurrence_popularity_exponent = -0.5
+[models.sasrec_ce.space]
+# SASRec's ranges, unchanged (see [models.sasrec]), without n_negatives: the full softmax is the model. An epoch is
+# one pass over the training users, as SASRec's: on Yambda (4,364 users) the epoch extension (×2, ×4 when the loss
+# still falls more than 5%, §42-43) is what took SASRec past 100, and it applies to this model alike.
+d_model = { choice = [16, 32, 50, 64, 128] }
+n_blocks = { choice = [1, 2, 3] }
+n_heads = { choice = [1, 2] }
+dropout = { uniform = [0.0, 0.7] }
+lr = { loguniform = [1e-4, 1e-2] }
+batch_size = { choice = [64, 128, 256] }
+epochs = { choice = [10, 20, 50, 100] }
+unk_dropout = { choice = [0.0, 0.02, 0.05, 0.1] }
+max_history_length = { choice = [25, 50, 100, 200, 400] }
+# Its own: the share of input positions masked, and of positions given a co-occurring item in place of the real one
+# (replace) or beside it (insert); 0 is in each, so the search can switch any of them off.
+mask_probability = { choice = [0.0, 0.1, 0.2, 0.3] }
+cooccurrence_replace_probability = { choice = [0.0, 0.1] }
+cooccurrence_insert_probability = { choice = [0.0, 0.1] }
+
 [models.bert4rec]
 # Decided 2026-10-06 (H26): BERT4Rec is compared too. The library's model, as
 # published: positions count from the oldest item, which since the refit leaves

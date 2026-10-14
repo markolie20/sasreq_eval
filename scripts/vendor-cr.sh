@@ -16,8 +16,18 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 CR=${1:-$HOME/Documents/recombee/compresso-recsys}
 UPSTREAM=${UPSTREAM:-origin/main}
-DEST=$HERE/vendor/compresso-recsys
+DEST=${VENDOR_DIR:-$HERE/vendor/compresso-recsys}  # VENDOR_DIR: for the tests
 PARTS=(src tests pyproject.toml README.md LICENSE)
+
+# An overlay from scripts/vendor-models.sh (DECISIONS §44) lives inside the copy this replaces: say so before anything
+# is touched, so a refresh is followed by vendor-models.sh unless the checkout has the overlay's packages itself.
+if [[ -f $DEST/VENDORED.md ]] && grep -q 'vendor-models.sh overlay: begin' "$DEST/VENDORED.md"; then
+    echo "warning: $DEST/VENDORED.md records an overlay from scripts/vendor-models.sh" \
+         "($(sed -n '/overlay: begin/,/overlay: end/p' "$DEST/VENDORED.md" | grep -o 'models/[a-z_0-9]*/__init__.py' \
+             | cut -d/ -f2 | sort -u | paste -sd' ')):" \
+         "this refresh replaces the whole copy and drops it; run scripts/vendor-models.sh afterwards unless" \
+         "$CR has those packages itself" >&2
+fi
 NOTICE="# Modified for seqrec_eval: differs from upstream compresso-recsys; see vendor/compresso-recsys/VENDORED.md"
 
 [[ -f $CR/pyproject.toml && -d $CR/src/compresso_recsys ]] || { echo "no compresso-recsys checkout at $CR" >&2; exit 2; }

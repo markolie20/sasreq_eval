@@ -134,6 +134,8 @@ def latency_table(protocol: Protocol, work_dir: Path, datasets: list[str], model
     stale = []
     for dataset in datasets:
         for model in models:
+            if not protocol.model(model).runs_on(dataset):
+                continue
             path = (run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
                     / f"final-seed{protocol.seeds[0]}" / "latency.json")
             if not path.exists():

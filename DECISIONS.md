@@ -1663,6 +1663,240 @@ caught. 281 tests pass.
 - **Mixed hardware:** runs on two GPUs (V100 and RTX 2060), which every run's host records; latency is measured
   on the PC's CPU.
 
+## 44. SASRec v2 joins stage 1, vendored from another branch of the library (2026-10-13)
+
+**Decision (Mark).** §43's SASRec v2 is added: a full stage 1 on Music4All, Yambda and OTTO, no ablations. Its
+search space is SASRec's plus its own settings, as below (D1), with `allow_history_negatives` fixed by a planted
+check (§46). It is vendored without refreshing the rest of the copy, by a script.
+
+**The model.** compresso-recsys's `SASRecCE`, on branch `32-bert4rec-model-implementation` (uncommitted):
+- SASRec's network, copied so that SASRec itself stays as published, trained with cross entropy over the whole
+  catalogue in place of SASRec's sampled binary objective;
+- `allow_history_negatives`: whether the user's own history is among the softmax's negatives;
+- input masking (`mask_probability`, with a `[mask]` token);
+- co-occurrence augmentation: an input replaced by an item that co-occurs with it (the target stays the true next
+  item), or one inserted after it; partners are drawn in proportion to count × popularity^exponent;
+- a sampled softmax (`n_negatives`) exists in the library; the suite does not use it.
+
+**Changes in the library** (the checkout's working tree, `sasrec_ce/` and its tests only):
+- **`loss_chunk_elements`** (default 2²⁶): the loss over the labelled positions in chunks, their gradients summed
+  before the encoder's one backward pass. This is GRU's and SASRec's pattern (§19). BERT4Rec has no such setting:
+  it bounds its memory through `max_predictions`.
+- **`prediction_chunk_elements`** (default 2²⁶): prediction in parts (§47).
+- **Tests:**
+  - a chunked step gives the same loss and every gradient to 1e-5 / 1e-7, for the full and the sampled softmax,
+    with the history in and out, dropout and masking on, down to one position per chunk;
+  - no chunk holds more than the bound;
+  - the contract: `candidate_ids`, items after the fitted catalogue read as `unk` and never recommended, and
+    `recommend` with item IDs across a save and load.
+- 94 tests in `test_sasrec_ce.py`. 8 deliberate breaks, all caught; one was caught only by the whole file, not by
+  the tests selected for it.
+
+**Vendoring:** `scripts/vendor-models.sh`.
+- **What it copies:** the two packages and their tests (11 files) from the checkout, each Python file with the
+  modified-file notice.
+- **The check, before anything is written:** every library module they import, directly or through another, must
+  be byte-identical in the checkout and the copy. 7 were checked; only `models/base.py` differs (the checkout adds
+  the `CandidateScorer` protocol, which the overlay's code does not import).
+- **What else it writes:** the exports in `models/__init__.py` and `tests/test_public_api.py`, and a section in
+  `CHANGES.patch` and in `VENDORED.md`, each between markers and replaced on every run. A second run changes no byte.
+- **Refreshes:** `vendor-cr.sh` now warns, before touching anything, while VENDORED.md records an overlay. That
+  section says a full refresh must be followed by `vendor-models.sh`.
+- **Two of the overlay's tests are deselected in the copy, both recorded in VENDORED.md:**
+  - LRURec's `test_the_trainer_is_a_candidate_scorer` (D4);
+  - LRURec's `test_it_evaluates_against_sampled_negatives`, found when the tests first ran against the copy.
+
+  Both need branch 32's sampled evaluation, which the suite does not use.
+- **Run against the copy in the suite's venv:**
+  - the overlay's tests: 242 passed, 2 deselected;
+  - the copy's 38 model, evaluation and API test files: 1,681 passed, 3 skipped. Its dataset and download tests
+    were not run (no real data on the laptop).
+
+**The suite.**
+- **Registered** in `models.py`. As for BERT4Rec, the trainer builds its own batcher, whose vocabulary has the
+  `[mask]` token (H26).
+- **`[models.sasrec_ce]` in both protocols:**
+  - `datasets = ["music4all", "yambda", "otto"]` and `in_ablations = false` (§45);
+  - fixed: `allow_history_negatives = true` (§46), and `cooccurrence_popularity_exponent = -0.5` (partners by
+    count / √popularity, cosine's weighting);
+  - space: SASRec's ranges without `n_negatives`; `mask_probability` {0, 0.1, 0.2, 0.3};
+    `cooccurrence_replace_probability` and `cooccurrence_insert_probability` {0, 0.1} each.
+- **The 10 trials as drawn:** insertion is on in 8 of them, replacement in 3, masking in 7. Only trial 9 has no
+  co-occurrence augmentation at all.
+
+**Why.**
+- Branch 32 lacks what the suite needs (`temporal_train_users`, the Music4All/Yambda/OTTO loaders, loss
+  chunking), so `vendor-cr.sh` could not take the models from it.
+- The new models' dependencies are the same files in both trees, so an overlay checked file by file is exact.
+- The full softmax is what distinguishes v2 from SASRec, which already covers 1–256 sampled negatives.
+- The epoch grid stays SASRec's. On Yambda, the extension rule (§42–43) is what took SASRec past 100 epochs, and it
+  applies to this model alike. A larger grid would cost mostly on Music4All and OTTO, which have 12 and 18 times
+  Yambda's users per epoch.
+
+**Effect.**
+- **Fingerprints:** every fingerprint of both protocols was computed before and after (runs, sweep conditions,
+  ablation runs, baselines, datasets). None changed or disappeared; 5 were added, SASRec v2's runs.
+- **Cost, projected:**
+  - **Method:** on the laptop's RTX 4050, with synthetic data shaped like each dataset (catalogue, users, median
+    history), and the 10 configurations as drawn (`review-plan/findings/S1-rest/sasrec_ce_cost.py`).
+  - **Search:** 4.2 h on Music4All, 2.0 h on Yambda, 3.0 h on OTTO.
+  - **Finals:** 2.8 h if the selection costs the mean, 8.7 h if it is the most expensive.
+  - **In all:** 12–18 h, before a Yambda epoch extension, which could add up to about 14 h in the worst case.
+  - **On the RTX 2060:** a factor of this that has not been measured. After the first trials,
+    `scripts/project-time.py` reprojects from the PC's own records.
+- **Two code builds in the report.** Every run records a hash of the whole library source and of the whole suite
+  source (§17). Runs made after this change record new ones, so the reports will list two builds per dataset.
+  - The difference cannot touch an earlier run: the library gained two packages and their exports, and nothing else
+    in it changed.
+  - The suite's changes place models (§45) and do not change what a run of an existing model computes. Their run
+    fingerprints are unchanged, and the suite's tests pass as before.
+  - This entry is the check that §17's warning asks for.
+
+**Side effects.**
+- **The laptop's `.venv`.** `uv sync` would have replaced the whole environment, because its Python changed from
+  3.14.7 to 3.14.8. That would have removed the SANSA plugin, even with `--inexact`. The library alone was
+  reinstalled with `uv pip install --no-deps --reinstall ./vendor/compresso-recsys`. The README says when to use
+  which.
+- `tests/test_local_run.py` lists the models with an `epochs` search; SASRec v2 joins the list.
+
+**Where.**
+- Library: `models/sasrec_ce/` (`config.py`, `trainer.py`), `tests/test_sasrec_ce.py`.
+- Suite: `scripts/vendor-models.sh` (new), `scripts/vendor-cr.sh`, `vendor/compresso-recsys/`, `models.py`, both
+  protocols, the README.
+- Measurements: `review-plan/findings/S1-rest/sasrec_ce_memory.py`, `sasrec_ce_cost.py` (with its `.out`).
+
+**Tests.**
+- **`tests/test_vendor_models.py`** (fake checkout and copy):
+  - the overlay, exports and records, and a second run that changes no byte;
+  - a dependency that differs only through another module's import is refused before anything is written;
+  - `vendor-cr.sh` warns once an overlay is recorded.
+- **`tests/test_smoke.py::test_sasrec_ce_runs_through_every_step`:** search, final, diversity, latency and the
+  report, with every augmentation on. No other model's fingerprint moves, and SASRec v2 is compared with ELSA like
+  every model.
+- **Deliberate breaks:** 5 in the scripts. One survived at first, because it was redundant code rather than a test
+  gap; the code was simplified and the real mechanism broken instead. All are caught.
+
+## 45. Where a model runs: `datasets` and `in_ablations` (2026-10-13)
+
+**Problem.**
+- A sweep that names no models runs every model of the protocol. SASRec v2 would therefore have joined the
+  Music4All and OTTO sweeps, and the inference sweep on every dataset.
+- Listing the models in every sweep instead would silently drop the SANSA plugin from them: it comes from an extra
+  file, and the public protocol cannot name it.
+- The report had no "not on this dataset": SASRec v2 would have shown as an unfinished `0/10` on ML-20M and Amazon,
+  and a full `final` would exit 3 for it.
+
+**Change.** Two optional keys in a `[models.*]` section:
+- **`datasets = [...]`:** the datasets the model runs on (default: all). Elsewhere:
+  - no trial is planned;
+  - its summary counts every trial as skipped, without reading or writing anything;
+  - so the report notes it as skipped, as for EASE's `max_items`, and `status` shows "skipped";
+  - `final`, `diversity` and `latency` pass it by;
+  - the latency, diversity and repeat-strata tables, the window diagnostic and the code-builds note leave out any
+    runs of it that exist there;
+  - `plan` shows "not run here";
+  - a run of it is refused before anything is written, so no record can outlive the scope.
+- **`in_ablations = false`:** the model is left out of every sweep that names no models, and a sweep that names it
+  is refused.
+- **(Mark) Neither enters a fingerprint,** like `eval_batch_size`. Widening `datasets` later starts the new
+  datasets' runs and leaves the finished ones where they are. Narrowing hides the old runs everywhere, and widening
+  again finds them.
+
+**Effect.**
+- No fingerprint moves: SASRec v2 is the only model with either key.
+- A later `datasets` change on any model moves nothing either; this is tested on the real protocol.
+- `plan` lists SASRec v2 in no sweep, and as "not run here" on ML-20M and Amazon.
+
+**Where.** `protocol.py` (`_PLACEMENT_KEYS`, `ModelProtocol.runs_on`, the sweeps' default), `runner.py`
+(`plan_trials`, `_base_summary`, `execute`), `cli.py`, `report.py`, `latency.py`, `diversity.py`, `strata.py`;
+the README.
+
+**Tests.**
+- **`tests/test_placement.py`:**
+  - every model of the real `protocol.toml`, given each of five placements, moves no fingerprint at all (runs,
+    conditions, ablation runs, baselines, datasets); as a control, another key still moves a run fingerprint;
+  - bad values are refused;
+  - a sweep's default leaves an `in_ablations = false` model out, and naming one in a sweep is refused;
+  - end to end on the synthetic workspace, a model with runs on a dataset is then kept off it:
+    - it is planned nowhere and reported as skipped;
+    - it is gone from status, report, latency, diversity, strata and the code-builds note;
+    - search, final, diversity (forced) and latency write and rewrite nothing;
+    - a stray run is refused;
+    - widened again, its old runs are found.
+- **`tests/test_ablations.py::test_a_model_kept_out_of_the_sweeps_runs_in_none_and_is_reported_in_none`:**
+  SASRec v2 with stage-1 runs and no ablation runs. Every sweep's models, conditions and ablation fingerprints are
+  unchanged; `ablate` over every model writes nothing; no ablation report mentions it.
+- **Deliberate breaks:** 14, each caught. The first run of these tests also found a real gap: the window
+  diagnostic and the code-builds note read finals directly. Both now follow the scope.
+
+## 46. SASRec v2 keeps the user's history among its negatives: the planted chain (2026-10-13)
+
+**The check (D1, Mark's rule).** Set `allow_history_negatives` from H53's planted chain: true if it confirms that
+keeping the history out of the softmax holds back the ranking where seen items are ranked.
+- **Data:** next = σ(last), 1,500 test users, 300 items, through the real temporal split and the suite's evaluator.
+- **SASRec v2's settings:** H53's settings for SASRec (window 50, d 64, 2 blocks, 1 head, dropout 0.2, lr 1e-3,
+  batch 128, 50 epochs), with the full softmax in place of 16 negatives.
+- **Control:** SASRec, run again beside it.
+
+| model | its history among the negatives | NDCG@10 / oracle, seen items ranked | the same, seen items masked |
+|---|---|---|---|
+| SASRec (control; its sampler keeps the history out) | no | 0.640 | 1.000 |
+| SASRec v2, masking 0.2 | no | 0.613 | 1.000 |
+| SASRec v2, no masking | no | 0.696 | 1.000 |
+| SASRec v2, masking 0.2 | **yes** | **1.000** | 1.000 |
+| SASRec v2, no masking | **yes** | **1.000** | 1.000 |
+
+Hit@10 is 1.0 everywhere: the planted item is always in the top 10. Kept out of the softmax, history items are
+never pushed down and outrank it whenever seen items are ranked, as on all three of SASRec v2's datasets. The
+control reproduces H53's 0.64.
+
+**Decision.** `allow_history_negatives = true`, fixed in both protocols.
+
+**Where.** `review-plan/findings/H53/h53_sasrec_ce.py` and `chain_sasrec_ce.out`. The H53 harness predates two
+changes, and the script adapts it without editing the original:
+- its protocol must now state `refit` (H11), so it states `refit = false`, which is what the harness did (fit on
+  the training window, score test);
+- the baselines' full-catalogue ranking has become a sparse path its oracle does not implement, so the oracle is
+  ranked by the dense path it was written for.
+
+## 47. Prediction at window 400 on a 6 GB card: SASRec v2 scores in parts; SASRec's own risk (2026-10-13)
+
+**What the memory probe found.** On the laptop's RTX 4050 (6 GB, like the PC's RTX 2060):
+- **Training:** SASRec v2's largest setting fits. At 150,000 items, window 400, batch 256, d 128, 3 blocks and
+  2 heads, with the history excluded and every augmentation on, a step peaks at 3.8 GB allocated (4.1 reserved) with
+  chunks of 2²⁶, against 4.6 GB at 2²⁷. Hence the default.
+- **Prediction:** scoring 1,024 histories at once (the main protocol's `eval_batch_size`) at window 400 with
+  2 heads ran out of memory at every catalogue tried, from Music4All's 36,797 items up. Each block builds a
+  1,024 × 2 × 400 × 400 attention mask: 1.2 GiB.
+- **SASRec itself:** its prediction is the same code, so the vendored SASRec was measured too, at Music4All's
+  catalogue, d 128, 3 blocks:
+
+| window | 1 head | 2 heads |
+|---|---|---|
+| 100 | 0.6 GB | 0.7 GB |
+| 200 | 1.2 GB | 1.8 GB |
+| 400 | 2.8 GB | **out of memory** |
+
+**Change (SASRec v2 only).** `predict_on_batch` scores a caller's batch in parts, so that each part holds at most
+`prediction_chunk_elements` elements of the larger of the attention map (heads × window², per history) and the
+catalogue scores. The rows are independent and padded to the full window, so the parts rank exactly as one batch
+would. A batch of 1,024 at the corner then peaks at 1.6 GB.
+
+**Not changed:** SASRec, whose code the week-long run uses. Any SASRec run on the RTX 2060 whose configuration has
+window 400 and 2 heads would fail where it scores 1,024 users at once. That covers validation of the Yambda epoch
+extensions, finals, diversity, the inference sweep's rescoring, and the ablation refits. BERT4Rec, with window up
+to 400 and up to 4 heads, is likely exposed too; it was not measured. Lowering `eval_batch_size` in
+`protocol.toml` (no fingerprint) avoids it for every model. An open decision, below.
+
+**Where.** Library: `sasrec_ce/trainer.py` (`_prediction_rows`), `config.py`. Probes:
+`review-plan/findings/S1-rest/sasrec_ce_memory.py`, `sasrec_predict_memory.py`.
+
+**Tests.** `tests/test_sasrec_ce.py`:
+- in parts, the rankings and scores equal one batch's, with seen items excluded and kept and with candidates;
+- no part holds more histories than the bound.
+
+3 deliberate breaks, all caught (§44).
+
 ---
 
 ## Known limitations recorded by the review
@@ -1709,6 +1943,9 @@ caught. 281 tests pass.
   an extra protocol file (entry 39); its code and settings are private.
 - The retuning spot-check of the ablations after the main runs, if time is left (entries 27 and 36).
 - N8: SASRec's out-of-memory search corner (fixed with H35 in memory; kept here as a check on the DGX).
+- SASRec's and BERT4Rec's prediction at window 400 with two or more heads does not fit a 6 GB card at
+  `eval_batch_size = 1024` (entry 47): lower `eval_batch_size` on the RTX 2060 (no fingerprint), or give
+  them SASRec v2's prediction in parts. Not changed while the week-long run uses their code.
 
 ## Decisions before the freeze (2026-09-23 to 09-25)
 

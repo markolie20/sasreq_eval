@@ -51,6 +51,8 @@ from .elsa import (
 )
 from .bert4rec import Bert4Rec, Bert4RecConfig, Bert4RecTrainer
 from .sasrec import SASRec, SASRecConfig, SASRecTrainer
+from .lrurec import LRURec, LRURecConfig, LRURecTrainer
+from .sasrec_ce import SASRecCE, SASRecCEConfig, SASRecCETrainer
 from .simple_gpt import (
     SimpleGPT,
     SimpleGPTConfig,
@@ -99,6 +101,12 @@ __all__ = [
     "SASRec",
     "SASRecConfig",
     "SASRecTrainer",
+    "LRURec",
+    "LRURecConfig",
+    "LRURecTrainer",
+    "SASRecCE",
+    "SASRecCEConfig",
+    "SASRecCETrainer",
     "SequenceBatcher",
     "SimpleBidirectionalTransformer",
     "SimpleBidirectionalTransformerConfig",

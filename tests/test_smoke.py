@@ -856,6 +856,64 @@ def test_bert4rec_runs_through_every_step(workspace, tmp_path):
     assert "| synth | bert4rec |" in latency_table(protocol, work, ["synth"], ["bert4rec"])
 
 
+SASREC_CE = """
+[models.sasrec_ce]
+family = "sequence"
+datasets = ["synth"]
+in_ablations = false
+[models.sasrec_ce.fixed]
+epochs = 2
+batch_size = 16
+d_model = 8
+n_blocks = 1
+n_heads = 1
+allow_history_negatives = true
+cooccurrence_insert_probability = 0.1
+cooccurrence_replace_probability = 0.1
+cooccurrence_popularity_exponent = -0.5
+[models.sasrec_ce.space]
+max_history_length = { choice = [10, 20] }
+mask_probability = { choice = [0.0, 0.2] }
+"""
+
+
+def test_sasrec_ce_runs_through_every_step(workspace, tmp_path):
+    # SASRec v2 (DECISIONS §44), every augmentation on, through the vendored library: search, final, diversity,
+    # latency and the report, where it is compared with ELSA like every other model
+    import shutil
+
+    from seqrec_eval.diversity import diversity_table
+    from seqrec_eval.latency import latency_table
+
+    root, _ = workspace
+    work = tmp_path / "work"
+    shutil.copytree(root / "work", work)
+    (tmp_path / "protocol.toml").write_text(PROTOCOL + SASREC_CE)
+    protocol = load_protocol(tmp_path / "protocol.toml")
+    before = load_protocol(root / "protocol.toml")
+    assert all(protocol.run_fingerprint("synth", m) == before.run_fingerprint("synth", m) for m in before.models)
+    common = ["--protocol", str(tmp_path / "protocol.toml"), "--work-dir", str(work)]
+    for step in (["search", "--model", "sasrec_ce", "--device", DEVICE],
+                 ["final", "--model", "sasrec_ce", "--device", DEVICE],
+                 ["diversity", "--model", "sasrec_ce", "--device", DEVICE],
+                 ["latency", "--model", "sasrec_ce", "--threads", "1"],
+                 ["report", "--reference", "elsa"]):
+        assert cli.main(common + step) == 0, step
+    finals = plan_finals(protocol, work, "synth", "sasrec_ce")
+    for spec in plan_trials(protocol, "synth", "sasrec_ce") + finals:
+        record = json.loads((spec.directory(work) / "done.json").read_text())
+        assert record["status"] == "done" and len(record["history"]) == 2
+        assert record["spec"]["params"]["allow_history_negatives"] is True
+    assert len(finals) == 2 and all((spec.directory(work) / "model.zip").exists() for spec in finals)
+    report = (work / "reports" / "stage1.md").read_text()
+    row = next(line for line in report.splitlines() if line.startswith("| sasrec_ce |"))
+    assert row.split(" | ")[1] == "2/2" and row.split(" | ")[4] == "2"  # 2 trials, 2 seeds
+    comparison = report.split("Comparison against **elsa**")[1]
+    assert any(line.startswith("| sasrec_ce | ") for line in comparison.splitlines())
+    assert "| synth | sasrec_ce |" in latency_table(protocol, work, ["synth"], ["sasrec_ce"])
+    assert "| synth | sasrec_ce |" in diversity_table(protocol, work, ["synth"], ["sasrec_ce"])
+
+
 def test_a_run_still_improving_at_its_last_epoch_is_recognised():
     # the epoch grid is capped (SASRec at 100, DECISIONS §32): a run stopped while its loss still fell is flagged
     from seqrec_eval.report import still_improving

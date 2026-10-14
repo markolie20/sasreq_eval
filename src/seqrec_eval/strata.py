@@ -101,6 +101,8 @@ def dataset_strata(protocol: Protocol, work_dir, dataset: str, models: list[str]
     lines = [f"## {dataset}", ""]
     averaged, missing = {}, []
     for model in models:
+        if not protocol.model(model).runs_on(dataset):
+            continue  # not run here (its datasets, DECISIONS §45): not missing either
         finals = load_final_evaluations(protocol, work_dir, dataset, model)
         if len(finals) == len(final_seeds(protocol, work_dir, dataset)):
             averaged[model] = mean_over_seeds([e for _, e in finals])
