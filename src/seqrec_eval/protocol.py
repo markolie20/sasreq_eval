@@ -81,7 +81,7 @@ _ALLOWED_KEYS = {
     "datasets": {"builder", "temporal_period_hours", "train_users", "min_user_support", "item_min_support",
                  "min_value_to_keep", "set_all_values_to", "exclude_seen", "new_item_diagnostic",
                  "amazon_category", "options"},
-    "models": {"family", "trials", "fixed", "space", "max_items", *_PLACEMENT_KEYS},
+    "models": {"family", "trials", "fixed", "space", "max_items", "latency_only", *_PLACEMENT_KEYS},
     "ablations": {"transform", "levels", "options", "scope", "datasets", "models", "seeds", "expected_to_move",
                   "manipulation_tolerance", "knee_margin", "min_level_users"},
     "baselines": {"kind", "trials", "fixed", "space"},
@@ -175,9 +175,17 @@ class ModelProtocol:
     datasets: tuple[str, ...] | None = None
     #: whether the sweeps that name no models run it (§45); a sweep may not name it while this is false
     in_ablations: bool = True
+    #: timed for latency only (DECISIONS §48): no search, one final at the first seed, fitted on a few users and
+    #: never scored, so it appears in the latency table and nowhere else. Unlike the placement keys it is part of the
+    #: fingerprint: such a final is not a model whose accuracy means anything.
+    latency_only: bool = False
 
     def runs_on(self, dataset: str) -> bool:
         return self.datasets is None or dataset in self.datasets
+
+    def scored_on(self, dataset: str) -> bool:
+        """Whether its accuracy is measured and shown on ``dataset``: it runs there and is not latency-only (§48)."""
+        return self.runs_on(dataset) and not self.latency_only
 
     def not_run_reason(self, dataset: str) -> str:
         return f"not run on {dataset}: [models.{self.name}] datasets = {list(self.datasets or [])}"
@@ -410,10 +418,20 @@ def _parse_model(name: str, table: dict, default_trials: int) -> ModelProtocol:
     in_ablations = table.get("in_ablations", True)
     if not isinstance(in_ablations, bool):
         raise ProtocolError(f"{where}.in_ablations must be true or false, got {in_ablations!r}")
+    latency_only = table.get("latency_only", False)
+    if not isinstance(latency_only, bool):
+        raise ProtocolError(f"{where}.latency_only must be true or false, got {latency_only!r}")
+    if latency_only:
+        # one fixed configuration, never searched, never in a sweep (DECISIONS §48)
+        clash = [key for key in ("space", "trials") if key in table] + (["in_ablations"] if table.get("in_ablations") else [])
+        if clash:
+            raise ProtocolError(f"{where} is latency_only, so it takes one fixed configuration and no {clash}")
+        in_ablations = False
     return ModelProtocol(
         name=name, family=family, trials=trials, fixed=fixed, space=space,
         max_items=None if max_items is None else int(max_items), raw=table,
         datasets=None if datasets is None else tuple(datasets), in_ablations=in_ablations,
+        latency_only=latency_only,
     )
 
 

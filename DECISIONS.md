@@ -1897,6 +1897,61 @@ to 400 and up to 4 heads, is likely exposed too; it was not measured. Lowering `
 
 3 deliberate breaks, all caught (§44).
 
+## 48. LRURec is timed for latency only: `latency_only` (2026-10-14)
+
+**Decision (Mark, §43; settled with the SASRec v2 session's plan, D2).** LRURec enters stage 1 for its inference
+latency only, not trained for accuracy:
+- the paper's architecture: d 64, 2 blocks, dropouts 0.2;
+- a window of 400, SASRec's longest;
+- on all five datasets;
+- nothing of it on the GPU.
+
+**Change.** A model key `latency_only = true`:
+- **Planning:** no search. One final at the first seed, of the model's fixed configuration. A latency-only model
+  takes no `space` or `trials`, and is in no sweep (`in_ablations` false; naming it in a sweep is refused).
+- **The fit:** that final is fitted on the first 256 training users (`LATENCY_ONLY_ROWS`), with the whole catalogue.
+  For LRURec, 1 epoch with 100 sampled negatives, the paper's large-catalogue setting; prediction ranks every item.
+  It is saved and never scored: no validation, no test, no diagnostics. Its record says
+  `"latency_only": {"fit_rows": …}`.
+- **Where it appears:** `latency` times it like any final. The stage-1 report leaves it out of every table,
+  comparison and CSV, with one note per dataset. Diversity and the repeat strata skip it. `status` shows
+  "latency only", and `plan` shows "1 unscored final".
+- **LRURec** is registered in `models.py`, with its section in both protocols.
+
+**Why.**
+- A request's time depends on the architecture, the window and the catalogue size, not on what the weights hold.
+  So a model fitted on a few users times exactly as a trained one would, at no GPU cost.
+- LRURrefuses `epochs = 0`, and fitting it on every user with a full softmax does not fit 6 GB: Yambda's
+  logits alone are about 13.7 GB.
+
+**In the fingerprint, unlike `datasets` and `in_ablations` (§45).** A latency-only final is not a model whose
+accuracy means anything. If the key were left out of the fingerprint, switching it off later would reuse that final
+as a real one. So it is part of the model's section and its fingerprint (tested). (The plan sent to the SASRec v2
+session listed it among the fingerprint-neutral keys; that was wrong for this key.)
+
+**Effect.**
+- No fingerprint of a finished run moves: every run, baseline and sweep fingerprint was compared against the
+  committed protocol.
+- LRURec costs one short CPU fit per dataset, plus its latency timing.
+- `scripts/project-time.py` skips models without trials. `scripts/local-run.sh` shortens only searched epochs;
+  a fixed count, as LRURec's, no longer stops it (its check counted every `epochs` line).
+
+**Where.**
+- `protocol.py` (`ModelProtocol.latency_only`, `scored_on`); `runner.py` (`plan_trials`, `plan_finals`,
+  `_execute`, `LATENCY_ONLY_ROWS`, `_save_model`).
+- `report.py` (stage-1 report, status); `diversity.py`; `strata.py`; `cli.py` (`plan`); `models.py`.
+- Both protocols; `scripts/project-time.py`; `scripts/local-run.sh`; README; OVERVIEW.
+
+**Tests.** `tests/test_latency_only.py`:
+- the key takes one fixed configuration (no space, trials or `in_ablations = true`) and must be a boolean;
+- it is part of the fingerprint, nothing is searched, and the one final is at the first seed;
+- end to end on the synthetic workspace: no trials; one final fitted on the capped number of users, saved, never
+  scored; no diversity; latency measured; `status` and `plan` show it; in the report it appears only in the latency
+  table, and not in the CSV.
+
+`tests/test_placement.py` (§45) no longer tries `in_ablations = true` on a latency-only model, which refuses
+it. 13 deliberate breaks, all caught (one in `local-run.sh`). 305 tests pass on CPU and on the GPU.
+
 ---
 
 ## Known limitations recorded by the review

@@ -96,7 +96,7 @@ MAP and MRR.
 | SASRec | causal self-attention, sampled-negative training (as published) | width 16–128, 1–3 blocks, 1–2 heads, dropout, learning rate, batch size, 10–100 epochs, 1–256 negatives, history window 25–400 | all 5 |
 | BERT4Rec | bidirectional self-attention, masked-item training (as published) | width 32–128, 1–3 blocks, 1–4 heads, dropout, mask share 0.2–0.6, learning rate, batch size, 1–10 epochs (11 passes each), history window 25–400 | all 5 |
 | SASRec v2 | SASRec's network trained with cross-entropy over the whole catalogue (the user's own history among the negatives), with input masking and co-occurrence augmentation | SASRec's ranges without negatives, plus mask share 0–0.3 and co-occurrence replacement and insertion 0–0.1 | Music4All, Yambda, OTTO (no ablations) |
-| LRURec | linear recurrent units (Yue et al., WSDM 2024) | latency only | — |
+| LRURec | linear recurrent units (Yue et al., WSDM 2024); timed for latency only: the paper's architecture (width 64, 2 blocks) at a 400-item window, not trained for accuracy | not searched | all 5 (latency) |
 
 **Non-sequential models** (read the history as a set):
 
@@ -238,4 +238,4 @@ stage-1 configuration, and each level is compared with the full data.
   - the ablations of the other models;
   - latency.
 - **Ready to run:** SASRec v2's stage 1 (Music4All, Yambda, OTTO), after the current run.
-- **Next:** LRURec's latency, then the client selection with Recombee.
+- **Next:** SASRec v2's run and LRURec's latency, then the client selection with Recombee.

@@ -263,6 +263,11 @@ def _main(argv: list[str] | None) -> int:
                 if not mp.runs_on(dataset):
                     print(f"  {model:<16} {mp.family:<8} not run here ([models.{model}] datasets)  [{registered}]")
                     continue
+                if mp.latency_only:
+                    total += 1
+                    print(f"  {model:<16} {mp.family:<8} latency only: 1 unscored final  "
+                          f"run fingerprint {protocol.run_fingerprint(dataset, model)[:12]}  [{registered}]")
+                    continue
                 runs = mp.trials + len(seeds)
                 total += runs
                 print(f"  {model:<16} {mp.family:<8} {mp.trials:>3} trials + {len(seeds)} finals"

@@ -156,6 +156,12 @@ def status_table(protocol: Protocol, work_dir: Path, datasets: list[str], models
             finals = sum((root / f"final-seed{seed}" / "done.json").exists() for seed in seeds)
             skipped = summary.planned and summary.skipped == summary.planned
             best = "—" if summary.best is None else f"{summary.best.selection} ({summary.best_value:.4f})"
+            if protocol.model(model).latency_only and protocol.model(model).runs_on(dataset):
+                # no search, one unscored final for latency (DECISIONS §48)
+                done = (root / f"final-seed{protocol.seeds[0]}" / "done.json").exists()
+                rows.append([dataset, model, "yes" if prepared else "no", "—", 0, running,
+                             f"{int(done)}/1", "latency only"])
+                continue
             rows.append([
                 dataset, model, "yes" if prepared else "no",
                 f"{summary.done + summary.skipped}/{summary.planned}", summary.failed, running,
@@ -279,6 +285,11 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                   "(`final --add-seeds`).", ""]
     rows, csv_rows, averaged, per_seed, notes, new_rows, scoring = [], [], {}, {}, [], [], None
     for model in models:
+        if protocol.model(model).latency_only:
+            if protocol.model(model).runs_on(dataset):
+                notes.append(f"- **{model}**: timed for latency only, untrained and never scored (DECISIONS §48): "
+                             "see the latency table.")
+            continue
         summary = summarize_trials(protocol, work_dir, dataset, model)
         if summary.skipped == summary.planned and summary.planned:
             notes.append(f"- **{model}** skipped: {summary.skip_reason}")
@@ -401,7 +412,7 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
     other = other_definition(protocol.targets)
     diagnostic_rows = []
     for model in models:
-        if not protocol.model(model).runs_on(dataset):
+        if not protocol.model(model).scored_on(dataset):
             continue
         finals = load_final_evaluations(protocol, work_dir, dataset, model, stem=f"test_{other}")
         if finals:

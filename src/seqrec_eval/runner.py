@@ -189,8 +189,8 @@ def plan_trials(protocol: Protocol, dataset: str, model: str) -> list[RunSpec]:
     """The search's trials, ``trial-000`` onwards; without the epoch extensions (:func:`plan_search`). None on a
     dataset the model does not run on (its ``datasets``, DECISIONS §45)."""
     mp = protocol.model(model)
-    if not mp.runs_on(dataset):
-        return []
+    if not mp.runs_on(dataset) or mp.latency_only:
+        return []  # a latency-only model is not searched (DECISIONS §48)
     fingerprint = protocol.run_fingerprint(dataset, model)
     return [
         RunSpec(dataset, model, "trial", trial, protocol.seeds[0],
@@ -368,6 +368,13 @@ def plan_finals(protocol: Protocol, work_dir: Path, dataset: str, model: str, *,
     ``accept_failed``: it is then recorded in ``accepted_failures.json`` and
     listed in the report.
     """
+    mp = protocol.model(model)
+    if mp.latency_only:
+        # one final of its fixed configuration, at the first seed: the one latency times (DECISIONS §48)
+        if not mp.runs_on(dataset):
+            return []
+        seed = protocol.seeds[0]
+        return [RunSpec(dataset, model, "final", seed, seed, dict(mp.fixed), protocol.run_fingerprint(dataset, model))]
     summary = summarize_trials(protocol, work_dir, dataset, model)
     if summary.skipped == summary.planned:
         return []
@@ -546,18 +553,26 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
         _seed_everything(spec.seed)
         trainer = registered.build(spec.params, n_items=len(train_item_ids), device=device, seed=spec.seed)
         data = split.data["x_train_sequences"] if mp.family == "sequence" else split.data["x_train"]
+        if mp.latency_only:
+            # the whole catalogue and the architecture, which is what a request's time depends on, fitted on a
+            # few users only: its weights mean nothing, so it is never scored (DECISIONS §48)
+            rows = np.arange(min(LATENCY_ONLY_ROWS, _n_rows(data)), dtype=np.int64)
+            data = data.select_rows(rows) if hasattr(data, "select_rows") else data[rows]
+            record["latency_only"] = {"fit_rows": int(rows.size)}
         started = time.perf_counter()
         trainer.fit(data, item_ids=train_item_ids)
         record["fit_seconds"] = time.perf_counter() - started
 
     started = time.perf_counter()
-    if not ablation and split.trained_on == "train":
+    if mp.latency_only:
+        _save_model(trainer, directory, record)
+    elif not ablation and split.trained_on == "train":
         val = evaluate_phase(trainer, split, "val", family=mp.family, protocol=protocol,
                              exclude_seen=dp.exclude_seen, rows=split.val_rows)
         save_evaluation(val, directory / "val")
         record["val"] = dict(val.metrics)
 
-    if spec.kind in ("final", "reference", "rescore"):
+    if spec.kind in ("final", "reference", "rescore") and not mp.latency_only:
         test = evaluate_phase(trainer, split, "test", family=mp.family, protocol=protocol,
                               exclude_seen=dp.exclude_seen, rows=split.test_rows)
         save_evaluation(test, directory / "test")
@@ -570,7 +585,7 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
                                  exclude_seen=True, rows=split.test_rows, targets="new")
             save_evaluation(new, directory / "test_new")
             record["test_new"] = dict(new.metrics)
-    if spec.kind == "final" and not ablation:
+    if spec.kind == "final" and not ablation and not mp.latency_only:
         other = other_definition(protocol.targets)
         if split.data.get(target_key("test", other)) is not None:
             # the target definition the protocol did not choose, as a diagnostic beside it
@@ -583,12 +598,7 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
                                  exclude_seen=True, targets="new")
             save_evaluation(new, directory / "test_new")
             record["test_new"] = dict(new.metrics)
-        try:
-            trainer.save(directory / "model.zip")
-            record["model_saved"] = True
-        except Exception as error:  # latency needs it, but a result without it is still a result  # noqa: BLE001
-            record["model_saved"] = False
-            record["model_save_error"] = f"{type(error).__name__}: {error}"
+        _save_model(trainer, directory, record)
     record["eval_seconds"] = time.perf_counter() - started
 
     history = getattr(trainer, "history", None)
@@ -603,6 +613,23 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
     record["status"] = "done"
     write_json(directory / "done.json", record)
     return "done"
+
+
+#: how many training users a latency-only model is fitted on (DECISIONS §48)
+LATENCY_ONLY_ROWS = 256
+
+
+def _n_rows(data) -> int:
+    return int(data.n_rows) if hasattr(data, "n_rows") else int(data.shape[0])
+
+
+def _save_model(trainer, directory: Path, record: dict[str, Any]) -> None:
+    try:
+        trainer.save(directory / "model.zip")
+        record["model_saved"] = True
+    except Exception as error:  # latency needs it, but a result without it is still a result  # noqa: BLE001
+        record["model_saved"] = False
+        record["model_save_error"] = f"{type(error).__name__}: {error}"
 
 
 def _reset_peak_memory(device: str) -> bool:

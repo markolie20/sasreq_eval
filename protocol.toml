@@ -308,6 +308,25 @@ mask_probability = { choice = [0.0, 0.1, 0.2, 0.3] }
 cooccurrence_replace_probability = { choice = [0.0, 0.1] }
 cooccurrence_insert_probability = { choice = [0.0, 0.1] }
 
+[models.lrurec]
+# Decided 2026-10-14 (Mark; DECISIONS §43, §48): LRURec (Yue et al., WSDM 2024), timed for latency only. One fixed
+# configuration -- the paper's architecture at SASRec's longest window -- on every dataset, never searched, never in
+# a sweep: its final is fitted for one epoch on a few users with the whole catalogue (a request's time depends on
+# the architecture, the window and the catalogue, not on the weights) and never scored.
+family = "sequence"
+latency_only = true
+[models.lrurec.fixed]
+d_model = 64
+n_blocks = 2
+dropout = 0.2
+lru_dropout = 0.2
+max_history_length = 400
+n_negatives = 100              # the paper's large-catalogue setting; training only, prediction ranks every item
+batch_size = 128
+epochs = 1
+lr = 0.001
+weight_decay = 0.01
+
 [models.bert4rec]
 # Decided 2026-10-06 (H26): BERT4Rec is compared too. The library's model, as
 # published: positions count from the oldest item, which since the refit leaves

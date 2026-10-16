@@ -116,7 +116,10 @@ def measure_final(protocol: Protocol, split: Split, model: str, directory: Path,
 
 def measure(protocol: Protocol, work_dir: Path, split: Split, model: str, *, device: str, force: bool = False,
             log=print) -> int:
-    """Measure every finished, current final of ``model`` on ``split`` (a final split) that has no record yet."""
+    """Measure every finished, current final of ``model`` on ``split`` (a final split) that has no record yet.
+    None of a latency-only model, whose weights mean nothing (DECISIONS §48)."""
+    if not protocol.model(model).scored_on(split.dataset):
+        return 0
     root = run_root(work_dir, split.dataset, model, protocol.run_fingerprint(split.dataset, model))
     stale = stale_final_seeds(protocol, work_dir, split.dataset, model)
     vectors = None  # factorised once, when the first final needs it
@@ -146,7 +149,7 @@ def diversity_table(protocol: Protocol, work_dir: Path, datasets: list[str], mod
     lines = [f"| dataset | model | seeds | coverage@{k} | intra-list diversity@{k} |", "|---|---|---|---|---|"]
     for dataset in datasets:
         for model in models:
-            if not protocol.model(model).runs_on(dataset):
+            if not protocol.model(model).scored_on(dataset):
                 continue
             root = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model))
             stale = stale_final_seeds(protocol, work_dir, dataset, model)

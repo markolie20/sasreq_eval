@@ -113,7 +113,8 @@ def project(protocol, timing: dict[str, dict], *, factors: dict[str, float], ref
     out = {"reference": reference, "rows": [], "skipped": [], "fit_error": {}}
     first = next(iter(protocol.datasets))
     # trained in epochs, on the GPU: `epochs` searched or fixed (a trial's params hold both)
-    gpu_models = [name for name in protocol.models if "epochs" in plan_trials(protocol, first, name)[0].params]
+    gpu_models = [name for name in protocol.models
+                  if (trials := plan_trials(protocol, first, name)) and "epochs" in trials[0].params]
     costs = {}
     for model in gpu_models:
         trials = timing[reference].get(model, {}).get("trials", [])

@@ -76,7 +76,9 @@ def _write(tmp_path, text: str, name: str = "protocol.toml"):
 def test_placing_any_model_of_the_real_protocol_moves_no_fingerprint(tmp_path, key, value):
     text = (REPO / "protocol.toml").read_text()
     before = fingerprints(load_protocol(REPO / "protocol.toml"))
-    for model in load_protocol(REPO / "protocol.toml").models:
+    for model, mp in load_protocol(REPO / "protocol.toml").models.items():
+        if mp.latency_only and key == "in_ablations" and value == "true":
+            continue  # a latency-only model is never in a sweep, and says so (DECISIONS §48)
         after = fingerprints(_write(tmp_path, place(text, model, key, value)))
         # a model taken out of the sweeps has no ablation fingerprints; everything that remains is unmoved
         assert {k: v for k, v in after.items() if k in before} == {k: v for k, v in before.items() if k in after}

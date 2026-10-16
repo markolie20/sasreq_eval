@@ -45,6 +45,8 @@ from compresso_recsys.models import (
     ItemTokenizer,
     PopularityBaseline,
     PopularityBaselineConfig,
+    LRURecConfig,
+    LRURecTrainer,
     SASRecCEConfig,
     SASRecCETrainer,
     SASRecConfig,
@@ -159,6 +161,12 @@ def _sasrec_ce(params, *, n_items, device, seed):
     # SASRec v2 (DECISIONS §44): SASRec's network trained with cross entropy over the catalogue. As for BERT4Rec, the
     # trainer builds its own batcher, whose vocabulary has the [mask] token input masking needs (review H26).
     return SASRecCETrainer(SASRecCEConfig(**params, device=device, seed=seed, show_progress=False))
+
+
+@register("lrurec", family="sequence", cls=LRURecTrainer)
+def _lrurec(params, *, n_items, device, seed):
+    # LRURec (Yue et al., WSDM 2024), timed for latency only (DECISIONS §48); the trainer builds its own batcher
+    return LRURecTrainer(LRURecConfig(**params, device=device, seed=seed, show_progress=False))
 
 
 @register("bert4rec", family="sequence", cls=Bert4RecTrainer)

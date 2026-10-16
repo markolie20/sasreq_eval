@@ -257,6 +257,12 @@ replacement and insertion in {0, 0.1} each. The user's own history stays among i
 OTTO and is in no sweep (§43). Its loss and its prediction are computed in chunks, so its largest setting fits a
 6 GB card (§47).
 
+`lrurec` is LRURec (Yue et al., WSDM 2024), timed for latency only (`latency_only = true`, DECISIONS.md §48): the
+paper's architecture (d 64, 2 blocks) at SASRec's longest window, 400, on every dataset. It is not searched and in
+no sweep. Its one final, at the first seed, is fitted for one epoch on 256 users with the whole catalogue, since a
+request's time depends on the architecture, the window and the catalogue, not on the weights. It is never scored,
+so it appears in the latency table and nowhere else; `status` shows it as "latency only".
+
 Two behaviours come with the library and are kept, documented (DECISIONS.md §25):
 - **Matrix inputs (N5).** cr's builder trains ELSA and EASE on the larger of the
   two training windows' counts per user and item, and gives them the sum over the

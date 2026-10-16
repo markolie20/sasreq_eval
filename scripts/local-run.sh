@@ -73,10 +73,11 @@ else
         -e "s/^trials_per_model = [0-9]*/trials_per_model = $TRIALS/" \
         -e "s/^epochs = { choice = \[[^]]*\] }/epochs = { choice = [$EPOCHS] }/" \
         "$HERE/protocol.local.toml" > "$PROTOCOL.new"
-    # every substitution must have happened, or this would not be the quick run it says it is
+    # every substitution must have happened, or this would not be the quick run it says it is. Only searched
+    # epochs are shortened: a fixed count (LRURec's 1, latency only: DECISIONS §48) is already as short as it gets
     if [[ $(sed -n '/^\[protocol\]/,/^\[/p' "$PROTOCOL.new" | grep -c "^seeds = \[$SEEDS\]") != 1 ||
           $(grep -c "^trials_per_model = $TRIALS\b" "$PROTOCOL.new") != 1 ||
-          $(grep -c "^epochs = " "$PROTOCOL.new") != $(grep -c "^epochs = { choice = \[$EPOCHS\] }" "$PROTOCOL.new") ]]; then
+          $(grep -c "^epochs = {" "$PROTOCOL.new") != $(grep -c "^epochs = { choice = \[$EPOCHS\] }" "$PROTOCOL.new") ]]; then
         echo "protocol.local.toml no longer has the lines this script shortens (seeds, trials_per_model, epochs)" >&2
         rm -f "$PROTOCOL.new"
         exit 1
