@@ -1952,6 +1952,47 @@ session listed it among the fingerprint-neutral keys; that was wrong for this ke
 `tests/test_placement.py` (§45) no longer tries `in_ablations = true` on a latency-only model, which refuses
 it. 13 deliberate breaks, all caught (one in `local-run.sh`). 305 tests pass on CPU and on the GPU.
 
+## 49. SASRec v2 on ML-20M and Amazon too (2026-10-19)
+
+**Decision (Mark).** The week's run finished on 2026-10-16 and the client's data has not arrived, so the PC has
+time. SASRec v2 now runs a full stage 1 on all five datasets: `datasets` in `[models.sasrec_ce]` adds `ml20m` and
+`amazon` to Music4All, Yambda and OTTO. Still no ablations.
+
+**Why.** §43 kept SASRec v2 to three datasets for the week's budget only. Without the other two:
+- there is no SASRec v2 against SASRec on ML-20M and Amazon;
+- the gap is in the two datasets whose main test already excludes seen items, which is what a client's
+  "recommend only new items" feed looks like.
+
+**Settings unchanged.** `allow_history_negatives = true` (§46) was chosen for datasets where seen items are ranked.
+On ML-20M and Amazon they are excluded (`exclude_seen = true`), and there the planted chain scored the same either way
+(1.000 with seen items masked). The search space and its 10 configurations are the same (trial *i* draws the same
+configuration on every dataset).
+
+**Cost.** Measured with the probe that priced the first three datasets, on synthetic data shaped like each dataset
+(training users, the catalogue the finals fit, median history; no real data read), on the laptop's RTX 4050:
+
+| dataset | search | finals (3 seeds, mean / most expensive selection) |
+|---|---|---|
+| ML-20M (21,557 items) | 4.1 h | 1.2 / 3.4 h |
+| Amazon (275,514 items) | 7.2 h | 2.2 / 4.2 h |
+
+That is 11 to 19 hours in all. On the first three datasets the probe's search estimate was within 2–25% of what the
+RTX 2060 took, always on the high side: Music4All 4.2 h estimated, 3.95 h actual; Yambda 1.97 h, 1.48 h; OTTO 2.99 h,
+2.94 h. Every configuration trained and predicted within the 6 GB card at Amazon's catalogue, twice the 150,000 items
+§47 measured.
+
+**Effect.**
+- No fingerprint moves (§45); the runs on Music4All, Yambda and OTTO keep their fingerprints, checked against the
+  copied work folder.
+- The stage-1 report, status and plan show SASRec v2 on ML-20M and Amazon as unfinished until their runs exist.
+- §43's limitation "SASRec v2 on three datasets" no longer holds once they do.
+
+**Where.** Both protocols; README; OVERVIEW (models table, status). Probe:
+`review-plan/findings/S1-rest/sasrec_ce_cost_ml20m_amazon.py` and its `.out`.
+
+**Tests.** No code changed. `tests/test_placement.py` already checks this placement on the real protocol (every
+dataset, no fingerprint moves). 305 tests pass.
+
 ---
 
 ## Known limitations recorded by the review
