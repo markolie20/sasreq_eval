@@ -176,7 +176,7 @@ stage-1 configuration, and each level is compared with the full data.
 
 **Retraining sweeps.**
 - **Where:** Music4All and OTTO, seed 0.
-- **Models:** ELSA, GRU, SASRec, SANSA, popularity, EASE (Music4All only), and BERT4Rec (OTTO only).
+- **Models:** ELSA, GRU, SASRec, SANSA, popularity, and BERT4Rec (OTTO only).
 - **How:** each model is retrained on the transformed data and scored on the same test users.
 
 | sweep | what changes | levels |
@@ -190,7 +190,7 @@ changed at a time (no augmentation, each co-occurrence augmentation alone, maski
 each against the stage-1 model.
 
 **Serving-time history length.**
-- **Where:** all five datasets, all models, 3 seeds.
+- **Where:** all five datasets, all models but EASE, 3 seeds.
 - **How:** the trained final models are not retrained; they score with only the last *n* items of each history.
 - **Levels:** 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000.
 - **It answers** how much history a model needs at serving time.
@@ -244,7 +244,7 @@ each against the stage-1 model.
   - stage 1 for every model on all five datasets (EASE where it fits): search, finals, epoch extensions, diversity,
     latency;
   - baselines, floor and data analysis;
-  - the ablations (EASE's on Music4All excepted).
+  - the ablations (EASE is in none).
 - **Ready to run:** the new-items floor and tests, ELSA and SANSA at their serving window, freshness, novelty and
-  later new items, SASRec v2's parts, SASRec on Yambda at 8 times its epochs, and EASE's Music4All ablations.
+  later new items, SASRec v2's parts, and SASRec on Yambda at 8 times its epochs.
 - **Next:** the client selection with Recombee.

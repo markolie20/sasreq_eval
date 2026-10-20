@@ -215,6 +215,10 @@ family = "matrix"
 [models.ease]
 family = "matrix"
 max_items = 40000
+# Decided 2026-10-20 (Mark; DECISIONS §56): EASE is in no sweep. Its Music4All retraining runs failed (out of memory
+# with the library's fit, not positive definite in float32 with the suite's) and are not redone; its stage-1 results
+# stay as reported. Placement only: no fingerprint moves, and the runs made stay on disk.
+in_ablations = false
 [models.ease.space]
 # λ ≈ 500 on ML-20M, 1,000 on Netflix, 200 on MSD, 3,000 with little training
 # data. 1 to 250,000 is centred on 500 in log space and keeps 1 to 10,000.

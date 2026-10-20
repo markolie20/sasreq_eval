@@ -261,9 +261,10 @@ model, and the report's freshness section sets it against the first seed's final
 model has never seen counts 0 for it. Beside it is the share of next items first seen in the validation window,
 counted by `analyse`.
 
-`ease` is the library's EASE with the suite's own fit (`LowMemoryEASE`, DECISIONS.md §55): the same closed form,
-inverted in place by Cholesky, at about 1.4 items × items matrices instead of nine. It reads and writes the library's
-checkpoints.
+`ease` is the library's EASE with the suite's own fit (`LowMemoryEASE`, DECISIONS.md §55, §56): the same closed
+form, accumulated and inverted in place in float64 by Cholesky, at about three float32 items × items matrices instead
+of nine; float32 cannot hold Music4All's play counts at λ ≈ 1. It reads and writes the library's checkpoints. EASE is
+in no sweep (`in_ablations = false`, §56).
 
 `bert4rec` is the library's BERT4Rec, as published (DECISIONS.md §36): one epoch is 11 passes over the
 training windows (10 re-maskings and the last-item samples), so its `epochs` of 1–10 match SASRec's 10–100 passes,

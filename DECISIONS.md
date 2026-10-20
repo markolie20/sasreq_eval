@@ -2223,7 +2223,8 @@ The window is each dataset's own: 339 days on MovieLens-20M and Amazon, 30 on th
   differently, so float32 weights can differ in their last digits from those of EASE's earlier finals.
 - **Checkpoints:** saved and read as the library's, both ways.
 - **The missing runs** (EASE's Music4All ablations: `history_length`, `shuffle`, `repeat_removal`) can run on the
-  PC's CPU.
+  PC's CPU. *Superseded by §56: in float32 three of them failed, the fit is now float64, and EASE's ablations are
+  dropped.*
 - No fingerprint moves.
 
 **Where.** `protocol.toml` and `protocol.local.toml` (`epoch_extension`), `runner.py` (`differs_in_epochs_only`),
@@ -2243,9 +2244,58 @@ stale split and model, the zero for unscored users, the settings, the fingerprin
 mirror, the head, novelty, the placement rule. The first round missed one, because the test's settings equalled the
 synthetic selection; the test now changes them. 332 tests pass on the CPU and on the GPU.
 
+## 56. EASE in float64, and its ablations dropped (2026-10-20)
+
+**What happened.** On the PC, three of EASE's Music4All ablation runs failed in §55's float32 fit: "not positive
+definite", at shuffle 10, shuffle all and repeat removal 0.5. A fourth (shuffle 2) was the death count left by the
+out-of-memory kills of 2026-10-14. Seven others succeeded.
+
+**Why.** EASE on Music4All was selected at λ ≈ 1.06 (trial #6), on a matrix of play counts.
+- **The conditioning:** a track played thousands of times makes XᵀX's largest entries huge, while near-duplicate
+  items leave eigenvalues near λ. The condition number then exceeds what float32 can hold (about 10⁷).
+- **What each fit does with it:** float32 Cholesky meets a non-positive pivot and stops. The library's float32 LU
+  does not stop, but its inverse is wrong.
+- **A synthetic matrix of that kind** (counts, 40 near-duplicates, condition 1.8·10¹⁰) shows how wrong. The library's
+  weights were off by 2.4 times the largest weight, and its top-10 lists shared 85% of their items with the exact
+  solution's. The float64 fit's were off by 3·10⁻⁷ relative, with identical top-10s.
+
+**Change.** `LowMemoryEASE` accumulates and inverts the Gram matrix in float64, whatever the model's dtype, and stores
+only the finished weights in that dtype (float32), a block of rows at a time.
+- **Peak:** about three float32 items × items matrices, about 16 GB on Music4All (the library's: nine, 45 GB).
+- **Where the problem is well conditioned,** the weights equal the library's to 10⁻⁶ relative in float32 and 10⁻¹²
+  in float64.
+
+**Decision (Mark).** EASE's ablations are dropped, and its stage-1 results stay as they are.
+- **`[models.ease] in_ablations = false`:** EASE is in no sweep. Placement only, so no fingerprint moves, and its
+  runs stay on disk.
+- **The side effect:** EASE's serving-time history sweep runs (ML-20M, Music4All), which rescored its stage-1
+  finals and were sound, also leave the reports.
+- EASE is not one of the study's comparators: those are ELSA and SANSA.
+- No EASE model is fitted again. The float64 fit stays the registered EASE, for any later fit; it cannot run on the
+  PC in the library's form.
+
+**A limitation to record.** EASE's stage-1 finals on Music4All were fitted with the library's float32 inverse, on a
+problem too ill-conditioned for it. Their weights are likely inaccurate. Read EASE's Music4All result (test
+NDCG@10 0.0810, +28.5% against ELSA) with that in mind; whether an exact fit would score higher or lower is not
+known. ML-20M (λ ≈ 999, one rating per film, a well-conditioned problem) is not affected in this way.
+
+**Where.** `models.py` (`LowMemoryEASE`), both protocols, README, OVERVIEW.
+
+**Tests.** `tests/test_ease_memory.py`:
+- on a well-conditioned problem the weights equal the library's;
+- on an ill-conditioned one, float32 Cholesky fails, the library's float32 weights are far off, and ours equal the
+  exact solution, with the same top-10 lists;
+- it reads and writes the library's checkpoints;
+- it holds under 3.3 float32 items × items matrices where the library held over 6.
+
+3 deliberate breaks, all caught: the mirrored triangle, a float32 inverse, float64 weights kept. 332 tests pass.
+
 ---
 
 ## Known limitations recorded by the review
+
+- **EASE's stage-1 finals on Music4All** were fitted in float32 on an ill-conditioned problem (λ ≈ 1, play counts),
+  so their weights are likely inaccurate (§56).
 
 - **ML-20M includes only users with at least 20 ratings over all time** (GroupLens README; checked: minimum
   20). Users are selected on their future. Together with H48, they are all heavy raters.

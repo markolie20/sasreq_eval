@@ -132,16 +132,23 @@ def _popularity(params, *, n_items, device, seed):
 
 
 class LowMemoryEASE(EASE):
-    """The library's EASE, fitted in a fraction of the memory: the same closed form, B = −P / diag(P) with
-    P = (XᵀX + λI)⁻¹ and a zero diagonal (Steck, WWW 2019), computed in place (DECISIONS §55).
+    """The library's EASE, fitted in a fraction of the memory and in float64: the same closed form,
+    B = −P / diag(P) with P = (XᵀX + λI)⁻¹ and a zero diagonal (Steck, WWW 2019), computed in place (DECISIONS §55,
+    §56).
 
     The library forms XᵀX as a sparse product, densifies it and inverts it with ``np.linalg.inv``: on Music4All's
     36,797 items that held about 45 GB at once, and the kernel's out-of-memory killer ended the run (2026-10-14).
     Here the Gram matrix is built dense block by block of items, never as a sparse product, and inverted in place by
-    Cholesky (``potrf``, then ``potri``; it is symmetric positive definite for λ > 0), so the peak is about one
-    items × items matrix: 5.4 GB in float32 on Music4All. Saved, loaded and scored exactly as the library's EASE,
-    whose checkpoints it reads. The inverse is the same to rounding (tested against the library's fit); LU and
-    Cholesky round differently, so float32 weights can differ in the last digits.
+    Cholesky (``potrf``, then ``potri``; it is symmetric positive definite for λ > 0).
+
+    **Always in float64** (DECISIONS §56). On play counts with λ ≈ 1 (EASE's selection on Music4All) the Gram
+    matrix is too ill-conditioned for float32: float32 Cholesky meets a non-positive pivot and stops (2026-10-20,
+    three of Music4All's ablation runs), and the library's float32 LU inverts it with large errors. On a synthetic
+    matrix of that kind (condition 4·10¹⁰) its weights were off by up to 3 times the largest weight, and its top-10
+    lists shared 86% of their items with the exact solution's. So the Gram matrix is accumulated and inverted in
+    float64, and only the finished weights are stored in the model's dtype. The peak is about three float32
+    items × items matrices: about 16 GB on Music4All. Saved, loaded and scored exactly as the library's EASE, whose
+    checkpoints it reads.
     """
 
     #: items per block of the Gram matrix: a block's sparse product holds at most items × this many entries
@@ -156,20 +163,20 @@ class LowMemoryEASE(EASE):
             raise ValueError("interactions must contain at least one user and one item")
         n_items = int(interactions.shape[1])
         vocabulary = self._prepare_item_vocabulary(item_ids, n_items=n_items)
-        x = interactions.astype(self.dtype, copy=False)
+        x = interactions.astype(np.float64)
         rows_of_items, columns = x.T.tocsr(), x.tocsc()
-        gram = np.empty((n_items, n_items), dtype=self.dtype)
+        gram = np.empty((n_items, n_items), dtype=np.float64)
         for start in range(0, n_items, self.BLOCK):
             stop = min(start + self.BLOCK, n_items)
             gram[:, start:stop] = (rows_of_items @ columns[:, start:stop]).toarray()
-        gram[np.diag_indices(n_items)] += self.dtype.type(self.cfg.l2)
+        del rows_of_items, columns, x
+        gram[np.diag_indices(n_items)] += float(self.cfg.l2)
         # the Gram matrix is symmetric, so its transpose -- a Fortran-ordered view of the same memory -- is itself:
         # LAPACK factorises and inverts it there, without a copy
-        potrf, potri = (lapack.spotrf, lapack.spotri) if self.dtype == np.float32 else (lapack.dpotrf, lapack.dpotri)
-        factor, info = potrf(gram.T, lower=False, overwrite_a=True, clean=False)
+        factor, info = lapack.dpotrf(gram.T, lower=False, overwrite_a=True, clean=False)
         if info != 0:
             raise np.linalg.LinAlgError(f"EASE's Gram matrix is not positive definite (potrf info {info})")
-        inverse, info = potri(factor, lower=False, overwrite_c=True)
+        inverse, info = lapack.dpotri(factor, lower=False, overwrite_c=True)
         if info != 0:
             raise np.linalg.LinAlgError(f"EASE's Gram matrix could not be inverted (potri info {info})")
         del factor, gram
@@ -189,7 +196,11 @@ class LowMemoryEASE(EASE):
             raise np.linalg.LinAlgError("EASE precision matrix has a zero diagonal")
         precision /= -diagonal
         precision[np.diag_indices(n_items)] = 0
-        self.coefficients_ = np.ascontiguousarray(precision)
+        coefficients = np.empty((n_items, n_items), dtype=self.dtype)
+        for start in range(0, n_items, self.BLOCK):  # a block of rows at a time: no second float64 copy
+            coefficients[start:start + self.BLOCK] = precision[start:start + self.BLOCK]
+        del precision
+        self.coefficients_ = coefficients
         self.n_items_ = n_items
         self._publish_item_vocabulary(vocabulary)
         return self
