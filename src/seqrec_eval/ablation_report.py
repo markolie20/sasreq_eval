@@ -84,7 +84,7 @@ from .ablations import (
 from .analysis import CONTROLS, condition_results, floor_of, mean_over_subsamples
 from .analysis_report import MIN_SLICE_USERS
 from .plots import gap_figure
-from .protocol import Protocol
+from .protocol import SETTINGS_TRANSFORM, Protocol
 from .report import ALPHA, CONFIDENCE, _mean_sd, _table, pool_over_seeds
 from .results import evaluation_exists, load_evaluation, read_json
 from .runner import made_with_another_selection
@@ -302,6 +302,7 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
                      comparator: str = "elsa") -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     ablation = protocol.ablation(sweep)
     transform = check_ablation(ablation)
+    settings = transform.name == SETTINGS_TRANSFORM
     tolerance = float(ablation.raw.get("manipulation_tolerance", DEFAULT_TOLERANCE))
     margin_fraction = float(ablation.raw.get("knee_margin", DEFAULT_KNEE_MARGIN))
     primary = protocol.primary_metric
@@ -540,7 +541,7 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
                          [[g["condition"], g["model"], f"{g['users']:,}", f"{g['gap']:+.4f}",
                            f"[{g['ci_low']:+.4f}, {g['ci_high']:+.4f}]", f"{g['p_adjusted']:.4g}",
                            verdict(g["p_adjusted"], g["condition"])] for g in gap_rows])]
-    elif averaged and comparator not in averaged:
+    elif averaged and comparator not in averaged and not settings:
         lines += ["", f"_No gap against {comparator}: it has no finished runs in this sweep on {dataset}._"]
     if descriptive:
         lines += ["", "### Gap: sequential − best non-sequential (descriptive)", "",
@@ -552,8 +553,14 @@ def dataset_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: st
                            f"{g['users']:,}" + (" *descriptive*" if g["below_min_users"] else ""),
                            f"{g['gap']:+.4f}", f"[{g['ci_low']:+.4f}, {g['ci_high']:+.4f}]"] for g in descriptive])]
     lines += _new_items_section(protocol, columns, new_items, comparator, len(seeds))
-    analysis_lines, analysis_rows, floor_rows = _analysis_section(
-        protocol, work_dir, sweep, dataset, columns, averaged, transform.changes_targets, comparator)
+    if settings:
+        # the data is the full data's at every level, so are the baselines and the floor (DECISIONS §52)
+        analysis_lines, analysis_rows, floor_rows = (
+            ["", "### Baselines", "", "_A settings sweep leaves the data as it is: the baselines and the floor are "
+             "the full data's, in the stage-1 and analysis reports._"], [], [])
+    else:
+        analysis_lines, analysis_rows, floor_rows = _analysis_section(
+            protocol, work_dir, sweep, dataset, columns, averaged, transform.changes_targets, comparator)
     lines += analysis_lines
     gap_rows += descriptive
     return "\n".join(lines), csv_rows, gap_rows, analysis_rows, floor_rows
@@ -707,6 +714,10 @@ def build_ablation_report(protocol: Protocol, work_dir: Path, sweep: str, datase
     if scope_of(ablation) == "inference":
         how = ("Scope **inference**: training data is untouched and only the histories given at recommendation "
                "time are transformed, so every condition rescores the stage-1 final models")
+    elif transform.name == SETTINGS_TRANSFORM:
+        how = ("The data is left as it is: each level refits the stage-1 selection with the level's settings in "
+               "place of its own (DECISIONS §52), so a level against the full data is what that part of the "
+               "configuration contributes")
     else:
         how = ("Scope **all**: training data and inference histories are both transformed, and every model "
                "refits its stage-1 configuration at each level")

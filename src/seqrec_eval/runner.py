@@ -38,6 +38,12 @@ validation (:func:`~seqrec_eval.splits.final_split`) and scores test only: its
 validation score would be leaked. Trials are always fitted on the training
 window, and a run given the wrong one refuses before it starts.
 
+One run more per selection can be asked for: ``stale-seed0``, the selected configuration fitted on the training
+window alone under the first seed, as the search fitted it, kept and scored on validation and on test
+(:func:`plan_stale`, DECISIONS §51, §53). It is the final model one window older: scored on test it shows what a
+model loses by being retrained a window less often, and its validation scores choose the history window a model is
+served at.
+
 The ablations (:mod:`seqrec_eval.ablations`) reuse the same machinery. Their
 runs carry a ``condition`` naming where they live, and come in three kinds: a
 ``final`` refitted on a transformed split, a ``reference`` that reloads a
@@ -82,7 +88,7 @@ from .splits import Split, code_provenance
 class RunSpec:
     dataset: str
     model: str
-    kind: str                     # "trial", "final", or (ablations only) "reference" / "rescore"
+    kind: str                     # "trial", "final", "stale", or (ablations only) "reference" / "rescore"
     index: int                    # trial number, or the seed of a final run
     seed: int
     params: dict[str, Any]
@@ -96,9 +102,16 @@ class RunSpec:
 
     @property
     def name(self) -> str:
+        if self.kind == "stale":
+            return f"stale-seed{self.seed}"
         if self.kind != "trial":
             return f"final-seed{self.seed}"
         return f"trial-{self.index:03d}" + (f"-x{self.epochs_factor}" if self.epochs_factor != 1 else "")
+
+    @property
+    def trains_on_window(self) -> bool:
+        """Whether the run fits the training window alone, as the search does, rather than what the finals fit."""
+        return self.kind in ("trial", "stale")
 
     @property
     def selection(self) -> str:
@@ -419,6 +432,18 @@ def plan_finals(protocol: Protocol, work_dir: Path, dataset: str, model: str, *,
     ]
 
 
+def plan_stale(protocol: Protocol, work_dir: Path, dataset: str, model: str) -> list[RunSpec]:
+    """The selection fitted on the training window alone, under the first seed (DECISIONS §51, §53): the final
+    model one window older. Raises as :func:`plan_finals` does while there is no selection; none for a model with no
+    finals here (skipped, not run here, or latency only)."""
+    mp = protocol.model(model)
+    if mp.latency_only or not mp.runs_on(dataset):
+        return []
+    finals = plan_finals(protocol, work_dir, dataset, model)
+    first = [final for final in finals if final.seed == protocol.seeds[0]]
+    return [replace(final, kind="stale", index=final.seed) for final in first]
+
+
 # ---------------------------------------------------------------------------
 # locking
 # ---------------------------------------------------------------------------
@@ -509,8 +534,8 @@ def _check_condition(spec: RunSpec, split: Split) -> None:
 
 
 def _check_training(spec: RunSpec, split: Split, protocol: Protocol) -> None:
-    """Trials fit on the training window; everything scored on test on :func:`final_split`'s data."""
-    wanted = "train+val" if protocol.refit and spec.kind != "trial" else "train"
+    """Trials (and the stale run) fit on the training window; everything else on :func:`final_split`'s data."""
+    wanted = "train+val" if protocol.refit and not spec.trains_on_window else "train"
     if split.trained_on != wanted:
         raise ValueError(f"{spec.name} of {spec.dataset}/{spec.model} must be given a split trained on {wanted}, "
                          f"not {split.trained_on}" + (" (pass final_split(protocol, split))" if wanted != "train"
@@ -572,12 +597,12 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
         save_evaluation(val, directory / "val")
         record["val"] = dict(val.metrics)
 
-    if spec.kind in ("final", "reference", "rescore") and not mp.latency_only:
+    if spec.kind in ("final", "reference", "rescore", "stale") and not mp.latency_only:
         test = evaluate_phase(trainer, split, "test", family=mp.family, protocol=protocol,
                               exclude_seen=dp.exclude_seen, rows=split.test_rows)
         save_evaluation(test, directory / "test")
         record["test"] = dict(test.metrics)
-        if ablation and dp.new_item_diagnostic:
+        if (ablation or spec.kind == "stale") and dp.new_item_diagnostic:
             # the next items the user never had, at every level: what a model adds beyond what the user already had
             # (DECISIONS §38). Seen items are judged on the whole history, so the targets are the same at every
             # level of a sweep that keeps the item space, and so are the users scored on them.
@@ -599,6 +624,8 @@ def _execute(spec: RunSpec, split: Split, protocol: Protocol, directory: Path, d
             save_evaluation(new, directory / "test_new")
             record["test_new"] = dict(new.metrics)
         _save_model(trainer, directory, record)
+    if spec.kind == "stale":
+        _save_model(trainer, directory, record)  # its validation scores at other windows read it (window.py)
     record["eval_seconds"] = time.perf_counter() - started
 
     history = getattr(trainer, "history", None)
@@ -669,9 +696,11 @@ def made_with_another_selection(spec: RunSpec, directory: Path) -> str | None:
 
 
 def differs_in_epochs_only(spec: RunSpec, directory: Path) -> bool:
-    """Whether the stage-1 final in ``directory`` was made with ``spec``'s configuration at another number of
-    epochs: the selection moved by an epoch extension (DECISIONS §42), not to another configuration."""
-    if spec.kind != "final" or spec.condition is not None or not (directory / "spec.json").exists():
+    """Whether the run in ``directory`` -- a stage-1 final, the stale run, or any ablation run built on a final --
+    was made with ``spec``'s configuration at another number of epochs: the selection moved by an epoch extension
+    (DECISIONS §42), not to another configuration. Such a run is moved aside and redone, not refused: an ablation's
+    runs follow the finals they rest on (DECISIONS §55)."""
+    if spec.kind == "trial" or not (directory / "spec.json").exists():
         return False
     made = read_json(directory / "spec.json")
     params = made.get("params") or {}
@@ -762,7 +791,7 @@ def execute(spec: RunSpec, split: Split, protocol: Protocol, work_dir: Path, *,
                                "host": socket.gethostname()})
     try:
         write_json(directory / "spec.json", asdict(spec))
-        trains = spec.kind in ("trial", "final")  # a reference or rescore reloads a stage-1 model
+        trains = spec.kind in ("trial", "final", "stale")  # a reference or rescore reloads a stage-1 model
         log(f"[{spec.dataset}/{spec.model}] {spec.label} on {device}"
             + (f": {json.dumps(spec.params, sort_keys=True)}" if trains else ""))
         started = time.perf_counter()

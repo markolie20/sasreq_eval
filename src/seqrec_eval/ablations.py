@@ -82,7 +82,7 @@ from compresso_recsys import ItemSequences
 from scipy.sparse import csr_matrix
 
 from .evaluate import fills_list, reachable_targets, recommendable_next, target_key
-from .protocol import AblationProtocol, Protocol, ProtocolError
+from .protocol import SETTINGS_TRANSFORM, AblationProtocol, Protocol, ProtocolError
 from .results import durable_replace, read_json, write_json
 from .runner import RunSpec, final_seeds, plan_finals, record_added_seeds, run_root, seeds_with_added
 from .search import _stream
@@ -657,6 +657,50 @@ def _catalogue(data, level, *, rng, options, value, phases):
 
 
 # ---------------------------------------------------------------------------
+# a model's own settings
+# ---------------------------------------------------------------------------
+
+def _validate_settings(levels, options) -> None:
+    if not all(isinstance(level, str) and level for level in levels):
+        raise ProtocolError(f"settings levels must be names, one per variant, got {list(levels)}")
+    unknown = sorted(set(options) - set(levels))
+    missing = [level for level in levels if level not in options]
+    if unknown or missing:
+        raise ProtocolError(f"settings options must give each level its settings and nothing else: "
+                            f"{'missing ' + str(missing) if missing else ''}{' ' if unknown and missing else ''}"
+                            f"{'unknown ' + str(unknown) if unknown else ''}")
+    empty = [level for level in levels if not isinstance(options[level], dict) or not options[level]]
+    if empty:
+        raise ProtocolError(f"settings levels {empty} change no setting: give each a table of the settings it sets")
+
+
+@register(SETTINGS_TRANSFORM, version=1, stochastic=False, target=None, validate=_validate_settings, scopes=("all",))
+def _settings(data, level, *, rng, options, value, phases):
+    """The data as it is: a settings sweep varies the model, not the data (DECISIONS §52).
+
+    Each level is the stage-1 selection with the settings ``options[level]`` put in place of its own, refitted on
+    the full data (:func:`plan_ablation`); the reference is the stage-1 final itself. So a level against the full
+    data is what that part of the configuration contributes, on the same data, users and seeds.
+    """
+    return dict(data)
+
+
+def settings_of(ablation: AblationProtocol, level: Any, model: str, params: dict[str, Any],
+                known: set[str]) -> dict[str, Any]:
+    """``params`` (a model's selected configuration) with a settings level's settings in place of its own.
+
+    ``known`` are the settings the model's section names (fixed or searched): a level that sets anything else is
+    refused, since a misspelt name would otherwise be ignored by nothing and passed to the model, or fail mid-run.
+    """
+    changes = dict(ablation.options[level_label(level)])
+    unknown = sorted(set(changes) - known)
+    if unknown:
+        raise ProtocolError(f"[ablations.{ablation.name}] level {level!r} sets {unknown}, which [models.{model}] "
+                            f"neither fixes nor searches; it has {sorted(known)}")
+    return {**params, **changes}
+
+
+# ---------------------------------------------------------------------------
 # conditions
 # ---------------------------------------------------------------------------
 
@@ -1152,6 +1196,9 @@ def plan_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: str, 
     base = (ablation_root(protocol, work_dir, sweep, dataset) / "runs" / model / fingerprint[:12]).relative_to(work_dir)
     stage1 = run_root(work_dir, dataset, model, protocol.run_fingerprint(dataset, model)).relative_to(work_dir)
     rescore = scope_of(protocol.ablation(sweep)) == "inference"
+    ablation = protocol.ablation(sweep)
+    settings = ablation.transform == SETTINGS_TRANSFORM
+    known = set(protocol.model(model).fixed) | set(protocol.model(model).space)
 
     def checkpoint(final: RunSpec) -> str:
         return str(stage1 / f"final-seed{final.seed}" / "model.zip")
@@ -1172,7 +1219,9 @@ def plan_ablation(protocol: Protocol, work_dir: Path, sweep: str, dataset: str, 
                              "path": str(base / level_label(level))}
                 if rescore:
                     condition["checkpoint"] = checkpoint(final)
+                # a settings sweep's level is the selection with some of its settings replaced (DECISIONS §52)
+                params = settings_of(ablation, level, model, final.params, known) if settings else final.params
                 specs.append(replace(final, kind="rescore" if rescore else "final", fingerprint=fingerprint,
-                                     condition=condition))
+                                     condition=condition, params=params))
             plans[condition_name(level, data_seed)] = specs
     return plans

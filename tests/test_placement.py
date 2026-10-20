@@ -84,7 +84,10 @@ def test_placing_any_model_of_the_real_protocol_moves_no_fingerprint(tmp_path, k
         assert {k: v for k, v in after.items() if k in before} == {k: v for k, v in before.items() if k in after}
         assert {k for k in before if k[0] != "ablation"} == {k for k in after if k[0] != "ablation"}
         if key == "in_ablations" and value == "false":
-            assert not [k for k in after if k[0] == "ablation" and k[-1] == model]
+            # out of every data sweep; a settings sweep, about the model itself, still names it (DECISIONS §52)
+            settings = {name for name, a in load_protocol(REPO / "protocol.toml").ablations.items()
+                        if a.transform == "settings"}
+            assert not [k for k in after if k[0] == "ablation" and k[-1] == model and k[1] not in settings]
 
 
 def test_the_placement_keys_are_the_only_ones_left_out(tmp_path):

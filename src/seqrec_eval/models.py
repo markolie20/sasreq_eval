@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from compresso_recsys.models import (
     EASE,
     Bert4RecConfig,
@@ -130,9 +131,73 @@ def _popularity(params, *, n_items, device, seed):
     return PopularityBaseline(PopularityBaselineConfig(**params))
 
 
-@register("ease", family="matrix", cls=EASE)
+class LowMemoryEASE(EASE):
+    """The library's EASE, fitted in a fraction of the memory: the same closed form, B = −P / diag(P) with
+    P = (XᵀX + λI)⁻¹ and a zero diagonal (Steck, WWW 2019), computed in place (DECISIONS §55).
+
+    The library forms XᵀX as a sparse product, densifies it and inverts it with ``np.linalg.inv``: on Music4All's
+    36,797 items that held about 45 GB at once, and the kernel's out-of-memory killer ended the run (2026-10-14).
+    Here the Gram matrix is built dense block by block of items, never as a sparse product, and inverted in place by
+    Cholesky (``potrf``, then ``potri``; it is symmetric positive definite for λ > 0), so the peak is about one
+    items × items matrix: 5.4 GB in float32 on Music4All. Saved, loaded and scored exactly as the library's EASE,
+    whose checkpoints it reads. The inverse is the same to rounding (tested against the library's fit); LU and
+    Cholesky round differently, so float32 weights can differ in the last digits.
+    """
+
+    #: items per block of the Gram matrix: a block's sparse product holds at most items × this many entries
+    BLOCK = 2048
+
+    def fit(self, interactions, *, item_ids=None):
+        from compresso_recsys.models._validation import canonical_csr
+        from scipy.linalg import lapack
+
+        interactions = canonical_csr(interactions, name="interactions")
+        if interactions.shape[0] < 1 or interactions.shape[1] < 1:
+            raise ValueError("interactions must contain at least one user and one item")
+        n_items = int(interactions.shape[1])
+        vocabulary = self._prepare_item_vocabulary(item_ids, n_items=n_items)
+        x = interactions.astype(self.dtype, copy=False)
+        rows_of_items, columns = x.T.tocsr(), x.tocsc()
+        gram = np.empty((n_items, n_items), dtype=self.dtype)
+        for start in range(0, n_items, self.BLOCK):
+            stop = min(start + self.BLOCK, n_items)
+            gram[:, start:stop] = (rows_of_items @ columns[:, start:stop]).toarray()
+        gram[np.diag_indices(n_items)] += self.dtype.type(self.cfg.l2)
+        # the Gram matrix is symmetric, so its transpose -- a Fortran-ordered view of the same memory -- is itself:
+        # LAPACK factorises and inverts it there, without a copy
+        potrf, potri = (lapack.spotrf, lapack.spotri) if self.dtype == np.float32 else (lapack.dpotrf, lapack.dpotri)
+        factor, info = potrf(gram.T, lower=False, overwrite_a=True, clean=False)
+        if info != 0:
+            raise np.linalg.LinAlgError(f"EASE's Gram matrix is not positive definite (potrf info {info})")
+        inverse, info = potri(factor, lower=False, overwrite_c=True)
+        if info != 0:
+            raise np.linalg.LinAlgError(f"EASE's Gram matrix could not be inverted (potri info {info})")
+        del factor, gram
+        # potri filled the upper triangle of the Fortran-ordered matrix, which is the lower triangle (row >= column)
+        # of its C-ordered transpose; the strict upper triangle still holds the Gram matrix. Mirror the lower one
+        # into it, a block of rows at a time.
+        precision = inverse.T
+        del inverse
+        for start in range(0, n_items, self.BLOCK):
+            stop = min(start + self.BLOCK, n_items)
+            upper = np.triu_indices(stop - start, k=1)
+            block = precision[start:stop, start:stop]
+            block[upper] = block.T[upper]
+            precision[start:stop, stop:] = precision[stop:, start:stop].T
+        diagonal = np.diag(precision).copy()
+        if np.any(diagonal == 0):
+            raise np.linalg.LinAlgError("EASE precision matrix has a zero diagonal")
+        precision /= -diagonal
+        precision[np.diag_indices(n_items)] = 0
+        self.coefficients_ = np.ascontiguousarray(precision)
+        self.n_items_ = n_items
+        self._publish_item_vocabulary(vocabulary)
+        return self
+
+
+@register("ease", family="matrix", cls=LowMemoryEASE)
 def _ease(params, *, n_items, device, seed):
-    return EASE(EASEConfig(**params))
+    return LowMemoryEASE(EASEConfig(**params))
 
 
 @register("elsa", family="matrix", cls=ELSATrainer)

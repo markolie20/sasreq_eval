@@ -31,14 +31,16 @@ import csv
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from compresso_recsys.evaluation import EvaluationResult
 
-from .analysis import cold_note, floor_of, full_results
+from .analysis import cold_note, discovery_views, floor_of, full_results
 from .evaluate import other_definition
+from .freshness import freshness_section, read_age
 from .protocol import Protocol
 from .results import read_json
 from .runner import (  # noqa: F401  (STILL_IMPROVING, still_improving: read from here by the tests)
@@ -55,6 +57,7 @@ from .runner import (  # noqa: F401  (STILL_IMPROVING, still_improving: read fro
 )
 from .seedstats import compare as compare_seeds, holm
 from .splits import PHASES, split_dir
+from .window import window_choice, window_finals
 
 
 #: Significance level and interval coverage of every comparison in the reports.
@@ -137,6 +140,44 @@ def _table(header: list[str], rows: list[list[Any]]) -> str:
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     lines += ["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows]
     return "\n".join(lines)
+
+
+def _view_comparisons(primary: str, per_seed: dict[str, list[EvaluationResult]], reference: str | None,
+                      floor: tuple[str, EvaluationResult] | None, *, what: str
+                      ) -> tuple[list[str], dict[str, tuple[float, float]]]:
+    """Every model against ``reference`` and against ``floor`` on one view of the test set (new items, a serving
+    window): the seed-aware test of the main comparison, each a Holm family of its own. The report's lines, and per
+    model its difference from the reference and adjusted p."""
+    lines: list[str] = []
+    outcome: dict[str, tuple[float, float]] = {}
+    if reference in per_seed and len(per_seed) > 1:
+        seeded = [compare_seeds(per_seed[model], per_seed[reference], primary, names=(model, reference),
+                                confidence=CONFIDENCE) for model in per_seed if model != reference]
+        adjusted, users_only = holm([c.p_value for c in seeded]), holm([c.p_users for c in seeded])
+        base = float(np.mean([np.mean(e.per_user[primary]) for e in per_seed[reference]]))
+        outcome = {c.candidate: (c.difference, p) for c, p in zip(seeded, adjusted)}
+        lines += ["", (f"{what}: every model against **{reference}**, test {primary}, the seed-aware t-test of the "
+                       f"main comparison, Holm across these {len(seeded)}."), "",
+                  _table(["model", "difference", "relative", f"{CONFIDENCE:.0%} interval", "adjusted p",
+                          "users-only p", "significant"],
+                         [[c.candidate, f"{c.difference:+.4f}", f"{c.difference / base:+.1%}" if base else "—",
+                           f"[{c.ci_low:+.4f}, {c.ci_high:+.4f}]", f"{p:.4g}", f"{u:.4g}",
+                           "yes" if p <= ALPHA else "no"] for c, p, u in zip(seeded, adjusted, users_only)])]
+    if floor is not None and per_seed:
+        name, result = floor
+        key = f"floor: {name}"
+        seeded = [compare_seeds(per_seed[model], [result], primary, names=(model, key), confidence=CONFIDENCE)
+                  for model in per_seed]
+        adjusted, users_only = holm([c.p_value for c in seeded]), holm([c.p_users for c in seeded])
+        lines += ["", (f"{what}: against the floor, **{name}** at test {primary} {result.metrics[primary]:.4f} (the "
+                       "strongest non-learned baseline scored the same way), Holm across these "
+                       f"{len(seeded)}."), "",
+                  _table(["model", "difference", f"{CONFIDENCE:.0%} interval", "adjusted p", "users-only p",
+                          "beats the floor"],
+                         [[c.candidate, f"{c.difference:+.4f}", f"[{c.ci_low:+.4f}, {c.ci_high:+.4f}]", f"{p:.4g}",
+                           f"{u:.4g}", "yes" if p <= ALPHA and c.difference > 0 else "no"]
+                          for c, p, u in zip(seeded, adjusted, users_only)])]
+    return lines, outcome
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +325,7 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
         lines += [f"Seeds {list(seeds)}: the protocol's, and {list(seeds[len(protocol.seeds):])} added later "
                   "(`final --add-seeds`).", ""]
     rows, csv_rows, averaged, per_seed, notes, new_rows, scoring = [], [], {}, {}, [], [], None
+    views = {view: {} for _, view in discovery_views(protocol, dataset)}  # view -> model -> one result per seed
     for model in models:
         if protocol.model(model).latency_only:
             if protocol.model(model).runs_on(dataset):
@@ -354,6 +396,10 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
             averaged[model] = mean_over_seeds([e for _, e in finals])
             per_seed[model] = [e for _, e in finals]
             scoring = scoring or finals[0][1]
+        for view in views:
+            found = [e for _, e in load_final_evaluations(protocol, work_dir, dataset, model, stem=view)]
+            if found and found[0].n_scored_rows:
+                views[view][model] = found
         new = load_final_evaluations(protocol, work_dir, dataset, model, stem="test_new")
         if new:
             scored = new[0][1].n_scored_rows
@@ -424,7 +470,8 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                       f"**{protocol.targets}** targets), test {protocol.primary_metric}:"), "",
                   _table(["model", f"{protocol.targets} (primary)", f"{other} (diagnostic)"], diagnostic_rows)]
 
-    baselines = full_results(protocol, work_dir, dataset)["baselines"]
+    analysed = full_results(protocol, work_dir, dataset)
+    baselines = analysed["baselines"]
     floor = floor_of(baselines, protocol.primary_metric, expected=protocol.baselines)
     if floor is None:
         missing = ", ".join(name for name in protocol.baselines if name not in baselines)
@@ -447,14 +494,81 @@ def dataset_report(protocol: Protocol, work_dir: Path, dataset: str, models: lis
                          [[c.candidate, f"{c.difference:+.4f}", f"[{c.ci_low:+.4f}, {c.ci_high:+.4f}]",
                            f"{p:.4g}", f"{u:.4g}", "yes" if p <= ALPHA and c.difference > 0 else "no"]
                           for c, p, u in zip(seeded, adjusted, users_only)])]
-    return "\n".join(lines), csv_rows, outcome
+
+    # the views of new items (DECISIONS §50, §54): the next item when the user never had it, and every new item
+    # later in the window; each with its own floor, from the baselines scored the same way
+    primary = protocol.primary_metric
+    outcomes = {"main": outcome}
+    for _, view in discovery_views(protocol, dataset):
+        found = views[view]
+        if not found:
+            continue
+        what = "New items only" if view == "test_new" else "Later new items"
+        if view == "test_window_new":
+            lines += ["", (f"Every new item the user went on to have in the test window, seen items excluded "
+                           "(DECISIONS §54): a list holding several of them counts each, where the next-item score "
+                           f"counts only the first. Test {primary}:"), "",
+                      _table(["model", f"test {primary}", "users scored"],
+                             [[model, _mean_sd([e.metrics[primary] for e in runs]), f"{runs[0].n_scored_rows:,}"]
+                              for model, runs in found.items()])]
+        view_floor = floor_of(analysed["views"].get(view, {}), primary, expected=protocol.baselines)
+        if view_floor is None:
+            lines += ["", f"_{what}: no floor yet, every baseline must be scored on it first (`seqrec-eval analyse`)._"]
+        added, outcomes[view] = _view_comparisons(primary, found, reference, view_floor, what=what)
+        lines += added
+
+    # each model with serving windows, at the window chosen on validation (DECISIONS §51)
+    for model in models:
+        mp = protocol.model(model)
+        if not mp.serving_windows or not mp.scored_on(dataset) or model not in per_seed:
+            continue
+        lines += [""] + _window_section(protocol, work_dir, dataset, model, per_seed, views.get("test_new", {}))
+    return "\n".join(lines), csv_rows, outcomes
+
+
+def _window_section(protocol: Protocol, work_dir: Path, dataset: str, model: str,
+                    per_seed: dict[str, list[EvaluationResult]], new_items: dict[str, list[EvaluationResult]]
+                    ) -> list[str]:
+    """``model`` at the serving window chosen on validation, and every model against it (DECISIONS §51)."""
+    primary = protocol.primary_metric
+    choice = window_choice(protocol, work_dir, dataset, model)
+    if choice is None:
+        return [f"_**{model}** at its serving window: not chosen yet; run `seqrec-eval window --model {model}`._"]
+    window = choice["window"]
+    shown = ", ".join(f"{'whole history' if n is None else f'last {n}'} {v:.4f}"
+                      for n, v in sorted(choice["values"].items(), key=lambda kv: math.inf if kv[0] is None else kv[0]))
+    trial = choice["trial_value"]
+    lines = [(f"**{model} at its serving window** (DECISIONS §51): the history a request carries cut to its last n "
+              f"events, n chosen on validation by the selection ({choice['selection']}) refitted on the training "
+              f"window under the first seed. Validation {primary}: {shown}"
+              + (f" (the search trial itself: {trial:.4f})" if trial is not None else "") + ".")]
+    if window is None:
+        return lines + ["", (f"The whole history scored best, so {model} is served it: the main comparison above is "
+                             "the comparison with it.")]
+    windowed = window_finals(protocol, work_dir, dataset, model, window)
+    if not windowed:
+        return lines + ["", f"_The last {window} events won; not scored on test yet: run `seqrec-eval window`._"]
+    label = f"{model}, last {window}"
+    candidates = {(f"{name}, whole history" if name == model else name): runs for name, runs in per_seed.items()}
+    added, _ = _view_comparisons(primary, {**candidates, label: windowed}, label, None,
+                                 what=f"Against {model} at its last {window} events")
+    lines += ["", f"At the last {window} events, test {primary} {_mean_sd([e.metrics[primary] for e in windowed])}."]
+    lines += added
+    new_windowed = window_finals(protocol, work_dir, dataset, model, window, view="test_new")
+    if new_windowed and new_items:
+        renamed = {(f"{name}, whole history" if name == model else name): runs for name, runs in new_items.items()}
+        added, _ = _view_comparisons(primary, {**renamed, label: new_windowed}, label, None,
+                                     what=f"New items only, against {model} at its last {window} events")
+        lines += added
+    return lines
 
 
 def _across_datasets(outcomes: dict[str, dict[str, tuple[float, float]]], datasets: list[str],
-                     reference: str) -> str:
+                     reference: str, *, title: str = "## Across datasets", view: str = "") -> str:
     """Per model, in how many datasets it is significantly better than, not different from, or worse than
     the reference, and the sign of each difference. Nothing is pooled: the rule fixed in advance (H51) is that
-    each dataset answers on its own, and an overall claim needs the same answer on most of them."""
+    each dataset answers on its own, and an overall claim needs the same answer on most of them. ``view`` names a
+    view of the test set other than the main one (new items only)."""
     models = sorted({model for outcome in outcomes.values() for model in outcome})
     if not models:
         return ""
@@ -472,8 +586,8 @@ def _across_datasets(outcomes: dict[str, dict[str, tuple[float, float]]], datase
             level += not significant
             cells.append(("+" if difference > 0 else "−") + ("*" if significant else ""))
         rows.append([model, *cells, better, level, worse])
-    return "\n".join(["## Across datasets", "", (
-        f"Against **{reference}**, per dataset: the sign of the difference, * where significant (Holm within the "
+    return "\n".join([title, "", (
+        f"Against **{reference}**{view}, per dataset: the sign of the difference, * where significant (Holm within the "
         "dataset). Nothing is pooled across datasets (H51): each answers on its own, and a claim about all of them "
         "needs the same answer on most of them, which the counts show."), "",
         _table(["model", *datasets, "better", "not different", "worse"], rows)])
@@ -487,7 +601,17 @@ def build_report(protocol: Protocol, work_dir: Path, datasets: list[str], models
         sections.append(section)
         all_rows += rows
     if reference and len(datasets) > 1:
-        sections.append(_across_datasets(outcomes, datasets, reference))
+        sections.append(_across_datasets({d: o["main"] for d, o in outcomes.items()}, datasets, reference))
+        new = {d: o["test_new"] for d, o in outcomes.items() if o.get("test_new")}
+        if new:
+            sections.append(_across_datasets(new, [d for d in datasets if d in new], reference,
+                                             title="## Across datasets: new items only",
+                                             view=" on the next items the users never had (DECISIONS §50)"))
+    # one window older, with how fast the catalogue goes stale (DECISIONS §53)
+    freshness = freshness_section(protocol, work_dir, datasets, models,
+                                  {dataset: read_age(protocol, work_dir, dataset) for dataset in datasets})
+    if freshness:
+        sections.append(freshness)
     # the full path and the file's hash: a report of a quick local run (work-local/<dataset>/protocol.toml) must
     # not read like one of the real protocol.toml
     digest = hashlib.sha256(protocol.path.read_bytes()).hexdigest()[:12]

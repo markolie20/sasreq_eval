@@ -372,18 +372,21 @@ def evaluate_phase(model: Any, split: Split, phase: str, *, family: str, protoco
     """Score ``model`` on ``phase``.
 
     ``targets`` is "primary" (the protocol's definition), "next" or "window"
-    explicitly, or "new": the protocol's targets not already in the history.
+    explicitly, "new": the protocol's targets not already in the history, or "window_new": everything in the
+    phase's window not already in the history -- every new item the user went on to have, so a list that holds
+    several of them counts each (DECISIONS §54).
     ``lists``, if given, receives each batch's ranked item columns (phase catalogue indices), in the order the
     rows are scored: the very lists the metrics were computed from (the diversity diagnostics read them).
     """
-    if targets not in ("primary", "new", *TARGET_DEFINITIONS):
-        raise ValueError(f"targets must be 'primary', 'new' or one of {TARGET_DEFINITIONS}, got {targets!r}")
+    if targets not in ("primary", "new", "window_new", *TARGET_DEFINITIONS):
+        raise ValueError(f"targets must be 'primary', 'new', 'window_new' or one of {TARGET_DEFINITIONS}, "
+                         f"got {targets!r}")
     if phase == "val" and split.trained_on != "train":
         raise ValueError(f"{split.dataset}: a model trained on {split.trained_on} has seen the validation window, "
                          "so its validation score would be leaked; score it on test")
-    definition = protocol.targets if targets in ("primary", "new") else targets
+    definition = {"primary": protocol.targets, "new": protocol.targets, "window_new": "window"}.get(targets, targets)
     target_matrix = phase_targets(split, phase, definition)
-    if targets == "new":
+    if targets in ("new", "window_new"):
         # against the whole history: a condition's input may be truncated
         target_matrix = new_item_targets(target_matrix, seen_history(split.data, phase))
     rows, unrecommendable, too_few_unseen = _select_rows(split, phase, protocol, definition, target_matrix,

@@ -6,7 +6,9 @@
     seqrec-eval analysis-report            work/reports/analysis.md
     seqrec-eval search  --device cuda:0    random-search trials, validation only
     seqrec-eval final   --device cuda:0    selected configuration x seeds, with test
-    seqrec-eval diversity --device cuda:0  coverage and intra-list diversity of the saved final models
+    seqrec-eval diversity --device cuda:0  coverage, intra-list diversity, novelty of the saved final models
+    seqrec-eval stale   --device cuda:0    each selection fitted on the training window alone: one window older
+    seqrec-eval window  --device cuda:0    models with serving_windows at the window chosen on validation
     seqrec-eval status | report | latency
     seqrec-eval ablate  --device cuda:0    each [ablations.*] sweep on the stage-1 configurations
     seqrec-eval ablation-report            work/reports/ablation-<sweep>.md and its CSVs
@@ -70,9 +72,19 @@ from .models import PLUGIN_ERRORS, model_spec
 from .protocol import load_protocol
 from .report import build_report, status_table
 from .results import read_json
-from .runner import add_final_seeds, execute, final_seeds, plan_extensions, plan_finals, plan_trials
+from .runner import (
+    add_final_seeds,
+    differs_in_epochs_only,
+    execute,
+    final_seeds,
+    plan_extensions,
+    plan_finals,
+    plan_stale,
+    plan_trials,
+)
 from .splits import final_split, load_split, prepare_split, split_dir
 from .strata import build_strata_report
+from .window import score_window, select_window
 
 
 def _log(message: str) -> None:
@@ -148,6 +160,16 @@ def _parser() -> argparse.ArgumentParser:
             sub.add_argument("--add-seeds", nargs="+", type=int, metavar="SEED",
                              help="give the selected datasets these further final seeds (all their models), beside "
                                   "the protocol's; recorded, so later commands and reports use them too")
+
+    for name, text in (("stale", "fit each selection on the training window alone and score it on validation and "
+                                 "test: the finals one window older (DECISIONS §53)"),
+                       ("window", "for a model with serving_windows, choose the window on validation (fitting its "
+                                  "stale run if needed) and score its finals there (DECISIONS §51)")):
+        sub = commands.add_parser(name, help=text)
+        selection(sub)
+        sub.add_argument("--device", default=_default_device(), help="torch device (default: %(default)s)")
+        sub.add_argument("--threads", type=int, help="torch CPU threads for this process")
+        sub.add_argument("--retry-failed", action="store_true", help="rerun a stale run that failed before")
 
     status = commands.add_parser("status", help="progress per dataset and model")
     selection(status)
@@ -354,6 +376,43 @@ def _main(argv: list[str] | None) -> int:
         _log("finished: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
         return _exit_code(counts)
 
+    if args.command in ("stale", "window"):
+        if args.threads:
+            torch.set_num_threads(args.threads)
+        counts = {}
+        for dataset in datasets:
+            split, tested = load_split(work_dir, dataset, protocol), None
+            for model in models:
+                mp = protocol.model(model)
+                if not mp.scored_on(dataset) or (args.command == "window" and not mp.serving_windows):
+                    continue
+                model_spec(model)
+                try:
+                    specs = plan_stale(protocol, work_dir, dataset, model)
+                except RuntimeError as error:
+                    _log(f"[{dataset}/{model}] not ready: {error}")
+                    counts["not-ready"] = counts.get("not-ready", 0) + 1
+                    continue
+                status = None
+                for spec in specs:
+                    status = execute(spec, split, protocol, work_dir, device=args.device,
+                                     retry_failed=args.retry_failed, log=_log)
+                    counts[status] = counts.get(status, 0) + 1
+                if args.command == "stale" or status not in ("done", "cached"):
+                    continue
+                choice = select_window(protocol, work_dir, split, model, device=args.device, log=_log)
+                if choice is None:
+                    counts["not-ready"] = counts.get("not-ready", 0) + 1
+                    continue
+                window = choice["window"]
+                _log(f"[{dataset}/{model}] serving window chosen on validation: "
+                     + ("the whole history" if window is None else f"the last {window} events"))
+                tested = tested if tested is not None else final_split(protocol, split)
+                score_window(protocol, work_dir, tested, model, window, device=args.device, log=_log)
+            del split, tested
+        _log("finished: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        return _exit_code(counts)
+
     if args.command == "status":
         print(status_table(protocol, work_dir, datasets, models))
         return 0
@@ -532,8 +591,11 @@ def _ablate(protocol, work_dir: Path, split, sweep: str, models: list[str], args
                 counts[status] = counts.get(status, 0) + 1
 
     def pending(name: str) -> bool:
+        # a run made on a final at other epochs than the selection's is work left too: it is moved aside and redone
+        # (DECISIONS §55), so a condition whose runs all finished is still built for it
         measured = (ablation_root(protocol, work_dir, sweep, dataset) / "conditions" / f"{name}.json").exists()
         return not measured or any(not (spec.directory(work_dir) / "done.json").exists()
+                                   or differs_in_epochs_only(spec, spec.directory(work_dir))
                                    for plan in plans.values() for spec in plan[name])
 
     run(build_reference(protocol, work_dir, split, sweep), REFERENCE)

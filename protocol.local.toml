@@ -65,7 +65,10 @@ refit = true
 # every model; models without `epochs` (EASE, popularity) are never extended.
 # Not in any fingerprint: the search's trials stay, and finals made at the old
 # epochs are moved aside and redone.
-epoch_extension = [2, 4]
+# Decided 2026-10-20 (Mark; DECISIONS §55): 8 joins 2 and 4. SASRec on Yambda was still
+# improving at 4x (validation 0.051, 0.070, 0.078 at 1x, 2x, 4x; loss still falling 15%);
+# the rule is the same for every selection still falling more than 5%.
+epoch_extension = [2, 4, 8]
 # Decided (2026-10-12, Mark; DECISIONS §43): only a selection whose training
 # loss still fell more than 5% over its last tenth of epochs is extended, not
 # every one the report flags (1%). A budget decision, made after the DGX was
@@ -219,6 +222,10 @@ l2 = { loguniform = [1.0, 250000.0] }
 
 [models.elsa]
 family = "matrix"
+# Decided 2026-10-20 (Mark; DECISIONS §51): ELSA is also served the last n events of a
+# history, n chosen on validation from these (the inference sweep's levels), and every model
+# is compared with it there too. Not in any fingerprint: it rescores the finals.
+serving_windows = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
 [models.elsa.space]
 # ML-20M reproduction: 800 factors, batch 32, lr 0.1 with NAdam (the library's
 # optimizer too), 10 epochs. 4096 factors would not fit a V100 with Adam state on
@@ -498,6 +505,26 @@ levels = [0.5, 1.0]
 seeds = [0]
 datasets = ["music4all", "otto"]
 knee_margin = 0.10
+
+[ablations.sasrec_ce_parts]
+# Decided 2026-10-20 (Mark; DECISIONS §52): what each part of SASRec v2's selection
+# contributes. The data stays as it is; each level refits the selection with the settings
+# below in place of its own, under seed 0, and is compared with the stage-1 final. On the
+# three datasets where trial #0 (d 64, 3 blocks, co-occurrence replacement and insertion
+# 0.1, no masking) was selected. A settings sweep names its models and may name one kept
+# out of the data sweeps.
+transform = "settings"
+models = ["sasrec_ce"]
+datasets = ["music4all", "yambda", "otto"]
+seeds = [0]
+levels = ["no_augmentation", "replace_only", "insert_only", "masking", "width_32", "one_block"]
+[ablations.sasrec_ce_parts.options]
+no_augmentation = { mask_probability = 0.0, cooccurrence_replace_probability = 0.0, cooccurrence_insert_probability = 0.0 }
+replace_only = { mask_probability = 0.0, cooccurrence_replace_probability = 0.1, cooccurrence_insert_probability = 0.0 }
+insert_only = { mask_probability = 0.0, cooccurrence_replace_probability = 0.0, cooccurrence_insert_probability = 0.1 }
+masking = { mask_probability = 0.2 }
+width_32 = { d_model = 32 }
+one_block = { n_blocks = 1 }
 
 # Stage-1 results cut by repeat share within history-length bins. No runs.
 [repeat_strata]

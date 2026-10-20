@@ -58,6 +58,12 @@ _SCORING_ONLY_KEYS = ("exclude_seen", "new_item_diagnostic")
 #: Like ``eval_batch_size``, they enter no fingerprint: a model's ``datasets`` widened later starts its runs on the
 #: new datasets and leaves the finished ones where they are, and taking a model out of the sweeps moves nothing.
 _PLACEMENT_KEYS = ("datasets", "in_ablations")
+#: Keys of a ``[models.*]`` section that add a measurement of the runs already made rather than change them: the
+#: windows a model is also served at (DECISIONS §51). Like the placement keys, they enter no fingerprint.
+_MEASUREMENT_KEYS = ("serving_windows",)
+#: The ablation transform that varies a model's own settings rather than the data (DECISIONS §52): such a sweep
+#: names its models, and may name one kept out of the data sweeps (``in_ablations = false``).
+SETTINGS_TRANSFORM = "settings"
 
 #: Bumped when the baselines' code changes what they recommend; it enters every baseline fingerprint, so results
 #: of the older code are not reused. 2 (2026-09-30): equal scores are ranked in one fixed order (more popular
@@ -81,7 +87,8 @@ _ALLOWED_KEYS = {
     "datasets": {"builder", "temporal_period_hours", "train_users", "min_user_support", "item_min_support",
                  "min_value_to_keep", "set_all_values_to", "exclude_seen", "new_item_diagnostic",
                  "amazon_category", "options"},
-    "models": {"family", "trials", "fixed", "space", "max_items", "latency_only", *_PLACEMENT_KEYS},
+    "models": {"family", "trials", "fixed", "space", "max_items", "latency_only", *_PLACEMENT_KEYS,
+               *_MEASUREMENT_KEYS},
     "ablations": {"transform", "levels", "options", "scope", "datasets", "models", "seeds", "expected_to_move",
                   "manipulation_tolerance", "knee_margin", "min_level_users"},
     "baselines": {"kind", "trials", "fixed", "space"},
@@ -179,6 +186,9 @@ class ModelProtocol:
     #: never scored, so it appears in the latency table and nowhere else. Unlike the placement keys it is part of the
     #: fingerprint: such a final is not a model whose accuracy means anything.
     latency_only: bool = False
+    #: the history windows (last n events) the model is also scored at, the best on validation kept (DECISIONS §51);
+    #: empty for none. In no fingerprint: it rescores the finals, it does not change them
+    serving_windows: tuple[int, ...] = ()
 
     def runs_on(self, dataset: str) -> bool:
         return self.datasets is None or dataset in self.datasets
@@ -320,11 +330,12 @@ class Protocol:
 
     def run_fingerprint(self, dataset: str, model: str) -> str:
         """Identity of every run of ``model`` on ``dataset`` under this file: its section without the keys that only
-        place it (:data:`_PLACEMENT_KEYS`)."""
+        place it (:data:`_PLACEMENT_KEYS`) or add a measurement of its runs (:data:`_MEASUREMENT_KEYS`)."""
         return _digest({
             "protocol": self._result_settings(),
             "dataset": self.dataset(dataset).raw,
-            "model": {key: value for key, value in self.model(model).raw.items() if key not in _PLACEMENT_KEYS},
+            "model": {key: value for key, value in self.model(model).raw.items()
+                      if key not in _PLACEMENT_KEYS + _MEASUREMENT_KEYS},
         })
 
 
@@ -427,11 +438,18 @@ def _parse_model(name: str, table: dict, default_trials: int) -> ModelProtocol:
         if clash:
             raise ProtocolError(f"{where} is latency_only, so it takes one fixed configuration and no {clash}")
         in_ablations = False
+    windows = table.get("serving_windows", [])
+    if (not isinstance(windows, list) or len(set(windows)) != len(windows)
+            or not all(isinstance(n, int) and not isinstance(n, bool) and n >= 1 for n in windows)):
+        raise ProtocolError(f"{where}.serving_windows must be a list of distinct positive integers (the last n events "
+                            f"a request is given), got {windows!r}")
+    if windows and latency_only:
+        raise ProtocolError(f"{where} is latency_only, so it is never scored, at a window or otherwise")
     return ModelProtocol(
         name=name, family=family, trials=trials, fixed=fixed, space=space,
         max_items=None if max_items is None else int(max_items), raw=table,
         datasets=None if datasets is None else tuple(datasets), in_ablations=in_ablations,
-        latency_only=latency_only,
+        latency_only=latency_only, serving_windows=tuple(sorted(windows)),
     )
 
 
@@ -474,6 +492,10 @@ def _parse_ablation(name: str, table: dict, datasets: dict, models: dict,
     if not isinstance(options, dict):
         raise ProtocolError(f"{where}.options must be a table")
     chosen = {}
+    # a settings sweep varies the model itself, so it names the models it is about (DECISIONS §52)
+    settings = table.get("transform") == SETTINGS_TRANSFORM
+    if settings and "models" not in table:
+        raise ProtocolError(f"{where} varies models' own settings, so it must name its models")
     # a sweep that names no models runs every model that takes part in the sweeps (§45)
     default = {"datasets": list(datasets), "models": [name for name, m in models.items() if m.in_ablations]}
     for key, available in (("datasets", datasets), ("models", models)):
@@ -482,7 +504,8 @@ def _parse_ablation(name: str, table: dict, datasets: dict, models: dict,
         if unknown:
             raise ProtocolError(f"{where}.{key} names {unknown}, which the protocol does not define")
         chosen[key] = tuple(names)
-    excluded = [name for name in chosen["models"] if not models[name].in_ablations]
+    # in_ablations = false keeps a model out of the data sweeps; a settings sweep, about the model itself, may name it
+    excluded = [] if settings else [name for name in chosen["models"] if not models[name].in_ablations]
     if excluded:
         raise ProtocolError(f"{where}.models names {excluded}, whose [models.*] in_ablations is false")
     seeds = table.get("seeds", list(protocol_seeds))

@@ -74,7 +74,8 @@ from .baselines import (
     TimeDecayedPopularityConfig,
 )
 from .evaluate import cold_histories, evaluate_phase, other_definition, scored_users, target_key
-from .protocol import BaselineProtocol, Protocol, _digest
+from .freshness import age_path, next_item_age, read_age
+from .protocol import SETTINGS_TRANSFORM, BaselineProtocol, Protocol, _digest
 from .results import (
     evaluation_exists,
     load_evaluation,
@@ -128,6 +129,20 @@ def _score(protocol: Protocol, split: Split, model, phase: str, targets: str = "
     rows = split.val_rows if phase == "val" else split.test_rows
     return evaluate_phase(model, split, phase, family="sequence", protocol=protocol,
                           exclude_seen=protocol.dataset(split.dataset).exclude_seen, rows=rows, targets=targets)
+
+
+def discovery_views(protocol: Protocol, dataset: str) -> list[tuple[str, str]]:
+    """The views of new items a dataset's finals and baselines are also scored on, as (targets, stem): the next
+    item when the user never had it (``new_item_diagnostic``, DECISIONS §38, §50), and every new item later in the
+    test window (DECISIONS §54). Seen items are always excluded on them."""
+    views = [("new", "test_new")] if protocol.dataset(dataset).new_item_diagnostic else []
+    return views + [("window_new", "test_window_new")]
+
+
+def score_view(protocol: Protocol, split: Split, model, targets: str, *, family: str = "sequence") -> EvaluationResult:
+    """``model`` on test against a view of :func:`discovery_views`, seen items excluded."""
+    return evaluate_phase(model, split, "test", family=family, protocol=protocol, exclude_seen=True,
+                          rows=split.test_rows, targets=targets)
 
 
 def analysis_root(protocol: Protocol, work_dir: Path, dataset: str) -> Path:
@@ -307,6 +322,9 @@ def analyse_full(protocol: Protocol, work_dir: Path, split: Split, log=print) ->
     if not cold.exists() or read_json(cold).get("version") != COLD_VERSION:
         write_json(cold, count_cold_histories(protocol, split, tested))
         log(f"[{split.dataset}] {cold_note(protocol, work_dir, split.dataset)}")
+    if read_age(protocol, work_dir, split.dataset) is None and tested.data.get(target_key("test", "next")) is not None:
+        # how many next items a model one window older has never seen (DECISIONS §53)
+        write_json(age_path(protocol, work_dir, split.dataset), next_item_age(split, tested))
     other = other_definition(protocol.targets)
     diagnose = tested.data.get(target_key("test", other)) is not None
     for name in protocol.baselines:
@@ -320,6 +338,11 @@ def analyse_full(protocol: Protocol, work_dir: Path, split: Split, log=print) ->
         if diagnose:
             _cached(stem.with_name(f"test_{other}"), lambda: _score(protocol, tested, fit(), "test", other),  # noqa: B023
                     {**record, "targets": other})
+        # the floor on new items: what a simple rule does where the user's own history cannot be recommended back
+        # (DECISIONS §50, §54); each baseline keeps the setting selected on all next items, as the models do
+        for targets, view in discovery_views(protocol, split.dataset):
+            _cached(stem.with_name(view), lambda t=targets: score_view(protocol, tested, fit(), t),  # noqa: B023
+                    {**record, "targets": targets})
     for control in CONTROLS:
         stem = root / "controls" / control / _controls_fingerprint(protocol, split.dataset)[:12] / "test"
         fit = lambda c=control: fit_control(protocol, tested, c, _control_stream(protocol, tested))
@@ -374,7 +397,12 @@ def analyse_sweep(protocol: Protocol, work_dir: Path, split: Split, sweep: str, 
 
     The baselines keep the setting selected on ``split``; the conditions are
     transforms of :func:`final_split`'s data, like the models' ablation runs.
+    A settings sweep (DECISIONS §52) leaves the data as it is, so its baselines are the full data's.
     """
+    if protocol.ablation(sweep).transform == SETTINGS_TRANSFORM:
+        log(f"[{split.dataset}] {sweep} varies models' own settings, not the data: its baselines are the full "
+            "data's, so there is nothing to analyse")
+        return
     scorers = _condition_scorers(protocol, work_dir, split)
     tested = final_split(protocol, split)
 
@@ -411,7 +439,9 @@ def full_results(protocol: Protocol, work_dir: Path, dataset: str) -> dict[str, 
     root = analysis_root(protocol, work_dir, dataset)
     other = other_definition(protocol.targets)
     out: dict[str, Any] = {"profile": None, "baselines": {}, "selected": {}, "controls": {},
-                           "other_targets": other, "diagnostic": {}}
+                           "other_targets": other, "diagnostic": {},
+                           # view stem -> baseline -> result, for each view of discovery_views (DECISIONS §50, §54)
+                           "views": {view: {} for _, view in discovery_views(protocol, dataset)}}
     if profile_path(protocol, work_dir, dataset).exists():
         out["profile"] = read_json(profile_path(protocol, work_dir, dataset))["characteristics"]
     for name in protocol.baselines:
@@ -425,6 +455,9 @@ def full_results(protocol: Protocol, work_dir: Path, dataset: str) -> dict[str, 
                 out.setdefault("tied", {})[name] = tied
         if evaluation_exists(directory / f"test_{other}"):
             out["diagnostic"][name] = load_evaluation(directory / f"test_{other}")
+        for view in out["views"]:
+            if evaluation_exists(directory / view):
+                out["views"][view][name] = load_evaluation(directory / view)
     for control in CONTROLS:
         stem = root / "controls" / control / _controls_fingerprint(protocol, dataset)[:12] / "test"
         if evaluation_exists(stem):

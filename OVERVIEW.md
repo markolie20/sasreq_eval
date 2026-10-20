@@ -141,6 +141,11 @@ simple rule.
 - **Across datasets:** no pooling. A table shows, per dataset, whether each model is better, not different or
   worse than ELSA.
 - **For comparison:** the paired t-test over users only is reported beside it.
+- **On new items too:** the same two comparisons on the next items users never had before, against ELSA and
+  against a floor of the simple rules scored the same way, with a table across datasets. This matches a feed that
+  never shows what the user already had.
+- **Against ELSA at its best window:** ELSA (and SANSA) is also served only the last *n* events of each history, *n*
+  chosen on validation, and every model is compared with it there too.
 
 ## 8. Diagnostics
 
@@ -148,10 +153,16 @@ Reported beside the results, never used for selection:
 - **New items only:** the next items the user never had before, on the repeat-heavy datasets. It shows what a
   model adds beyond repeating the user's history.
 - **Window targets:** everything in the test window, beside the next item.
+- **Later new items:** every new item the user went on to have in the test window, so a list that holds several
+  counts each; compared like new items, with its own floor.
 - **Diversity:**
   - catalogue coverage@K: the share of the catalogue that appears in any user's top K;
   - intra-list diversity@K: the average dissimilarity between items in a list, with item similarity taken from
-    co-occurrence in the training data.
+    co-occurrence in the training data;
+  - novelty@K: how unpopular the recommended items are (their mean self-information);
+  - long-tail share@K: the share of recommended items outside the most popular items that hold 80% of interactions.
+- **Freshness:** each final against the same configuration trained one window earlier, and the share of next items
+  that such an older model has never seen.
 - **Convergence:** flags a selected run whose training loss was still falling at its last epoch.
 - **All-cold histories:** the number of users whose history holds only items unseen in training.
 - **Repeat strata:** accuracy by history length and by the share of repeats in the user's history.
@@ -173,6 +184,10 @@ stage-1 configuration, and each level is compared with the full data.
 | history length | every history is cut to its last *n* interactions, in training and as input | 5, 20, 100, 500 |
 | shuffle | the order within histories is randomised, the contents kept | in blocks of 2, in blocks of 10, the whole history |
 | repeat removal | repeat interactions are removed with probability *p* | 50%, 100% |
+
+**SASRec v2's parts.** On Music4All, Yambda and OTTO, seed 0: its selected configuration retrained with one part
+changed at a time (no augmentation, each co-occurrence augmentation alone, masking added, half the width, one block),
+each against the stage-1 model.
 
 **Serving-time history length.**
 - **Where:** all five datasets, all models, 3 seeds.
@@ -218,17 +233,18 @@ stage-1 configuration, and each level is compared with the full data.
 - **Fingerprints:** every result is stored under a fingerprint of the settings that determine it, and records the
   code version that produced it.
 - **Resumable:** runs can be stopped and resumed, and several processes can share the work without duplicating it.
-- **Tests:** 300 automated tests on synthetic data, end to end on CPU and GPU. Each model was also checked on data
+- **Tests:** 330 automated tests on synthetic data, end to end on CPU and GPU. Each model was also checked on data
   with a planted signal whose best possible score is known.
 - **Hardware:** an NVIDIA V100 server (most of stage 1) and an RTX 2060 workstation (the rest). Latency is
   measured on one machine.
 
-## 13. Status (19 October 2026)
+## 13. Status (20 October 2026)
 
 - **Done:**
-  - stage 1 for every model on all five datasets (EASE where it fits; SASRec v2 on Music4All, Yambda and OTTO):
-    search, finals, epoch extensions, diversity, latency;
+  - stage 1 for every model on all five datasets (EASE where it fits): search, finals, epoch extensions, diversity,
+    latency;
   - baselines, floor and data analysis;
-  - the ablations (EASE's on Music4All excepted: it does not fit the PC's memory there).
-- **Running:** SASRec v2's stage 1 on MovieLens-20M and Amazon.
+  - the ablations (EASE's on Music4All excepted).
+- **Ready to run:** the new-items floor and tests, ELSA and SANSA at their serving window, freshness, novelty and
+  later new items, SASRec v2's parts, SASRec on Yambda at 8 times its epochs, and EASE's Music4All ablations.
 - **Next:** the client selection with Recombee.

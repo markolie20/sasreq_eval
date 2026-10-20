@@ -1993,6 +1993,256 @@ RTX 2060 took, always on the high side: Music4All 4.2 h estimated, 3.95 h actual
 **Tests.** No code changed. `tests/test_placement.py` already checks this placement on the real protocol (every
 dataset, no fingerprint moves). 305 tests pass.
 
+## 50. New items get a floor and the tests (2026-10-20)
+
+**Problem.** The client's feed (SpicyChat's "For You") never shows an item the user already had, so the comparison
+that matches it is on new items. The suite scored only the models there (§38's diagnostic):
+- **No floor:** recent popularity beat every model on MovieLens and Amazon, where every next item is new, but it was
+  never scored on new items elsewhere;
+- **No test:** the new-items table was means only.
+
+**Decision (Mark).** The baselines are scored on new items too, and the report compares every model on them, with
+the reference and with that floor, by the main comparison's test.
+
+**Change.**
+- **`analyse`:** each baseline, at the setting selected on all next items, is also scored on the test users' next
+  items they never had, seen items excluded (`test_new` beside its `test`), on every dataset with
+  `new_item_diagnostic`. The baselines keep their selection, as the models keep theirs: neither is tuned for new items.
+- **The stage-1 report**, per dataset with the diagnostic, below the new-items table:
+  - the new-items floor: the strongest baseline scored that way, waiting for every baseline as the main floor does;
+  - every model against the reference, and every model against the floor: the seed-aware t-test, each a Holm family;
+  - and across datasets, a table like the main one, on new items.
+- **By construction:** replay under exclusion has nothing left to replay, so it ranks by training popularity.
+
+**Effect.**
+- No fingerprint moves; `analyse` adds the new scores beside the old.
+- **The order of reading changes, not the protocol:** the main comparison fixed in advance stays all next items.
+  The new-items comparison is added after the preliminary results, because the client's feed excludes history, and
+  is reported as that.
+
+**Where.** `analysis.py` (`discovery_views`, `score_view`, `analyse_full`, `full_results`), `report.py`
+(`_view_comparisons`, `dataset_report`, `_across_datasets`).
+
+**Tests.** `tests/test_discovery.py`:
+- every baseline is scored on both views of new items, with exclusion;
+- replay equals popularity by events there;
+- the report compares on new items, against the reference and against the floor, and the floor waits for every
+  baseline.
+
+## 51. A model at its serving window (2026-10-20)
+
+**Problem.** In the inference sweep ELSA scored 1.5 to 1.9 times its whole-history score when a request carried
+only its last 5 to 20 events (MovieLens-20M, Music4All, Yambda). Production may serve it so. Against that ELSA the best sequential model's lead fell from +21–136% to +11–42%, but the window was picked on
+test, so that was an upper bound for ELSA, with no test.
+
+**Decision (Mark).** Choose the window on validation, score it on test, and test it like every other comparison.
+Production's own window, once Recombee gives it, can be fixed by listing it alone.
+
+**Change.**
+- **`[models.*] serving_windows = [...]`:** the windows a model is also served at; in no fingerprint, since it
+  rescores the finals and changes none (`_MEASUREMENT_KEYS`). ELSA gets the inference sweep's levels, 1 to 1,000;
+  SANSA the same, in the private protocol (P7 there). A latency-only model refuses it.
+- **The stale run** (`stale-seed0`, with §53): the selection fitted on the training window under the first seed,
+  exactly as its search trial was, kept, and scored on validation and test.
+- **`seqrec-eval window`:**
+  1. fits the stale run if it is missing;
+  2. scores it on the validation sample with every history cut to its last n events, for each n, and whole;
+  3. keeps the best, a tie keeping the longer window and the whole history longest of all;
+  4. rescores every current final on test at that window (`test_last<n>`, and `test_new_last<n>` on new items).
+
+  Seen items are still excluded against the whole history, so the users scored are the finals' own, and every
+  comparison pairs them.
+- **The stage-1 report:**
+  - per such model, the validation score at every window, and the search trial's own as a check;
+  - the test score at the chosen window;
+  - every model, at its whole history, against the windowed one (the model itself included, as "whole history"):
+    the seed-aware test, Holm; and the same on new items.
+
+**Effect.**
+- No fingerprint moves.
+- **Cost:** one extra fit per model and dataset (ELSA on the GPU, SANSA on the CPU), then rescorings.
+- **A check comes with it:** the stale run reproduces the selected trial's validation score, since it is the same
+  configuration and seed. A difference beyond the GPU's nondeterminism would point to a problem.
+
+**Where.** New `window.py`; `runner.py` (`plan_stale`, the run kind `stale`); `protocol.py`; `cli.py` (`window`);
+`report.py` (`_window_section`).
+
+**Tests.** `tests/test_window.py`:
+- the key is checked and moves no fingerprint;
+- a window cuts the inputs but not what was seen, nor who is scored;
+- on synth, the window is chosen on validation, the stale run reproduces the selected trial, the finals are
+  rescored on their own users, and the report compares;
+- a tie keeps the longer window, and the whole history longest;
+- nothing is chosen until every window is scored.
+
+## 52. A settings sweep: SASRec v2's parts (2026-10-20)
+
+**Problem.** SASRec v2's selection, trial #0 on Music4All, Yambda and OTTO, has width 64, 3 blocks, co-occurrence
+replacement and insertion, and no masking. The random search cannot say which of these the result rests on: every
+setting changes between trials at once.
+
+**Decision (Mark).** Refit the selection with one part changed at a time, and compare each with the stage-1 final.
+
+**Change.**
+- **The transform `settings`:** the data as it is. Each level is the selection with the settings in `options[level]`
+  put in place of its own (`settings_of`), refitted under the sweep's seeds. It reuses the ablation machinery:
+  - the reference reloads the stage-1 final;
+  - the fixed test users, the manipulation check (nothing moves), the new-items scores;
+  - and "each level against the full data", which is the result.
+
+  A setting the model's section neither fixes nor searches is refused before anything runs.
+- **The protocol:**
+  - a settings sweep names its models;
+  - it may name a model kept out of the data sweeps (`in_ablations = false`, §45), since it is about the model itself.
+- **Not done for it:**
+  - `analyse` skips it: its baselines are the full data's;
+  - the report has no knee and no gap for it.
+- **`[ablations.sasrec_ce_parts]`:** SASRec v2 on Music4All, Yambda and OTTO, seed 0, at six levels:
+  - `no_augmentation`, `replace_only`, `insert_only`: masking off, the co-occurrence parts one at a time;
+  - `masking`: masking 0.2 added;
+  - `width_32`: width 32;
+  - `one_block`: one block.
+
+**Effect.**
+- No other sweep's fingerprint moves, nor its models.
+- **Cost:** about 8 to 10 hours on the RTX 2060, from the finals' own times (Music4All 0.8 h, Yambda 0.3 h, OTTO
+  0.5 h per run, less for the smaller variants).
+
+**Where.** `ablations.py` (the transform, `settings_of`, `plan_ablation`), `protocol.py` (`SETTINGS_TRANSFORM`,
+`_parse_ablation`), `analysis.py`, `ablation_report.py`, both protocols.
+
+**Tests.** `tests/test_settings_sweep.py`:
+- the sweep is checked: it names its models, every level has its settings, and `full` stays reserved;
+- it may name a model out of the data sweeps, which a data sweep still may not;
+- on synth, each level refits the selection with its settings, which differ from the selection's, and is compared
+  with the final;
+- nothing about the data moves, and nothing is analysed;
+- a misspelt setting is refused.
+
+`tests/test_placement.py` now allows a model out of the sweeps to have fingerprints in a settings sweep, and in no
+other sweep.
+
+## 53. Freshness: the finals one window older (2026-10-20)
+
+**Problem.** How quickly a model goes stale decides how often it must be retrained. The plan was to split test by
+days since training, but the split keeps no time for the test window's events: only `prepare` reads them, from the
+raw data, and the PC runs without it.
+
+**Decision (Mark: measure freshness; the form follows from what the split has).** Measure one window of staleness,
+two ways:
+- **The catalogue** (`analyse`, exact): of the test users with a next item, the share whose next item was first seen
+  in the validation window, which a model one window older has never seen, beside the share no model has seen
+  (`next-item-age-*.json` in the analysis folder).
+- **The model:** the stale run (§51) scored on test, against the first seed's final, on the final's users. A user
+  whose next item the older model has never seen counts 0 for it, which is part of the cost. One seed each, so the
+  test is the paired t-test over users, Holm across a dataset's models; on next items and on new items.
+
+The window is each dataset's own: 339 days on MovieLens-20M and Amazon, 30 on the music data, two on OTTO.
+
+**Change.**
+- **`seqrec-eval stale`:** the stale run of every selection asked for.
+- **The run kind `stale`:**
+  - it fits the training window, as a trial does, and refuses the refitted split;
+  - it keeps its model, and is scored on validation and test (and new items).
+- **The stage-1 report:** "Freshness: one window older", after the across-datasets tables.
+
+**Effect.**
+- No fingerprint moves.
+- **Cost:** one extra fit per model and dataset, as one search trial.
+- **Limit:** the measure is one window, not a curve over days.
+
+**Where.** New `freshness.py`; `runner.py`; `analysis.py`; `cli.py` (`stale`); `report.py`.
+
+**Tests.** `tests/test_window.py`:
+- the stale run is the selection one window older and refuses the refitted split;
+- the comparison pairs the final's users, one seed each;
+- a user the older model cannot score counts 0;
+- the catalogue's age adds up and is reported.
+
+## 54. Discovery: novelty, the long tail, and later new items (2026-10-20)
+
+**Decision (Mark).** Two measures that bear on the gap between offline and online:
+
+- **What the lists hold** (`seqrec-eval diversity`, beside coverage and intra-list diversity):
+  - **novelty@K**, the mean self-information −log2(p) of the recommended items, with p the share of training users
+    who had the item (Zhou et al., 2010);
+  - **the long-tail share@K**, the share of recommended items outside the head, the most popular items that together
+    hold 80% of the training interactions.
+
+  An item no training user had counts as had by one, and as a tail item.
+- **Later new items** (targets `window_new`): every new item a user went on to have in the test window, seen items
+  excluded. A list that holds several of them counts each, where the next-item score counts only the first: one
+  target per user undercounts a list that is good in several places.
+  - **Models:** the finals are scored on it in the diversity pass, which reloads every final (`test_window_new`).
+  - **Baselines:** scored on it by `analyse`, which gives it a floor.
+  - **Report:** it is compared as new items are (§50), on every dataset.
+
+**Effect.**
+- No fingerprint moves.
+- `DIVERSITY_VERSION` 2: every final is measured again, once, on its next `diversity`.
+
+**Where.** `diversity.py` (`item_users`, `tail_items`, `list_diversity`, `measure_final`, the table), `evaluate.py`
+(`window_new`), `analysis.py`, `report.py`.
+
+**Tests.** `tests/test_discovery.py`:
+- later new items are exactly the window less the history, and every user with one is scored;
+- novelty and the tail share are checked on a hand-made list, the head included;
+- the report and the diversity table show them.
+
+## 55. Loose ends: SASRec at 8× on Yambda, and EASE in less memory (2026-10-20)
+
+**SASRec on Yambda (Mark).**
+- **The problem:** it was still improving at 4× its epochs: validation 0.051, 0.070, 0.078 at 1×, 2×, 4×, and its
+  loss still falling 15%.
+- **The change:** `epoch_extension = [2, 4, 8]`, the same rule for every selection still falling more than 5%
+  (§43). On today's runs it adds SASRec and GRU on Yambda at 8×: about 0.25 and 0.8 hours, and SASRec's finals
+  (about 0.26 hours each at 8×) if 8× wins.
+- **Ablation runs follow the finals:**
+  - a run built on a final at other epochs than the selection's is moved aside (`*.superseded-<time>`) and redone,
+    as the finals are (§42), rather than refused;
+  - `differs_in_epochs_only` covers the stale run and every ablation run;
+  - `ablate` counts such a run as work left, so a condition whose runs all finished is still built for it.
+
+  So the inference sweep on Yambda redoes those models' rescorings after the new finals.
+
+**EASE (Mark).**
+- **The problem:** EASE's Music4All ablation runs were killed by the out-of-memory killer on 2026-10-14. The
+  library forms XᵀX as a sparse product, densifies it, and inverts it with `np.linalg.inv`: about nine items × items
+  matrices at once, 45 GB on 36,797 items.
+- **The change:** `LowMemoryEASE`, in the suite's `models.py`, is now the registered `ease`. It is the library's
+  class with its own fit, the same closed form:
+  - the Gram matrix is built dense, a block of items at a time;
+  - it is inverted in place by Cholesky (`potrf`, `potri`; positive definite for λ > 0);
+  - its triangle is mirrored, a block at a time;
+  - the peak is about 1.4 such matrices, about 7.6 GB on Music4All.
+- **Why not in the library:** the compresso-recsys checkout is on another branch than the vendored copy came from,
+  and branches are not switched, so the vendored library is untouched.
+
+**Effect.**
+- **Weights:** equal to the library's to rounding (float64 2e-16, float32 1e-7 relative). Cholesky and LU round
+  differently, so float32 weights can differ in their last digits from those of EASE's earlier finals.
+- **Checkpoints:** saved and read as the library's, both ways.
+- **The missing runs** (EASE's Music4All ablations: `history_length`, `shuffle`, `repeat_removal`) can run on the
+  PC's CPU.
+- No fingerprint moves.
+
+**Where.** `protocol.toml` and `protocol.local.toml` (`epoch_extension`), `runner.py` (`differs_in_epochs_only`),
+`cli.py` (`_ablate`), `models.py` (`LowMemoryEASE`).
+
+**Tests.**
+- **`tests/test_ease_memory.py`:**
+  - the weights equal the library's in float64 and float32, over uneven blocks;
+  - it is the registered EASE, and reads and writes the library's checkpoints;
+  - it holds under 1.6 items × items matrices where the library held over 3 (`tracemalloc`);
+  - an indefinite matrix is refused.
+- **`tests/test_settings_sweep.py`:** on synth, an epoch extension moves the selection; `ablate` then moves the
+  inference sweep's runs aside and redoes them at the new epochs.
+
+**Deliberate breaks for §50–§55:** 16, each caught: exclusion, targets, floors, the window's tie and exclusion, the
+stale split and model, the zero for unscored users, the settings, the fingerprint, the supersede (two), the EASE
+mirror, the head, novelty, the placement rule. The first round missed one, because the test's settings equalled the
+synthetic selection; the test now changes them. 332 tests pass on the CPU and on the GPU.
+
 ---
 
 ## Known limitations recorded by the review

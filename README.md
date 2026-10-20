@@ -128,6 +128,8 @@ seqrec-eval report --reference elsa          # work/reports/stage1.md + final_me
 seqrec-eval ablate --device cuda:0           # every [ablations.*] sweep; two GPUs share it as search does
 seqrec-eval ablation-report                  # work/reports/ablation-<sweep>.md + -metrics.csv + -gap.csv/.png
 seqrec-eval repeat-strata                    # work/reports/repeat-strata.md + .csv, from the stage-1 finals
+seqrec-eval stale --device cuda:0            # each selection fitted on the training window alone: one window older
+seqrec-eval window --device cuda:0           # serving_windows models at the window chosen on validation
 
 # More seeds later, beside the runs already made (nothing is rerun):
 seqrec-eval final --dataset amazon --add-seeds 3 4 --device cuda:0
@@ -240,8 +242,28 @@ reported as "GRU (full softmax)", not as GRU4Rec.
 
 Where a model runs is part of its section too (DECISIONS.md §45): `datasets = [...]` keeps it to those datasets,
 and everywhere else it is reported as skipped, with no runs and no record; `in_ablations = false` leaves it out of
-every sweep that names no models (a sweep may not name it). Neither key enters a fingerprint, so widening a model's
-datasets later starts runs on the new ones and leaves the finished ones where they are.
+every sweep that names no models (a data sweep may not name it; a settings sweep may, §52). Neither key enters a
+fingerprint, so widening a model's datasets later starts runs on the new ones and leaves the finished ones where they
+are.
+
+`serving_windows = [...]` (DECISIONS.md §51) also serves a model the last n events of each history, n chosen on
+validation from the list. `seqrec-eval window` does it:
+1. it fits the selection on the training window alone, under the first seed (the **stale run**, `stale-seed0`);
+2. it scores that on the validation sample at every window, and with the whole history;
+3. it keeps the best, a tie keeping the longer window;
+4. it rescores every final on test there (`test_last<n>`).
+
+The report then compares every model with the windowed one. The key enters no fingerprint. ELSA has it, and SANSA in
+the private protocol. Listing one window alone (production's, say) fixes it.
+
+The stale run is also the finals **one window older** (DECISIONS.md §53): `seqrec-eval stale` makes it for every
+model, and the report's freshness section sets it against the first seed's final. A user whose next item the older
+model has never seen counts 0 for it. Beside it is the share of next items first seen in the validation window,
+counted by `analyse`.
+
+`ease` is the library's EASE with the suite's own fit (`LowMemoryEASE`, DECISIONS.md §55): the same closed form,
+inverted in place by Cholesky, at about 1.4 items × items matrices instead of nine. It reads and writes the library's
+checkpoints.
 
 `bert4rec` is the library's BERT4Rec, as published (DECISIONS.md §36): one epoch is 11 passes over the
 training windows (10 re-maskings and the last-item samples), so its `epochs` of 1–10 match SASRec's 10–100 passes,
@@ -605,6 +627,7 @@ only (`test_new`), shown as a descriptive section of the sweep's report.
 | `repeat_removal` | *q* in (0, 1] | remove each repeat event (item already earlier in the history) with probability *q*; first occurrences stay | yes, most removal within δ |
 | `shuffle` | block size ≥ 2, or `"all"` | shuffle order within consecutive blocks; matrices untouched, so the matrix models are a control | no |
 | `catalogue` | item count, or fraction | keep the top items by training popularity (`strategy = "top"`), or a random draw within popularity strata (`"stratified"`, `strata`), nested across levels; removed items leave the item space, histories and targets; each level is scored on its own users | no |
+| `settings` | a name | the data as it is; the level refits the stage-1 selection with the settings in `options.<level>` in place of its own (DECISIONS §52). It names its models and may name one with `in_ablations = false`; `analyse` skips it | no |
 
 Random transforms (`density`, `repeat_removal`, `shuffle`, stratified
 `catalogue`) draw one subsample per seed from a stream of their own. Each
@@ -753,9 +776,18 @@ its metrics (the same users, the same exclusion of seen items), keeps the ranked
   rank-64 approximation of the binarised training matrix. Item attributes are not used: OTTO has none, and the
   others' differ in kind.
 
-A final with a record is skipped (`--force` measures again). The stage-1 report shows both at the primary cutoff,
-mean ± sd over seeds. They are diagnostics: nothing is selected on them. `scripts/dgx-run.sh` runs the step after
-the finals.
+- **novelty@K** (DECISIONS §54): the mean self-information −log2(p) of the recommended items, p the share of
+  training users who had the item;
+- **long-tail share@K** (DECISIONS §54): the share of recommended items outside the head, the most popular items
+  that together hold 80% of the training interactions.
+
+The same pass scores each final on every new item its users went on to have in the test window (`test_window_new`).
+The stage-1 report compares the models on it, as on new items, against the reference and a floor that `analyse`
+scores the same way (DECISIONS §50, §54).
+
+A final with a record is skipped (`--force` measures again). The stage-1 report shows all four at the primary
+cutoff, mean ± sd over seeds. They are diagnostics: nothing is selected on them. `scripts/dgx-run.sh` runs the step
+after the finals.
 
 ## How long it takes
 
