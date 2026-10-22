@@ -277,8 +277,9 @@ over the whole catalogue instead of sampled negatives, with input masking and co
 is SASRec's ranges without `n_negatives`, plus `mask_probability` in {0, 0.1, 0.2, 0.3} and co-occurrence
 replacement and insertion in {0, 0.1} each. The user's own history stays among its negatives
 (`allow_history_negatives = true`, fixed by the planted chain, §46). It runs a full stage 1 on every dataset
-(Music4All, Yambda and OTTO first, §43; ML-20M and Amazon since §49) and is in no sweep. Its loss and its prediction
-are computed in chunks, so its largest setting fits a 6 GB card (§47).
+(Music4All, Yambda and OTTO first, §43; ML-20M and Amazon since §49), and since §57 it is in the data sweeps like
+every other model, beside its own parts sweep (§52). Its loss and its prediction are computed in chunks, so its
+largest setting fits a 6 GB card (§47).
 
 `lrurec` is LRURec (Yue et al., WSDM 2024), timed for latency only (`latency_only = true`, DECISIONS.md §48): the
 paper's architecture (d 64, 2 blocks) at SASRec's longest window, 400, on every dataset. It is not searched and in

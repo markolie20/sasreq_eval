@@ -2290,6 +2290,39 @@ known. ML-20M (λ ≈ 999, one rating per film, a well-conditioned problem) is n
 
 3 deliberate breaks, all caught: the mirrored triangle, a float32 inverse, float64 weights kept. 332 tests pass.
 
+## 57. SASRec v2 in the data sweeps (2026-10-22)
+
+**Why.** SASRec v2 was added as a full stage 1 without ablations (§44), when the week's sweeps had already been
+planned. It has since become the strongest model, so the sweeps that ask where a model's gain comes from (history
+length, order, repeats, and the history given at recommendation time) lacked the model they matter most for. The
+PC is free, and the client's data has not arrived.
+
+**Decision (Mark).** `[models.sasrec_ce] in_ablations = true`, in both protocols: SASRec v2 joins every sweep that
+names no models, like every other model.
+- **To run now:** the three retraining sweeps (history length, shuffle, repeat removal) on Music4All and OTTO at seed
+  0, 18 refits; and the serving-time history sweep on all five datasets, which rescores the three finals without
+  refitting.
+- **Defined but not run, for any model:** the density and catalogue sweeps. SASRec v2 is pending there with the rest.
+- **Its parts sweep (§52)** still names it alone.
+
+**What it moves, and what not.**
+- **No fingerprint moves:** `in_ablations` is placement only (§45). Checked against the previous protocol: all 96
+  condition and ablation fingerprints and all 40 stage-1 run fingerprints are equal, so every finished run stays
+  where it is and nothing reruns.
+- **The reference is not refitted:** a sweep's "full" level is the stage-1 final, as in every sweep.
+- **The side effect: larger Holm families.** The sweep reports test each level against the full data in one Holm
+  family per sweep and dataset, across every model. SASRec v2's comparisons join those families, so every other
+  model's adjusted p-values there grow a little. A result near 0.05 can change from significant to not; the
+  regenerated reports show the new values.
+- **The gap against ELSA** gains a SASRec v2 line in every retraining sweep.
+
+**Where.** `protocol.toml`, `protocol.local.toml`, README, OVERVIEW.
+
+**Tests.** `tests/test_placement.py`: both protocols put SASRec v2 in every data sweep, and the parts sweep still
+names it alone. Setting it back to false in one protocol is caught. The existing placement test already flips
+`in_ablations` on every model of the real protocol and finds no fingerprint moved. 333 tests pass; the private
+plugin's 15 pass.
+
 ---
 
 ## Known limitations recorded by the review

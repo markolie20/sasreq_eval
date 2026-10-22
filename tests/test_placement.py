@@ -90,6 +90,19 @@ def test_placing_any_model_of_the_real_protocol_moves_no_fingerprint(tmp_path, k
             assert not [k for k in after if k[0] == "ablation" and k[-1] == model and k[1] not in settings]
 
 
+def test_sasrec_v2_is_in_every_data_sweep_of_both_protocols():
+    # DECISIONS §57: SASRec v2 joined the data sweeps, like every other model; its parts sweep (a settings sweep,
+    # §52) still names it alone
+    for name in ("protocol.toml", "protocol.local.toml"):
+        protocol = load_protocol(REPO / name)
+        assert protocol.models["sasrec_ce"].in_ablations, name
+        for sweep, ablation in protocol.ablations.items():
+            if ablation.transform == "settings":
+                assert list(ablation.models) == ["sasrec_ce"], (name, sweep)
+            else:
+                assert "sasrec_ce" in ablation.models, (name, sweep)
+
+
 def test_the_placement_keys_are_the_only_ones_left_out(tmp_path):
     # anything else in a model's section still moves its fingerprint, as before (a control on the test above)
     text = (REPO / "protocol.toml").read_text()

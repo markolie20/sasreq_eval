@@ -288,10 +288,11 @@ max_history_length = { choice = [25, 50, 100, 200, 400] }
 # cross entropy over the whole catalogue, with input masking and optional co-occurrence augmentation, vendored by
 # scripts/vendor-models.sh. A full stage 1, and no ablations. Neither key below enters a fingerprint (§45): widening
 # `datasets` later leaves the runs already made where they are. Decided 2026-10-19 (Mark; DECISIONS §49): ML-20M and
-# Amazon joined the first three, which ran 2026-10-16, once the week's run had finished.
+# Amazon joined the first three, which ran 2026-10-16, once the week's run had finished. Decided 2026-10-22 (Mark;
+# DECISIONS §57): it joins the data sweeps as well, like every other model; no other run moves.
 family = "sequence"
 datasets = ["ml20m", "amazon", "music4all", "yambda", "otto"]
-in_ablations = false
+in_ablations = true
 [models.sasrec_ce.fixed]
 # Decided 2026-10-13 (the planted chain, DECISIONS §46): the user's own history stays among the softmax's negatives.
 # Kept out, a history item is never pushed down, and it outranks the planted next item whenever seen items are

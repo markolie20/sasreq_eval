@@ -95,7 +95,7 @@ MAP and MRR.
 | GRU | recurrent network (GRU cell), full softmax over the catalogue | embedding and hidden size 64–512, 1–2 layers, dropout, learning rate, batch size, 3–40 epochs, history window 50–200 | all 5 |
 | SASRec | causal self-attention, sampled-negative training (as published) | width 16–128, 1–3 blocks, 1–2 heads, dropout, learning rate, batch size, 10–100 epochs, 1–256 negatives, history window 25–400 | all 5 |
 | BERT4Rec | bidirectional self-attention, masked-item training (as published) | width 32–128, 1–3 blocks, 1–4 heads, dropout, mask share 0.2–0.6, learning rate, batch size, 1–10 epochs (11 passes each), history window 25–400 | all 5 |
-| SASRec v2 | SASRec's network trained with cross-entropy over the whole catalogue (the user's own history among the negatives), with input masking and co-occurrence augmentation | SASRec's ranges without negatives, plus mask share 0–0.3 and co-occurrence replacement and insertion 0–0.1 | all 5 (no ablations) |
+| SASRec v2 | SASRec's network trained with cross-entropy over the whole catalogue (the user's own history among the negatives), with input masking and co-occurrence augmentation | SASRec's ranges without negatives, plus mask share 0–0.3 and co-occurrence replacement and insertion 0–0.1 | all 5 |
 | LRURec | linear recurrent units (Yue et al., WSDM 2024); timed for latency only: the paper's architecture (width 64, 2 blocks) at a 400-item window, not trained for accuracy | not searched | all 5 (latency) |
 
 **Non-sequential models** (read the history as a set):
@@ -176,7 +176,7 @@ stage-1 configuration, and each level is compared with the full data.
 
 **Retraining sweeps.**
 - **Where:** Music4All and OTTO, seed 0.
-- **Models:** ELSA, GRU, SASRec, SANSA, popularity, and BERT4Rec (OTTO only).
+- **Models:** ELSA, GRU, SASRec, SANSA, popularity, BERT4Rec (OTTO only), and SASRec v2 (since 22 October, §57).
 - **How:** each model is retrained on the transformed data and scored on the same test users.
 
 | sweep | what changes | levels |
@@ -238,13 +238,14 @@ each against the stage-1 model.
 - **Hardware:** an NVIDIA V100 server (most of stage 1) and an RTX 2060 workstation (the rest). Latency is
   measured on one machine.
 
-## 13. Status (20 October 2026)
+## 13. Status (22 October 2026)
 
 - **Done:**
   - stage 1 for every model on all five datasets (EASE where it fits): search, finals, epoch extensions, diversity,
     latency;
   - baselines, floor and data analysis;
-  - the ablations (EASE is in none).
-- **Ready to run:** the new-items floor and tests, ELSA and SANSA at their serving window, freshness, novelty and
-  later new items, SASRec v2's parts, and SASRec on Yambda at 8 times its epochs.
+  - the ablations (EASE is in none);
+  - the new-items floor and tests, ELSA and SANSA at their serving window, freshness, novelty and later new items,
+    SASRec v2's parts, and SASRec on Yambda at 8 times its epochs.
+- **Running:** SASRec v2 in the retraining sweeps and the serving-time history sweep (§57).
 - **Next:** the client selection with Recombee.
